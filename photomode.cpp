@@ -487,67 +487,69 @@ void __fastcall ProjDetour(void* plat, void* edx, eView* view, float a, float b,
   m[2] = Mul(m[0], m[1]);
 }
 
-// FE root transform. cFEng::Render (0x536520) starts by asking its interface (UIData vtable
-// 0x79BCD8 slot 15 = 0x50C490, thiscall(float out[16]), ret 4) for the root matrix, which is
-// identity. Every object position goes through it (0x504B50, row vectors: translation in m[12..13])
-// and groups chain their child matrices onto it (0x52C5D0). While our menu package is being drawn
-// we hand back a scale + offset instead, which shrinks the native screen into a side panel.
-using RootTransformFn = void(__fastcall*)(void*, void*, float*);
-RootTransformFn oRootTransform = reinterpret_cast<RootTransformFn>(0x50C490);
-bool g_panelPass = false;
-void __fastcall RootTransformDetour(void* self, void* edx, float* out) {
-  oRootTransform(self, edx, out);
-  if (!g_panelPass) return;
+// ---- menu side panel (docs/kb/fe-rendering.md) ----------------------------------------------
+// FE draws are flushed one package at a time by UIData vtable slot 9 (0x79BCFC = 0x537480 ->
+// 0x5371F0), and every FE vertex is transformed by the world matrix set through 0x5BDDE0
+// (cdecl(const float m[16], int view); set once per frame at 0x5CC08D, which WidescreenFix FEScale
+// redirects). That matrix works in clip space (-1..1). To draw only our menu as a side panel we
+// wrap its package draw: base * (scale about the screen centre + offset), then restore the base.
+// 0x5BDDE0 skips the update if the same pointer is passed again, so two buffers are used.
+using FeSetTransformFn = void(__cdecl*)(const float*, int);
+FeSetTransformFn oFeSetTransform;
+alignas(16) float g_feBase[16];
+bool g_feBaseValid = false;
+void __cdecl FeSetTransformDetour(const float* m, int view) {
+  if (m && view == 0) {
+    std::memcpy(g_feBase, m, sizeof g_feBase);
+    g_feBaseValid = true;
+  }
+  oFeSetTransform(m, view);
+}
+
+using DrawPackageFn = void(__fastcall*)(void*, void*, void*);
+DrawPackageFn oDrawPackage = reinterpret_cast<DrawPackageFn>(0x537480);
+void __fastcall DrawPackageDetour(void* ui, void* edx, void* pkg) {
   const menu::Layout& L = menu::GetLayout();
-  out[0] *= L.scale;
-  out[5] *= L.scale;
-  out[12] += L.x;
-  out[13] += L.y;
+  bool panel = g->state != State::Off && g_feBaseValid && pkg &&
+               menu::IsMenuPackage(feng::PackageName(static_cast<feng::FEPackage*>(pkg))) &&
+               (L.scale != 1.0f || L.x != 0 || L.y != 0);
+  if (!panel) return oDrawPackage(ui, edx, pkg);
+  // Canvas pixels -> clip space with the game's own constants (2/640, 2/480; WidescreenFix may
+  // change the first), read live.
+  float tx = L.x * Var<float>(0x79AC10), ty = -L.y * Var<float>(0x79AC14);
+  alignas(16) static Mat4 mine, base;
+  std::memcpy(&base, g_feBase, sizeof base);
+  Mat4 o = Mat4::Identity();
+  o.m[0][0] = o.m[1][1] = L.scale;
+  o.m[3][0] = tx;
+  o.m[3][1] = ty;
+  mine = Mul(o, base);
+  oFeSetTransform(&mine.m[0][0], 0);
+  oDrawPackage(ui, edx, pkg);
+  oFeSetTransform(&base.m[0][0], 0);
   static bool logged = false;
   if (!logged) {
     logged = true;
-    U2LOG("menu panel root transform: [%.2f %.2f %.2f %.2f | %.2f %.2f %.2f %.2f | .. | %.1f %.1f %.1f %.1f]", out[0], out[1],
-          out[2], out[3], out[4], out[5], out[6], out[7], out[12], out[13], out[14], out[15]);
+    U2LOG("menu panel: scale %.2f offset (%.0f, %.0f) px -> clip (%.3f, %.3f)", L.scale, L.x, L.y, tx, ty);
   }
 }
 
-// While photo mode is up:
-//  pass 1: every package except our menu, with the HUD hidden (only the help bar stays);
-//  pass 2: only our menu, scaled/offset into a side panel (FE flushes draws per package, 0x53678F).
+// While photo mode is up only our menu and the PC help bar are drawn (HUD, minimap, messages hidden).
 void __fastcall FeRenderDetour(void* feng, void* edx) {
   if (g->state == State::Off || !g->hudFilter) return oFeRender(feng, edx);
   void* saved[64];
   feng::FEPackage* pkgs[64];
   int n = 0;
-  feng::FEPackage* mine = nullptr;
   for (auto p = feng::FirstActivePackage(); p && n < 64; p = feng::NextPackage(p)) {
+    const char* name = feng::PackageName(p);
+    if (menu::IsMenuPackage(name) || (name && !_stricmp(name, "UI_PC_Help_Bar.fng"))) continue;
     pkgs[n] = p;
     saved[n] = feng::PackageObjects(p);
+    feng::PackageObjects(p) = nullptr;
     ++n;
-    if (menu::IsMenuPackage(feng::PackageName(p))) mine = p;
   }
-  auto keepInPass1 = [](feng::FEPackage* p) {
-    const char* name = feng::PackageName(p);
-    return name && !_stricmp(name, "UI_PC_Help_Bar.fng");
-  };
-  for (int i = 0; i < n; ++i)
-    if (!keepInPass1(pkgs[i])) feng::PackageObjects(pkgs[i]) = nullptr;
   oFeRender(feng, edx);
   for (int i = 0; i < n; ++i) feng::PackageObjects(pkgs[i]) = saved[i];
-
-  static feng::FEPackage* loggedMine = nullptr;
-  if (mine != loggedMine) {
-    loggedMine = mine;
-    U2LOG("menu panel pass: package %p (%d active packages)", mine, n);
-  }
-  if (mine) {
-    for (int i = 0; i < n; ++i)
-      if (pkgs[i] != mine) feng::PackageObjects(pkgs[i]) = nullptr;
-    g_panelPass = true;
-    oFeRender(feng, edx);
-    g_panelPass = false;
-    for (int i = 0; i < n; ++i) feng::PackageObjects(pkgs[i]) = saved[i];
-  }
 }
 
 void OnDeviceReset() {
@@ -572,9 +574,10 @@ bool Install() {
   ok &= hook::Create(addr::cFEng_Render, &FeRenderDetour, &oFeRender, "cFEng::Render");
   ok &= d3d::InstallResetHook();
   ok &= menu::Install(menu::Callbacks{RowCount, &RowLabel, &RowValue, &Adjust, &Activate, &MenuBack}, g->cfg.menuLayout);
-  // UIData vtable slot 15 (root FE transform); only one UIData instance exists (ctor 0x5372FF).
-  if (Var<uintptr_t>(0x79BD14) == 0x50C490) mem::Write<void*>(0x79BD14, reinterpret_cast<void*>(&RootTransformDetour));
-  else U2LOG("FE root transform slot already patched (another mod?); menu stays full size");
+  ok &= hook::Create(0x5BDDE0, &FeSetTransformDetour, &oFeSetTransform, "FE SetTransform");
+  // UIData vtable slot 9 = per-package draw; only one UIData instance exists (ctor 0x5372FF).
+  if (Var<uintptr_t>(0x79BCFC) == 0x537480) mem::Write<void*>(0x79BCFC, reinterpret_cast<void*>(&DrawPackageDetour));
+  else U2LOG("FE package-draw slot already patched (another mod?); menu stays full size");
   // Verify the exact bytes before redirecting the pause decision (movzx eax,al; cmp eax,ebx).
   const uint8_t expect[5] = {0x0F, 0xB6, 0xC0, 0x3B, 0xC3};
   if (std::memcmp(reinterpret_cast<void*>(kPauseDecision), expect, 5) == 0) {
