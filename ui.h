@@ -37,6 +37,7 @@ class Ui {
 
  private:
   struct Label {
+    uint8_t* obj = nullptr;
     uint32_t hash = 0;
     std::string text;
   };
@@ -45,6 +46,7 @@ class Ui {
   Label grid_[kCols][kRows];
   bool mapped_ = false;
   bool requested_ = false;
+  int logFlags_ = 0;
 };
 
 }  // namespace photomode

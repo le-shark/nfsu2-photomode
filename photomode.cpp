@@ -25,8 +25,10 @@ namespace {
 using namespace u2;
 
 constexpr uintptr_t kMirrorPtr = 0x7FEE40;  // read once at 0x5CC0CA; null = no rear-view mirror quad
-// "Paused" game speed. NFSU2_CameraToolkit pauses with 0.01 rather than 0 (InputHandle.h).
-constexpr float kPauseSpeed = 0.01f;
+// Paused game speed. 0 makes World::DoTimeStep (0x601A60: dt * Tweak_GameSpeed) step with dt = 0,
+// which is exactly what the game's own pause does (GameLoop 0x581319 calls it with dt = 0).
+// (NFSU2_CameraToolkit uses 0.01, which is visible slow motion.)
+constexpr float kPauseSpeed = 0.0f;
 
 enum class State { Off, Active, Capturing };
 enum Row { RowCamera, RowFocal, RowRoll, RowFocus, RowAperture, RowShutter, RowPreview, RowQuality, RowResolution, RowTake, RowCount };
@@ -65,6 +67,8 @@ struct PhotoMode {
   bool endSceneHooked = false;
   float postExitLog = 0;      // seconds left to log game state after exit
   int debugShot = 0;
+  bool hudFilter = true;      // F11 toggles (debug)
+  POINT cursorAtEnter{};
 };
 PhotoMode* g = nullptr;
 
@@ -162,6 +166,7 @@ void Enter() {
   g->uiHidden = false;
   Var<float>(addr::GameSpeed) = kPauseSpeed;
   Var<void*>(kMirrorPtr) = nullptr;
+  GetCursorPos(&g->cursorAtEnter);
   g->input.SetMouseCapture(true);
   g->state = State::Active;
   ApplyCamera();  // the hook needs a valid matrix from the very next frame
@@ -184,6 +189,8 @@ void Exit(const char* why) {
   cam->DepthOfField = g->saved.cam.DepthOfField;
   g->ui.Clear();
   g->input.SetMouseCapture(false);
+  // Put the cursor back: the game/WidescreenFix mouse-look reads cursor deltas.
+  SetCursorPos(g->cursorAtEnter.x, g->cursorAtEnter.y);
   g->state = State::Off;
   g->postExitLog = 3;
   U2LOG("exit (%s): speed=%.2f hud=%d", why, Var<float>(addr::GameSpeed), Var<int>(addr::DrawHud));
@@ -360,6 +367,10 @@ void Tick() {
   if (g->toastTime > 0) g->toastTime -= dt;
   if (std::string m = g->capture.TakeMessage(); !m.empty()) Toast(m, 4);
 
+  if (g->input.KeyPressed(VK_F11)) {
+    g->hudFilter = !g->hudFilter;
+    U2LOG("debug: HUD filter %s", g->hudFilter ? "on" : "off");
+  }
   if (g->input.KeyPressed(VK_F12)) {  // debug: save the displayed frame incl. HUD/UI
     CreateDirectoryA(g->cfg.outputDir.c_str(), nullptr);
     std::string path = g->cfg.outputDir + "\\debug_" + std::to_string(++g->debugShot) + ".png";
@@ -438,7 +449,7 @@ void __fastcall ProjDetour(void* plat, void* edx, eView* view, float a, float b,
 
 // Hide every FE package except ours while photo mode is up (HUD, messages, minimap...).
 void __fastcall FeRenderDetour(void* feng, void* edx) {
-  if (g->state == State::Off) return oFeRender(feng, edx);
+  if (g->state == State::Off || !g->hudFilter) return oFeRender(feng, edx);
   void* saved[64];
   feng::FEPackage* pkgs[64];
   int n = 0;

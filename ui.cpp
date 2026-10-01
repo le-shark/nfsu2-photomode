@@ -20,6 +20,7 @@ feng::FEPackage* FindActive(const char* name) {
 }
 
 struct Found {
+  uint8_t* obj;
   uint32_t hash;
   float x, y;
 };
@@ -46,7 +47,7 @@ bool Ui::Attach() {
   std::vector<Found> found;
   for (auto o = static_cast<uint8_t*>(feng::PackageObjects(p)); o; o = *reinterpret_cast<uint8_t**>(o + 4)) {
     if (*reinterpret_cast<uint32_t*>(o + 0x18) != 2) continue;
-    Found f{*reinterpret_cast<uint32_t*>(o + 0x10), 0, 0};
+    Found f{o, *reinterpret_cast<uint32_t*>(o + 0x10), 0, 0};
     feng::GetCenter(reinterpret_cast<feng::FEObject*>(o), &f.x, &f.y);
     found.push_back(f);
   }
@@ -56,7 +57,15 @@ bool Ui::Attach() {
   }
   std::sort(found.begin(), found.end(), [](const Found& a, const Found& b) { return a.x < b.x || (a.x == b.x && a.y < b.y); });
   for (int c = 0; c < kCols; ++c)
-    for (int r = 0; r < kRows; ++r) grid_[c][r] = Label{found[c * kRows + r].hash, std::string("\x01")};  // force first print
+    for (int r = 0; r < kRows; ++r) {
+      Found& f = found[c * kRows + r];
+      // nfsu2-re docs ("ScreenPrintf.fng"): the labels only appeared after setting flag 0x2 and
+      // clearing 0x1 (a_utils.c: someFlags |= 0x2; someFlags &= ~1).
+      uint32_t& flags = *reinterpret_cast<uint32_t*>(f.obj + 0x1C);
+      flags = (flags | 0x2) & ~0x1u;
+      grid_[c][r] = Label{f.obj, f.hash, std::string("\x01")};  // force first print
+    }
+  logFlags_ = 2;
   mapped_ = true;
   U2LOG("ui: mapped %d x %d labels, top-left %08X at (%.1f, %.1f)", kCols, kRows, grid_[0][0].hash, found[0].x, found[0].y);
   return true;
@@ -72,6 +81,9 @@ void Ui::Set(int col, int row, const std::string& text) {
 
 void Ui::Draw(const MenuView& v) {
   if (!Attach()) return;
+  if (logFlags_ > 0 && --logFlags_ == 0)
+    U2LOG("ui: after print, label[0][0] flags %08X text '%s'", *reinterpret_cast<uint32_t*>(grid_[0][0].obj + 0x1C),
+          grid_[0][0].text.c_str());
   std::string cells[kCols][kRows];
   cells[0][0] = v.title;
   int r = 2;
