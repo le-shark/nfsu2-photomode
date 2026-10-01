@@ -27,6 +27,7 @@ bool Ui::Attach() {
     if (!requested_) {
       U2LOG("ui: showing %s", kPkg);
       feng::PushOverlayPackage(kPkg);
+      U2LOG("ui: pushed");
       requested_ = true;
       ownsPackage_ = true;
     }
@@ -124,9 +125,9 @@ void Ui::HideAll() {
 void Ui::Detach() {
   HideAll();
   if (ownsPackage_) {
-    if (feng::FEPackage* p = FindActive(kPkg)) {
-      U2LOG("ui: popping %s", kPkg);
-      feng::PopOverlayPackage(p);
+    if (FindActive(kPkg)) {
+      U2LOG("ui: removing %s", kPkg);
+      feng::RemovePackage(kPkg);
     }
   }
   ownsPackage_ = false;
