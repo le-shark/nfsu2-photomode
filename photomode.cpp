@@ -362,7 +362,7 @@ void Tick() {
 
   if (g->input.KeyPressed(VK_F12)) {  // debug: save the displayed frame incl. HUD/UI
     CreateDirectoryA(g->cfg.outputDir.c_str(), nullptr);
-    std::string path = g->cfg.outputDir + "\debug_" + std::to_string(++g->debugShot) + ".png";
+    std::string path = g->cfg.outputDir + "\\debug_" + std::to_string(++g->debugShot) + ".png";
     dev::RequestShot(path, 2);
   }
   if (g->postExitLog > 0) {
