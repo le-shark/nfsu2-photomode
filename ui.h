@@ -52,6 +52,8 @@ class Ui {
   std::vector<Label> labels_;
   bool requested_ = false;
   bool ownsPackage_ = false;
+  int dumpPending_ = 0;
+  void DumpFirstLabel();
 };
 
 }  // namespace photomode

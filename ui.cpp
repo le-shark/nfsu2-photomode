@@ -26,7 +26,7 @@ bool Ui::Attach() {
     labels_.clear();
     if (!requested_) {
       U2LOG("ui: showing %s", kPkg);
-      feng::ShowPackage(kPkg);
+      feng::PushOverlayPackage(kPkg);
       requested_ = true;
       ownsPackage_ = true;
     }
@@ -50,6 +50,7 @@ bool Ui::Attach() {
     labels_.push_back(l);
   }
   U2LOG("ui: %s attached, %zu labels", kPkg, labels_.size());
+  dumpPending_ = 3;
   return !labels_.empty();
 }
 
@@ -71,12 +72,23 @@ void Ui::Set(size_t i, const std::string& text, float x, float y, uint32_t color
   }
   if (!l.visible || (feng::ObjectFlags(l.obj) & 1)) {
     feng::SetVisible(l.obj);
+    // Flag 0x2 is required for these labels to draw (yugecin, nfsu2-re "ScreenPrintf.fng").
+    feng::ObjectFlags(l.obj) |= 0x2 | 0x400000;
     l.visible = true;
   }
 }
 
+void Ui::DumpFirstLabel() {
+  if (labels_.empty()) return;
+  auto o = reinterpret_cast<uint8_t*>(labels_[0].obj);
+  auto d = *reinterpret_cast<uint32_t**>(o + 0x2C);
+  U2LOG("ui: label0 flags %08X data %08X %08X %08X %08X | %08X %08X %08X %08X | %08X %08X %08X %08X",
+        feng::ObjectFlags(labels_[0].obj), d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10], d[11]);
+}
+
 void Ui::Draw(const MenuView& v, const UiLayout& L) {
   if (!Attach()) return;
+  if (dumpPending_ > 0 && --dumpPending_ == 0) DumpFirstLabel();
   size_t i = 0;
   float y = L.y;
   Set(i++, v.title, L.x, y, L.colorTitle);
@@ -111,9 +123,11 @@ void Ui::HideAll() {
 }
 void Ui::Detach() {
   HideAll();
-  if (ownsPackage_ && FindActive(kPkg)) {
-    U2LOG("ui: removing %s", kPkg);
-    feng::RemovePackage(kPkg);
+  if (ownsPackage_) {
+    if (feng::FEPackage* p = FindActive(kPkg)) {
+      U2LOG("ui: popping %s", kPkg);
+      feng::PopOverlayPackage(p);
+    }
   }
   ownsPackage_ = false;
   requested_ = false;

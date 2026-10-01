@@ -13,6 +13,7 @@
 #include "settings.h"
 #include "ui.h"
 #include "u2sdk/d3d.h"
+#include "u2sdk/dev.h"
 #include "u2sdk/feng.h"
 #include "u2sdk/game.h"
 #include "u2sdk/hook.h"
@@ -46,7 +47,7 @@ struct PhotoMode {
 
   // menu values
   int sel = RowFocal;
-  int focalIdx = 10, fstopIdx = 0, shutterIdx = 0, qualityIdx = 1, tiles = 1;
+  int focalIdx = 10, fstopIdx = 3, shutterIdx = 0, qualityIdx = 1, tiles = 1;
   bool focusAuto = true;
   float focusDist = 5;
   bool previewFx = true;
@@ -60,6 +61,8 @@ struct PhotoMode {
   bool inOwnSetCamera = false;
   bool frameArmed = false;    // main-frame EndScene pending
   bool endSceneHooked = false;
+  float postExitLog = 0;      // seconds left to log game state after exit
+  int debugShot = 0;
 };
 PhotoMode* g = nullptr;
 
@@ -182,7 +185,8 @@ void Exit(const char* why) {
   g->ui.Detach();
   g->input.SetMouseCapture(false);
   g->state = State::Off;
-  U2LOG("exit (%s)", why);
+  g->postExitLog = 3;
+  U2LOG("exit (%s): speed=%.2f hud=%d", why, Var<float>(addr::GameSpeed), Var<int>(addr::DrawHud));
 }
 
 void StartCapture() {
@@ -331,6 +335,7 @@ void HandleControls(float dt) {
 HRESULT __stdcall EndSceneDetour(IDirect3DDevice9* dev) {
   if (g->frameArmed) {
     g->frameArmed = false;
+    dev::OnEndScene(dev);
     if (g->state == State::Capturing && dev == Device()) g->capture.OnEndScene(dev);
   }
   return oEndScene(dev);
@@ -350,10 +355,25 @@ void Tick() {
     g->endSceneHooked = true;
   }
   g->frameArmed = true;
+  dev::Poll();
   g->input.Update();
   if (g->toastTime > 0) g->toastTime -= dt;
   if (std::string m = g->capture.TakeMessage(); !m.empty()) Toast(m, 4);
 
+  if (g->input.KeyPressed(VK_F12)) {  // debug: save the displayed frame incl. HUD/UI
+    CreateDirectoryA(g->cfg.outputDir.c_str(), nullptr);
+    std::string path = g->cfg.outputDir + "\debug_" + std::to_string(++g->debugShot) + ".png";
+    dev::RequestShot(path, 2);
+  }
+  if (g->postExitLog > 0) {
+    float before = g->postExitLog;
+    g->postExitLog -= dt;
+    if (static_cast<int>(before) != static_cast<int>(g->postExitLog) || g->postExitLog <= 0) {
+      auto rc = Var<int*>(addr::pRaceCoordinator);
+      U2LOG("post-exit: flow=%d speed=%.2f hud=%d pauseFE=%d rc=%d stop=%d", GameFlowState(), Var<float>(addr::GameSpeed),
+            Var<int>(addr::DrawHud), Var<uint8_t>(addr::PauseFEActive), rc ? *rc : -1, Var<int>(addr::CameraStopUpdating));
+    }
+  }
   if (g->state == State::Off) {
     // L3 + R3 (Start would also open the game's pause menu).
     bool combo = g->cfg.padCombo && g->input.PadDown(PadLS) && g->input.PadDown(PadRS) &&

@@ -10,8 +10,7 @@
 
 #include "u2sdk/log.h"
 
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#include "stb_image_write.h"
+#include "u2sdk/dev.h"
 
 namespace photomode {
 namespace {
@@ -181,7 +180,7 @@ void Capture::Finish() {
   ++g_saving;
   Notify("SAVING...");
   std::thread([this, img, w, h, path] {
-    int ok = stbi_write_png(path.c_str(), w, h, 3, img->data(), w * 3);
+    bool ok = u2::dev::SavePng(path, w, h, img->data());
     U2LOG("png %s (%dx%d): %s", path.c_str(), w, h, ok ? "saved" : "FAILED");
     std::string name = path.substr(path.find_last_of("\\/") + 1);
     Notify(ok ? "SAVED " + name : "SAVE FAILED");
