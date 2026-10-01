@@ -52,7 +52,7 @@ __declspec(naked) void PauseDecisionStub() {
 }
 
 enum class State { Off, Active, Capturing };
-enum Row { RowCamera, RowFocal, RowRoll, RowFocus, RowAperture, RowShutter, RowPreview, RowQuality, RowResolution, RowTake, RowCount };
+enum Row { RowCamera, RowFocal, RowRoll, RowFocus, RowAperture, RowShutter, RowPan, RowQuality, RowResolution, RowTake, RowCount };
 
 struct Saved {
   float gameSpeed;
@@ -74,7 +74,8 @@ struct PhotoMode {
   int focalIdx = 10, fstopIdx = 3, shutterIdx = 0, qualityIdx = 1, tiles = 1;
   bool focusAuto = true;
   float focusDist = 5;
-  bool previewFx = false;   // native DOF/MB preview is opt-in until verified in-game
+  bool panWithCar = true;   // free camera follows the car during a shutter exposure
+  Vec3 captureAnchor{};
   bool uiHidden = false;
   std::string toast;
   float toastTime = 0;
@@ -146,36 +147,24 @@ std::string NewPicturePath() {
 }
 
 // ---- camera ---------------------------------------------------------------------------------
-// The game's DOF / motion-blur passes sample blur render targets (0x86EB0C[], 0x86EB88[]) that are
-// only created when the effect is enabled in Display options at device creation. Turning the flag on
-// at runtime without them crashes at 0x5C6223 (null texture in the full-screen pass 0x5C5F70).
-bool NativeFxAvailable(bool dof) {
-  bool enabled = dof ? g->saved.dofEnable != 0 : g->saved.mbEnable != 0;
-  return enabled && Var<void*>(0x86EB88) && Var<void*>(0x86EB0C);
-}
-
-// Computes the photo camera's matrix; the SetCameraMatrix hook applies it the way
-// NFSU2_CameraToolkit does (replace *matrix and FOV, then call the original).
-void ApplyCamera() {
+// While photo mode is open the game's chase camera (CubicCameraMover::Update 0x453570) is frozen,
+// like NFSU2 Extra Options' "Freeze Camera" hotkey (HotkeyStuff.h writes `ret` there). That also
+// keeps WidescreenFix's mouse-look (which lives inside that update) from accumulating offsets.
+// We then feed the player camera ourselves through Camera::SetCameraMatrix 0x447280, the same
+// function NFSU2_CameraToolkit drives.
+void ApplyCamera(float dt) {
   CameraParams* cam = PlayerCamera();
   Vec3 eye, target, up;
   g->rig.Compute(g->anchor, &eye, &target, &up);
-  CreateLookAtMatrix(&g->camMatrix, eye, target, up);
-
-  bool nativeDof = g->state == State::Active && g->previewFx && FStop() > 0 && NativeFxAvailable(true);
-  bool nativeMb = g->state == State::Active && g->previewFx && lens::kShutters[g->shutterIdx] > 0 && NativeFxAvailable(false);
-  // Only ever switch an effect on if the player has it enabled in Display options (see
-  // NativeFxAvailable); otherwise leave the game's own setting untouched.
-  if (g->state == State::Active && g->saved.dofEnable) Var<int>(addr::g_DepthOfFieldEnable) = nativeDof ? 1 : 0;
-  if (g->state == State::Active && g->saved.mbEnable) Var<int>(addr::g_MotionBlurEnable) = nativeMb ? 1 : 0;
-  if (nativeDof) {
-    float s = FocusDistance();
-    cam->FocalDistance = s;
-    cam->DepthOfField = Clamp(lens::DepthOfFieldM(Focal(), FStop(), s), 0.05f, 1000.f);
-  } else {
-    cam->FocalDistance = 0;
-    cam->DepthOfField = 0;
+  // Free camera + shutter: pan with the car during the exposure (tracking shot).
+  if (g->state == State::Capturing && g->rig.mode == RigMode::Free && g->panWithCar) {
+    Vec3 d = g->anchor - g->captureAnchor;
+    eye += d;
+    target += d;
   }
+  CreateLookAtMatrix(&g->camMatrix, eye, target, up);
+  cam->FieldOfView = FocalToGameFov(Focal(), FovCal());
+  oSetCameraMatrix(cam, nullptr, &g->camMatrix, dt);
 }
 
 // ---- state transitions ----------------------------------------------------------------------
@@ -195,10 +184,12 @@ void Enter() {
   g->sel = RowFocal;
   g->uiHidden = false;
   g_freezeWorld = true;
+  Var<int>(addr::g_DepthOfFieldEnable) = 0;  // turning effects off is always safe
+  Var<int>(addr::g_MotionBlurEnable) = 0;
   GetCursorPos(&g->cursorAtEnter);
   g->input.SetMouseCapture(true);
   g->state = State::Active;
-  ApplyCamera();  // the hook needs a valid matrix from the very next frame
+  ApplyCamera(0);
   U2LOG("enter: cam pos (%.1f %.1f %.1f) dir (%.2f %.2f %.2f) fov %u (%.0fmm) car (%.1f %.1f %.1f)", cam->Position.x,
         cam->Position.y, cam->Position.z, cam->Direction.x, cam->Direction.y, cam->Direction.z, cam->FieldOfView, focal,
         g->anchor.x, g->anchor.y, g->anchor.z);
@@ -249,10 +240,9 @@ void StartCapture() {
     Toast(err);
     return;
   }
-  // Clean frame: game FX off (we do our own DOF/blur), FE off (HUD + our UI) via drawHud.
-  Var<int>(addr::g_DepthOfFieldEnable) = 0;
-  Var<int>(addr::g_MotionBlurEnable) = 0;
+  // Clean frame: FE off (HUD + our UI) via drawHud. Native DOF/MB are already off in photo mode.
   Var<int>(addr::DrawHud) = 0;
+  g->captureAnchor = g->anchor;
   g->state = State::Capturing;
 }
 
@@ -282,7 +272,7 @@ void Adjust(int row, int dir) {
       break;
     case RowAperture: g->fstopIdx = clampi(g->fstopIdx + dir, 0, lens::Count(lens::kFStops) - 1); break;
     case RowShutter: g->shutterIdx = clampi(g->shutterIdx + dir, 0, lens::Count(lens::kShutters) - 1); break;
-    case RowPreview: g->previewFx = !g->previewFx; break;
+    case RowPan: g->panWithCar = !g->panWithCar; break;
     case RowQuality: g->qualityIdx = wrap(g->qualityIdx + dir, lens::Count(lens::kQualitySamples)); break;
     case RowResolution: g->tiles = clampi(g->tiles + dir, 1, lens::kMaxTiles); break;
     default: break;
@@ -311,8 +301,7 @@ MenuView BuildMenu() {
   lens::FormatFStop(b, sizeof b, FStop());
   add("APERTURE", b);
   add("SHUTTER", lens::kShutterNames[g->shutterIdx]);
-  if (!NativeFxAvailable(true) && !NativeFxAvailable(false)) add("PREVIEW FX", "ENABLE DOF/BLUR IN OPTIONS");
-  else add("PREVIEW FX", g->previewFx ? "ON" : "OFF");
+  add("PAN WITH CAR", g->rig.mode == RigMode::Free ? (g->panWithCar ? "ON" : "OFF") : "ORBIT FOLLOWS");
   std::snprintf(b, sizeof b, "%s (%d)", lens::kQualityNames[g->qualityIdx], lens::kQualitySamples[g->qualityIdx]);
   add("QUALITY", b);
   std::snprintf(b, sizeof b, "%dX", g->tiles);
@@ -446,13 +435,13 @@ void Tick() {
       // (unpaused) loop path; otherwise the world stays on the game's own pause path.
       g_freezeWorld = speed <= 0;
       Var<float>(addr::GameSpeed) = speed > 0 ? speed : g->saved.gameSpeed;
-      ApplyCamera();
+      ApplyCamera(g->lastDt);
     }
   }
   if (g->state == State::Active) {
     HandleControls(dt);
     if (g->state == State::Off) return;
-    if (g->state == State::Active) ApplyCamera();
+    if (g->state == State::Active) ApplyCamera(g->lastDt);
   }
   if (g->uiHidden && g->state == State::Active && g->toastTime <= 0) g->ui.Clear();
   else g->ui.Draw(BuildMenu());
@@ -465,12 +454,20 @@ void __cdecl FrameDetour() {
   oFrame();
 }
 
+// Any other mover that still targets the player camera gets our matrix instead.
 void __fastcall SetCameraMatrixDetour(CameraParams* cam, void* edx, bMatrix4* m, float dt) {
   if (g->state != State::Off && cam == PlayerCamera()) {
     *m = g->camMatrix;
     cam->FieldOfView = FocalToGameFov(Focal(), FovCal());
   }
   oSetCameraMatrix(cam, edx, m, dt);
+}
+
+using MoverUpdateFn = void(__fastcall*)(void*, void*);
+MoverUpdateFn oCubicMoverUpdate;
+void __fastcall CubicMoverUpdateDetour(void* mover, void* edx) {
+  if (g->state != State::Off) return;  // frozen while photo mode is open (ExOpts "Freeze Camera")
+  oCubicMoverUpdate(mover, edx);
 }
 
 void __fastcall ProjDetour(void* plat, void* edx, eView* view, float a, float b, int c) {
@@ -515,6 +512,7 @@ bool Install() {
   bool ok = true;
   ok &= hook::Create(0x5D2850, &FrameDetour, &oFrame, "RenderFrame");
   ok &= hook::Create(addr::Camera_SetCameraMatrix, &SetCameraMatrixDetour, &oSetCameraMatrix, "Camera::SetCameraMatrix");
+  ok &= hook::Create(0x453570, &CubicMoverUpdateDetour, &oCubicMoverUpdate, "CubicCameraMover::Update");
   ok &= hook::Create(addr::eViewPlatInfo_Update, &ProjDetour, &oProj, "eViewPlatInfo::Update");
   ok &= hook::Create(addr::cFEng_Render, &FeRenderDetour, &oFeRender, "cFEng::Render");
   ok &= d3d::InstallResetHook();
