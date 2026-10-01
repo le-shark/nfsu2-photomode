@@ -89,6 +89,7 @@ struct PhotoMode {
   int debugShot = 0;
   bool hudFilter = true;      // F11 toggles (debug)
   POINT cursorAtEnter{};
+  uint8_t savedCursorFlag = 1;
 };
 PhotoMode* g = nullptr;
 
@@ -186,6 +187,8 @@ void Enter() {
   Var<int>(addr::g_DepthOfFieldEnable) = 0;  // turning effects off is always safe
   Var<int>(addr::g_MotionBlurEnable) = 0;
   GetCursorPos(&g->cursorAtEnter);
+  g->savedCursorFlag = Var<uint8_t>(0x7FA29C);
+  Var<uint8_t>(0x7FA29C) = 0;  // hide the FE cursor, like the game's showcase photo shoot (0x4CEE11)
   g->input.SetMouseCapture(true);
   g->state = State::Active;
   ApplyCamera(0);
@@ -210,6 +213,7 @@ void Exit(const char* why) {
   cam->DepthOfField = g->saved.cam.DepthOfField;
   menu::Close();
   g->input.SetMouseCapture(false);
+  Var<uint8_t>(0x7FA29C) = g->savedCursorFlag;
   // Put the cursor back: the game/WidescreenFix mouse-look reads cursor deltas.
   SetCursorPos(g->cursorAtEnter.x, g->cursorAtEnter.y);
   g->state = State::Off;
@@ -483,22 +487,64 @@ void __fastcall ProjDetour(void* plat, void* edx, eView* view, float a, float b,
   m[2] = Mul(m[0], m[1]);
 }
 
-// Hide every FE package except ours while photo mode is up (HUD, messages, minimap...).
+// FE transform (0x5BDDE0, cdecl(const matrix*, int view)): called for the 2D pass at 0x5CC08D
+// (WidescreenFix redirects that call to apply FEScale, so hooking the function entry sees the final
+// matrix). We remember the last one so our menu can be drawn with an extra scale/offset.
+using FeSetTransformFn = void(__cdecl*)(const Mat4*, int);
+FeSetTransformFn oFeSetTransform;
+alignas(16) Mat4 g_feMatrix;
+bool g_feMatrixValid = false;
+void __cdecl FeSetTransformDetour(const Mat4* m, int view) {
+  if (m && view == 0) {
+    g_feMatrix = *m;
+    g_feMatrixValid = true;
+  }
+  oFeSetTransform(m, view);
+}
+
+// While photo mode is up:
+//  pass 1: every package except our menu, with the HUD hidden (only the help bar stays);
+//  pass 2: only our menu, scaled/offset into a side panel (FE flushes draws per package, 0x53678F).
 void __fastcall FeRenderDetour(void* feng, void* edx) {
   if (g->state == State::Off || !g->hudFilter) return oFeRender(feng, edx);
   void* saved[64];
   feng::FEPackage* pkgs[64];
   int n = 0;
+  feng::FEPackage* mine = nullptr;
   for (auto p = feng::FirstActivePackage(); p && n < 64; p = feng::NextPackage(p)) {
-    const char* name = feng::PackageName(p);
-    if (name && (!_stricmp(name, "UI_PauseOptions.fng") || !_stricmp(name, "UI_PC_Help_Bar.fng"))) continue;  // our menu
     pkgs[n] = p;
     saved[n] = feng::PackageObjects(p);
-    feng::PackageObjects(p) = nullptr;
     ++n;
+    if (menu::IsMenuPackage(feng::PackageName(p))) mine = p;
   }
+  auto keepInPass1 = [](feng::FEPackage* p) {
+    const char* name = feng::PackageName(p);
+    return name && !_stricmp(name, "UI_PC_Help_Bar.fng");
+  };
+  for (int i = 0; i < n; ++i)
+    if (!keepInPass1(pkgs[i])) feng::PackageObjects(pkgs[i]) = nullptr;
   oFeRender(feng, edx);
   for (int i = 0; i < n; ++i) feng::PackageObjects(pkgs[i]) = saved[i];
+
+  if (mine) {
+    for (int i = 0; i < n; ++i)
+      if (pkgs[i] != mine) feng::PackageObjects(pkgs[i]) = nullptr;
+    const menu::Layout& L = menu::GetLayout();
+    bool scaled = g_feMatrixValid && (L.scale != 1.0f || L.x != 0 || L.y != 0);
+    alignas(16) Mat4 restore = g_feMatrix;
+    alignas(16) Mat4 panel;
+    if (scaled) {
+      Mat4 a = Mat4::Identity();
+      a.m[0][0] = a.m[1][1] = L.scale;
+      a.m[3][0] = L.x;
+      a.m[3][1] = L.y;
+      panel = Mul(a, g_feMatrix);
+      oFeSetTransform(&panel, 0);
+    }
+    oFeRender(feng, edx);
+    if (scaled) oFeSetTransform(&restore, 0);
+    for (int i = 0; i < n; ++i) feng::PackageObjects(pkgs[i]) = saved[i];
+  }
 }
 
 void OnDeviceReset() {
@@ -511,6 +557,9 @@ bool Install() {
   g->cfg.Load();
   g->qualityIdx = g->cfg.defaultQuality < 0 ? 0 : (g->cfg.defaultQuality > 2 ? 2 : g->cfg.defaultQuality);
   QueryPerformanceFrequency(&g->qpcFreq);
+  // Park the cursor at the left edge, outside the menu's hit area, so FE mouse hover can't change
+  // the selected row while the mouse steers the camera.
+  g->input.SetCapturePoint(0.06f, 0.5f);
   if (!hook::Init()) return false;
   bool ok = true;
   ok &= hook::Create(0x5D2850, &FrameDetour, &oFrame, "RenderFrame");
@@ -519,7 +568,8 @@ bool Install() {
   ok &= hook::Create(addr::eViewPlatInfo_Update, &ProjDetour, &oProj, "eViewPlatInfo::Update");
   ok &= hook::Create(addr::cFEng_Render, &FeRenderDetour, &oFeRender, "cFEng::Render");
   ok &= d3d::InstallResetHook();
-  ok &= menu::Install(menu::Callbacks{RowCount, &RowLabel, &RowValue, &Adjust, &Activate, &MenuBack});
+  ok &= menu::Install(menu::Callbacks{RowCount, &RowLabel, &RowValue, &Adjust, &Activate, &MenuBack}, g->cfg.menuLayout);
+  ok &= hook::Create(0x5BDDE0, &FeSetTransformDetour, &oFeSetTransform, "FE SetTransform");
   // Verify the exact bytes before redirecting the pause decision (movzx eax,al; cmp eax,ebx).
   const uint8_t expect[5] = {0x0F, 0xB6, 0xC0, 0x3B, 0xC3};
   if (std::memcmp(reinterpret_cast<void*>(kPauseDecision), expect, 5) == 0) {

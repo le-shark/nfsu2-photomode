@@ -1,6 +1,8 @@
 #pragma once
 #include <string>
 
+#include "native_menu.h"
+
 
 namespace photomode {
 
@@ -20,6 +22,8 @@ struct Settings {
   std::string outputDir;         // default <game>\screenshots
   bool antialias = true;
   int defaultQuality = 1;
+  // [Menu]
+  menu::Layout menuLayout;
   // [Debug]
   bool verbose = false;
 

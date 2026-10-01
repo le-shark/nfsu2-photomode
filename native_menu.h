@@ -19,7 +19,17 @@ struct Callbacks {
   void (*back)();                                // BACK pressed (called from frame code)
 };
 
-bool Install(const Callbacks& cb);               // dispatching factory in FNGData[UI_PauseOptions.fng]
+// Side-panel layout: our package is drawn in its own pass with this canvas-space scale/offset
+// applied on top of the FE transform (640x480 FE canvas, origin at the centre).
+struct Layout {
+  float scale = 0.6f;
+  float x = 226, y = -82;       // canvas offset after scaling
+  int backingAlpha = 140;       // 0..255 alpha of the menu backing panels (transparency)
+};
+
+bool Install(const Callbacks& cb, const Layout& layout);
+const Layout& GetLayout();
+bool IsMenuPackage(const char* name);  // our package (drawn in the scaled pass)
 bool Open();                                     // call from frame code (not inside FE callbacks)
 void Close();                                    // same
 bool IsOpen();

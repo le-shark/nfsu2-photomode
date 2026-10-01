@@ -45,6 +45,7 @@ using FactoryFn = void*(__cdecl*)(void*);
 
 // ---- state ----------------------------------------------------------------------------------
 Callbacks g_cb{};
+Layout g_layout{};
 FactoryFn g_origFactory = nullptr;
 bool g_wantOurs = false;     // next UI_PauseOptions.fng construction is ours
 int g_wantFrames = 0;
@@ -125,6 +126,31 @@ void PushHelpBar(const char* ownPkg) {
   }
 }
 
+// Backing panels only have an INIT script, so alpha changes after startup stick.
+// Group children: first child at +0x64, next sibling at +0x04 (see FEngSetVisible 0x50CA50).
+void SetAlphaRecursive(uint8_t* obj, int alpha) {
+  for (; obj; obj = *reinterpret_cast<uint8_t**>(obj + 4)) {
+    auto data = *reinterpret_cast<int**>(obj + 0x2C);
+    if (data) {
+      data[3] = data[3] * alpha / 255;                       // FEObjData color: B, G, R, A ints
+      *reinterpret_cast<uint32_t*>(obj + 0x1C) |= 0x400000;  // needs update (as FEngSetColor 0x51D843)
+    }
+    if (*reinterpret_cast<uint32_t*>(obj + 0x18) == 5) SetAlphaRecursive(*reinterpret_cast<uint8_t**>(obj + 0x64), alpha);
+  }
+}
+
+void ApplyBacking(const char* pkg) {
+  if (g_layout.backingAlpha >= 255) return;
+  for (const char* name : {"BIG MENU BACKING", "SMALLER MENU BACKING"}) {
+    auto group = reinterpret_cast<uint8_t*>(u2::feng::FindObject(pkg, u2::feng::HashUpper(name)));
+    if (!group) {
+      U2LOG("menu: %s not found", name);
+      continue;
+    }
+    SetAlphaRecursive(*reinterpret_cast<uint8_t**>(group + 0x64), g_layout.backingAlpha);
+  }
+}
+
 void* __cdecl Factory(void* showData) {
   if (!g_wantOurs) return g_origFactory(showData);
   g_wantOurs = false;
@@ -152,6 +178,7 @@ void* __cdecl Factory(void* showData) {
     UIWidgetMenu_AddToggleOption(menu, nullptr, w, true);  // binds OPTION_NAME_n etc. and calls Draw
   }
   UIWidgetMenu_SetInitialOption(menu, nullptr, 0);
+  ApplyBacking(pkg);
   PushHelpBar(pkg);
   g_menu = menu;
   U2LOG("menu: built native screen %p with %zu rows", menu, g_rows.size());
@@ -159,8 +186,12 @@ void* __cdecl Factory(void* showData) {
 }
 }  // namespace
 
-bool Install(const Callbacks& cb) {
+const Layout& GetLayout() { return g_layout; }
+bool IsMenuPackage(const char* name) { return g_open && name && _stricmp(name, kPkg) == 0; }
+
+bool Install(const Callbacks& cb, const Layout& layout) {
   g_cb = cb;
+  g_layout = layout;
   auto cur = Var<FactoryFn>(kFactorySlot);
   if (reinterpret_cast<uintptr_t>(cur) != 0x4EB650) {
     U2LOG("menu: FNGData[%s] factory is %p, expected 004EB650 (another mod?); native menu disabled", kPkg, cur);

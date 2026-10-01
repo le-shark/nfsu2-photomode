@@ -37,6 +37,11 @@ void Settings::Load() {
   antialias = ini.GetBool("Capture", "AntiAliasing", antialias);
   defaultQuality = ini.GetInt("Capture", "DefaultQuality", defaultQuality);
 
+  menuLayout.scale = ini.GetFloat("Menu", "Scale", menuLayout.scale);
+  menuLayout.x = ini.GetFloat("Menu", "X", menuLayout.x);
+  menuLayout.y = ini.GetFloat("Menu", "Y", menuLayout.y);
+  menuLayout.backingAlpha = ini.GetInt("Menu", "BackingAlpha", menuLayout.backingAlpha);
+
   verbose = ini.GetBool("Debug", "Verbose", verbose);
   U2LOG("settings: hotkey=0x%02X padCombo=%d move=%.1f sens=%.3f maxDist=%.0f out=%s", hotkey, padCombo, moveSpeed,
         mouseSensitivity, maxDistance, outputDir.c_str());
