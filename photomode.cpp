@@ -146,6 +146,14 @@ std::string NewPicturePath() {
 }
 
 // ---- camera ---------------------------------------------------------------------------------
+// The game's DOF / motion-blur passes sample blur render targets (0x86EB0C[], 0x86EB88[]) that are
+// only created when the effect is enabled in Display options at device creation. Turning the flag on
+// at runtime without them crashes at 0x5C6223 (null texture in the full-screen pass 0x5C5F70).
+bool NativeFxAvailable(bool dof) {
+  bool enabled = dof ? g->saved.dofEnable != 0 : g->saved.mbEnable != 0;
+  return enabled && Var<void*>(0x86EB88) && Var<void*>(0x86EB0C);
+}
+
 // Computes the photo camera's matrix; the SetCameraMatrix hook applies it the way
 // NFSU2_CameraToolkit does (replace *matrix and FOV, then call the original).
 void ApplyCamera() {
@@ -154,10 +162,12 @@ void ApplyCamera() {
   g->rig.Compute(g->anchor, &eye, &target, &up);
   CreateLookAtMatrix(&g->camMatrix, eye, target, up);
 
-  bool nativeDof = g->state == State::Active && g->previewFx && FStop() > 0;
-  bool nativeMb = g->state == State::Active && g->previewFx && lens::kShutters[g->shutterIdx] > 0;
-  Var<int>(addr::g_DepthOfFieldEnable) = nativeDof ? 1 : 0;
-  Var<int>(addr::g_MotionBlurEnable) = nativeMb ? 1 : 0;
+  bool nativeDof = g->state == State::Active && g->previewFx && FStop() > 0 && NativeFxAvailable(true);
+  bool nativeMb = g->state == State::Active && g->previewFx && lens::kShutters[g->shutterIdx] > 0 && NativeFxAvailable(false);
+  // Only ever switch an effect on if the player has it enabled in Display options (see
+  // NativeFxAvailable); otherwise leave the game's own setting untouched.
+  if (g->state == State::Active && g->saved.dofEnable) Var<int>(addr::g_DepthOfFieldEnable) = nativeDof ? 1 : 0;
+  if (g->state == State::Active && g->saved.mbEnable) Var<int>(addr::g_MotionBlurEnable) = nativeMb ? 1 : 0;
   if (nativeDof) {
     float s = FocusDistance();
     cam->FocalDistance = s;
@@ -192,6 +202,8 @@ void Enter() {
   U2LOG("enter: cam pos (%.1f %.1f %.1f) dir (%.2f %.2f %.2f) fov %u (%.0fmm) car (%.1f %.1f %.1f)", cam->Position.x,
         cam->Position.y, cam->Position.z, cam->Direction.x, cam->Direction.y, cam->Direction.z, cam->FieldOfView, focal,
         g->anchor.x, g->anchor.y, g->anchor.z);
+  U2LOG("enter: options dof=%d mb=%d, blur RTs 86EB0C=%p 86EB88=%p 86FFA8=%p 86FF74=%p", g->saved.dofEnable, g->saved.mbEnable,
+        Var<void*>(0x86EB0C), Var<void*>(0x86EB88), Var<void*>(0x86FFA8), Var<void*>(0x86FF74));
 }
 
 void Exit(const char* why) {
@@ -299,7 +311,8 @@ MenuView BuildMenu() {
   lens::FormatFStop(b, sizeof b, FStop());
   add("APERTURE", b);
   add("SHUTTER", lens::kShutterNames[g->shutterIdx]);
-  add("PREVIEW FX", g->previewFx ? "ON" : "OFF");
+  if (!NativeFxAvailable(true) && !NativeFxAvailable(false)) add("PREVIEW FX", "ENABLE DOF/BLUR IN OPTIONS");
+  else add("PREVIEW FX", g->previewFx ? "ON" : "OFF");
   std::snprintf(b, sizeof b, "%s (%d)", lens::kQualityNames[g->qualityIdx], lens::kQualitySamples[g->qualityIdx]);
   add("QUALITY", b);
   std::snprintf(b, sizeof b, "%dX", g->tiles);
