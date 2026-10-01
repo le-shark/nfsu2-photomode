@@ -487,19 +487,28 @@ void __fastcall ProjDetour(void* plat, void* edx, eView* view, float a, float b,
   m[2] = Mul(m[0], m[1]);
 }
 
-// FE transform (0x5BDDE0, cdecl(const matrix*, int view)): called for the 2D pass at 0x5CC08D
-// (WidescreenFix redirects that call to apply FEScale, so hooking the function entry sees the final
-// matrix). We remember the last one so our menu can be drawn with an extra scale/offset.
-using FeSetTransformFn = void(__cdecl*)(const Mat4*, int);
-FeSetTransformFn oFeSetTransform;
-alignas(16) Mat4 g_feMatrix;
-bool g_feMatrixValid = false;
-void __cdecl FeSetTransformDetour(const Mat4* m, int view) {
-  if (m && view == 0) {
-    g_feMatrix = *m;
-    g_feMatrixValid = true;
+// FE root transform. cFEng::Render (0x536520) starts by asking its interface (UIData vtable
+// 0x79BCD8 slot 15 = 0x50C490, thiscall(float out[16]), ret 4) for the root matrix, which is
+// identity. Every object position goes through it (0x504B50, row vectors: translation in m[12..13])
+// and groups chain their child matrices onto it (0x52C5D0). While our menu package is being drawn
+// we hand back a scale + offset instead, which shrinks the native screen into a side panel.
+using RootTransformFn = void(__fastcall*)(void*, void*, float*);
+RootTransformFn oRootTransform = reinterpret_cast<RootTransformFn>(0x50C490);
+bool g_panelPass = false;
+void __fastcall RootTransformDetour(void* self, void* edx, float* out) {
+  oRootTransform(self, edx, out);
+  if (!g_panelPass) return;
+  const menu::Layout& L = menu::GetLayout();
+  out[0] *= L.scale;
+  out[5] *= L.scale;
+  out[12] += L.x;
+  out[13] += L.y;
+  static bool logged = false;
+  if (!logged) {
+    logged = true;
+    U2LOG("menu panel root transform: [%.2f %.2f %.2f %.2f | %.2f %.2f %.2f %.2f | .. | %.1f %.1f %.1f %.1f]", out[0], out[1],
+          out[2], out[3], out[4], out[5], out[6], out[7], out[12], out[13], out[14], out[15]);
   }
-  oFeSetTransform(m, view);
 }
 
 // While photo mode is up:
@@ -526,23 +535,17 @@ void __fastcall FeRenderDetour(void* feng, void* edx) {
   oFeRender(feng, edx);
   for (int i = 0; i < n; ++i) feng::PackageObjects(pkgs[i]) = saved[i];
 
+  static feng::FEPackage* loggedMine = nullptr;
+  if (mine != loggedMine) {
+    loggedMine = mine;
+    U2LOG("menu panel pass: package %p (%d active packages)", mine, n);
+  }
   if (mine) {
     for (int i = 0; i < n; ++i)
       if (pkgs[i] != mine) feng::PackageObjects(pkgs[i]) = nullptr;
-    const menu::Layout& L = menu::GetLayout();
-    bool scaled = g_feMatrixValid && (L.scale != 1.0f || L.x != 0 || L.y != 0);
-    alignas(16) Mat4 restore = g_feMatrix;
-    alignas(16) Mat4 panel;
-    if (scaled) {
-      Mat4 a = Mat4::Identity();
-      a.m[0][0] = a.m[1][1] = L.scale;
-      a.m[3][0] = L.x;
-      a.m[3][1] = L.y;
-      panel = Mul(a, g_feMatrix);
-      oFeSetTransform(&panel, 0);
-    }
+    g_panelPass = true;
     oFeRender(feng, edx);
-    if (scaled) oFeSetTransform(&restore, 0);
+    g_panelPass = false;
     for (int i = 0; i < n; ++i) feng::PackageObjects(pkgs[i]) = saved[i];
   }
 }
@@ -569,7 +572,9 @@ bool Install() {
   ok &= hook::Create(addr::cFEng_Render, &FeRenderDetour, &oFeRender, "cFEng::Render");
   ok &= d3d::InstallResetHook();
   ok &= menu::Install(menu::Callbacks{RowCount, &RowLabel, &RowValue, &Adjust, &Activate, &MenuBack}, g->cfg.menuLayout);
-  ok &= hook::Create(0x5BDDE0, &FeSetTransformDetour, &oFeSetTransform, "FE SetTransform");
+  // UIData vtable slot 15 (root FE transform); only one UIData instance exists (ctor 0x5372FF).
+  if (Var<uintptr_t>(0x79BD14) == 0x50C490) mem::Write<void*>(0x79BD14, reinterpret_cast<void*>(&RootTransformDetour));
+  else U2LOG("FE root transform slot already patched (another mod?); menu stays full size");
   // Verify the exact bytes before redirecting the pause decision (movzx eax,al; cmp eax,ebx).
   const uint8_t expect[5] = {0x0F, 0xB6, 0xC0, 0x3B, 0xC3};
   if (std::memcmp(reinterpret_cast<void*>(kPauseDecision), expect, 5) == 0) {
