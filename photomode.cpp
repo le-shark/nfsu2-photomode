@@ -12,7 +12,7 @@
 #include "lens.h"
 #include "rig.h"
 #include "settings.h"
-#include "ui.h"
+#include "native_menu.h"
 #include "u2sdk/d3d.h"
 #include "u2sdk/dev.h"
 #include "u2sdk/feng.h"
@@ -64,7 +64,6 @@ struct PhotoMode {
   Settings cfg;
   Input input;
   Rig rig;
-  Ui ui;
   Capture capture;
   State state = State::Off;
   Saved saved{};
@@ -209,7 +208,7 @@ void Exit(const char* why) {
   cam->FieldOfView = g->saved.cam.FieldOfView;
   cam->FocalDistance = g->saved.cam.FocalDistance;
   cam->DepthOfField = g->saved.cam.DepthOfField;
-  g->ui.Clear();
+  menu::Close();
   g->input.SetMouseCapture(false);
   // Put the cursor back: the game/WidescreenFix mouse-look reads cursor deltas.
   SetCursorPos(g->cursorAtEnter.x, g->cursorAtEnter.y);
@@ -285,39 +284,45 @@ void Activate(int row) {
   else Adjust(row, 1);
 }
 
-MenuView BuildMenu() {
-  MenuView v;
-  char b[64];
-  v.title = "PHOTO MODE";
-  auto add = [&](const char* name, const std::string& val) { v.rows.push_back({name, val, false}); };
-  add("CAMERA", g->rig.mode == RigMode::Orbit ? "ORBIT" : "FREE");
-  std::snprintf(b, sizeof b, "%.0fMM", Focal());
-  add("FOCAL LENGTH", b);
-  std::snprintf(b, sizeof b, "%+.0f DEG", g->rig.roll);
-  add("ROLL", b);
-  if (g->focusAuto) std::snprintf(b, sizeof b, "AUTO %.1fM", AutoFocusDistance());
-  else std::snprintf(b, sizeof b, "%.1fM", g->focusDist);
-  add("FOCUS", b);
-  lens::FormatFStop(b, sizeof b, FStop());
-  add("APERTURE", b);
-  add("SHUTTER", lens::kShutterNames[g->shutterIdx]);
-  add("PAN WITH CAR", g->rig.mode == RigMode::Free ? (g->panWithCar ? "ON" : "OFF") : "ORBIT FOLLOWS");
-  std::snprintf(b, sizeof b, "%s (%d)", lens::kQualityNames[g->qualityIdx], lens::kQualitySamples[g->qualityIdx]);
-  add("QUALITY", b);
-  std::snprintf(b, sizeof b, "%dX", g->tiles);
-  add("RESOLUTION", b);
-  add("TAKE PICTURE", "");
-  v.rows[g->sel].selected = true;
-  if (g->state == State::Capturing) {
-    std::snprintf(b, sizeof b, "CAPTURING %d%%", static_cast<int>(g->capture.Progress() * 100));
-    v.toast = b;
-  } else if (g->toastTime > 0) {
-    v.toast = g->toast;
+// Row texts for the native menu (native_menu.cpp draws them into UI_PauseOptions.fng).
+std::string RowLabel(int row) {
+  static const char* names[RowCount] = {"Camera",  "Focal Length", "Roll",       "Focus",     "Aperture",
+                                        "Shutter", "Pan With Car", "Quality",    "Resolution", "Take Picture"};
+  return row >= 0 && row < RowCount ? names[row] : "";
+}
+
+std::string RowValue(int row) {
+  char b[64] = "";
+  switch (row) {
+    case RowCamera: return g->rig.mode == RigMode::Orbit ? "Orbit" : "Free";
+    case RowFocal: std::snprintf(b, sizeof b, "%.0f mm", Focal()); break;
+    case RowRoll: std::snprintf(b, sizeof b, "%+.0f", g->rig.roll); break;
+    case RowFocus:
+      if (g->focusAuto) std::snprintf(b, sizeof b, "Auto (%.1f m)", AutoFocusDistance());
+      else std::snprintf(b, sizeof b, "%.1f m", g->focusDist);
+      break;
+    case RowAperture: lens::FormatFStop(b, sizeof b, FStop()); break;
+    case RowShutter: return lens::kShutterNames[g->shutterIdx];
+    case RowPan: return g->rig.mode == RigMode::Free ? (g->panWithCar ? "On" : "Off") : "Orbit follows";
+    case RowQuality: std::snprintf(b, sizeof b, "%s", lens::kQualityNames[g->qualityIdx]); break;
+    case RowResolution: std::snprintf(b, sizeof b, "%dx", g->tiles); break;
+    case RowTake: return "";
   }
-  v.help = g->input.Pad().connected
-               ? "LS/RS MOVE+LOOK  LT/RT DOWN/UP  LB/RB ROLL  (X) PICTURE  (Y) HIDE  (B) EXIT"
-               : "WASD/QE MOVE  MOUSE LOOK  Z/C ROLL  WHEEL ZOOM  SPACE PICTURE  H HIDE  TAB EXIT";
-  return v;
+  return b;
+}
+
+std::string StatusText() {
+  char b[64];
+  if (g->state == State::Capturing) {
+    std::snprintf(b, sizeof b, "Capturing %d%%", static_cast<int>(g->capture.Progress() * 100));
+    return b;
+  }
+  return g->toastTime > 0 ? g->toast : std::string();
+}
+
+void MenuBack() {
+  if (g->state == State::Capturing) g->capture.Abort("CANCELLED");
+  else Exit("menu back");
 }
 
 // ---- per-frame ------------------------------------------------------------------------------
@@ -334,14 +339,7 @@ void HandleControls(float dt) {
     StartCapture();
     return;
   }
-  if (!g->uiHidden) {
-    if (in.KeyRepeat(VK_UP, dt) || in.PadRepeat(PadUp, dt)) g->sel = (g->sel + RowCount - 1) % RowCount;
-    if (in.KeyRepeat(VK_DOWN, dt) || in.PadRepeat(PadDown, dt)) g->sel = (g->sel + 1) % RowCount;
-    if (in.KeyRepeat(VK_LEFT, dt) || in.PadRepeat(PadLeft, dt)) Adjust(g->sel, -1);
-    if (in.KeyRepeat(VK_RIGHT, dt) || in.PadRepeat(PadRight, dt)) Adjust(g->sel, +1);
-    if (in.KeyPressed(VK_RETURN) || in.PadPressed(PadA)) Activate(g->sel);
-    if (g->state != State::Active) return;  // capture started from the menu
-  }
+  // Menu navigation (arrows / Enter / Esc, D-pad / A / B) is handled by the game's own FE.
   if (int w = in.Wheel()) g->focalIdx = static_cast<int>(Clamp(static_cast<float>(g->focalIdx + w), 0, lens::Count(lens::kFocals) - 1.f));
 
   RigInput ri;
@@ -417,7 +415,9 @@ void Tick() {
     }
     return;
   }
-  if (!IsInGame() || IsGamePaused()) {
+  // Only the game's real pause state counts here (our own menu screen is up while photo mode is).
+  auto rc = Var<int*>(addr::pRaceCoordinator);
+  if (!IsInGame() || (rc && *rc == 6)) {
     Exit(IsInGame() ? "game paused" : "left gameplay");
     return;
   }
@@ -443,8 +443,11 @@ void Tick() {
     if (g->state == State::Off) return;
     if (g->state == State::Active) ApplyCamera(g->lastDt);
   }
-  if (g->uiHidden && g->state == State::Active && g->toastTime <= 0) g->ui.Clear();
-  else g->ui.Draw(BuildMenu());
+  if (g->state != State::Off) {
+    if (g->uiHidden && g->state == State::Active) menu::Close();
+    else if (!menu::IsOpen()) menu::Open();
+    menu::Update("Photo Mode", StatusText());
+  }
   g->lastDt = dt > 0 ? dt : g->lastDt;
 }
 
@@ -486,9 +489,9 @@ void __fastcall FeRenderDetour(void* feng, void* edx) {
   void* saved[64];
   feng::FEPackage* pkgs[64];
   int n = 0;
-  feng::FEPackage* mine = g->ui.Package();
   for (auto p = feng::FirstActivePackage(); p && n < 64; p = feng::NextPackage(p)) {
-    if (p == mine) continue;
+    const char* name = feng::PackageName(p);
+    if (name && (!_stricmp(name, "UI_PauseOptions.fng") || !_stricmp(name, "UI_PC_Help_Bar.fng"))) continue;  // our menu
     pkgs[n] = p;
     saved[n] = feng::PackageObjects(p);
     feng::PackageObjects(p) = nullptr;
@@ -516,6 +519,7 @@ bool Install() {
   ok &= hook::Create(addr::eViewPlatInfo_Update, &ProjDetour, &oProj, "eViewPlatInfo::Update");
   ok &= hook::Create(addr::cFEng_Render, &FeRenderDetour, &oFeRender, "cFEng::Render");
   ok &= d3d::InstallResetHook();
+  ok &= menu::Install(menu::Callbacks{RowCount, &RowLabel, &RowValue, &Adjust, &Activate, &MenuBack});
   // Verify the exact bytes before redirecting the pause decision (movzx eax,al; cmp eax,ebx).
   const uint8_t expect[5] = {0x0F, 0xB6, 0xC0, 0x3B, 0xC3};
   if (std::memcmp(reinterpret_cast<void*>(kPauseDecision), expect, 5) == 0) {
