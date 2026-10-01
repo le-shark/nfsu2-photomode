@@ -4,6 +4,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <ctime>
 #include <string>
 
@@ -19,16 +20,36 @@
 #include "u2sdk/hook.h"
 #include "u2sdk/input.h"
 #include "u2sdk/log.h"
+#include "u2sdk/mem.h"
 
 namespace photomode {
 namespace {
 using namespace u2;
 
-constexpr uintptr_t kMirrorPtr = 0x7FEE40;  // read once at 0x5CC0CA; null = no rear-view mirror quad
-// Paused game speed. 0 makes World::DoTimeStep (0x601A60: dt * Tweak_GameSpeed) step with dt = 0,
-// which is exactly what the game's own pause does (GameLoop 0x581319 calls it with dt = 0).
-// (NFSU2_CameraToolkit uses 0.01, which is visible slow motion.)
-constexpr float kPauseSpeed = 0.0f;
+// ---- world freeze ---------------------------------------------------------------------------
+// GameLoop decides at 0x58132C whether the game is paused:
+//   0x58132C  movzx eax, al      ; al = paused (RaceCoordinator state 6 = pause menu)
+//   0x58132F  cmp eax, ebx       ; ebx = 0
+//   0x581331  je  0x581349       ; not paused -> sim block, World::DoTimestep 0x609CE0(scaledDt)
+//   paused:   0x601A60(dt=0), store sim dt, jmp 0x581465 (skips the whole simulation block)
+// We redirect those 5 bytes to a stub that reports "paused" while photo mode wants the world frozen,
+// so the game takes its own pause path. (Tweak_GameSpeed = 0 is NOT equivalent: it still runs
+// World::DoTimestep with dt = 0, which left the game permanently frozen after exiting.)
+volatile bool g_freezeWorld = false;
+constexpr uintptr_t kPauseDecision = 0x58132C, kPauseDecisionReturn = 0x581331;
+
+__declspec(naked) void PauseDecisionStub() {
+  __asm {
+    movzx eax, al
+    cmp byte ptr [g_freezeWorld], 0
+    je done
+    mov eax, 1
+  done:
+    cmp eax, ebx
+    push kPauseDecisionReturn
+    ret
+  }
+}
 
 enum class State { Off, Active, Capturing };
 enum Row { RowCamera, RowFocal, RowRoll, RowFocus, RowAperture, RowShutter, RowPreview, RowQuality, RowResolution, RowTake, RowCount };
@@ -36,7 +57,6 @@ enum Row { RowCamera, RowFocal, RowRoll, RowFocus, RowAperture, RowShutter, RowP
 struct Saved {
   float gameSpeed;
   int dofEnable, mbEnable, drawHud;
-  void* mirror;
   CameraParams cam;
 };
 
@@ -154,7 +174,7 @@ bool CanEnter() { return IsInGame() && !IsGamePaused() && Device() && PlayerCame
 void Enter() {
   CameraParams* cam = PlayerCamera();
   g->saved = Saved{Var<float>(addr::GameSpeed), Var<int>(addr::g_DepthOfFieldEnable), Var<int>(addr::g_MotionBlurEnable),
-                   Var<int>(addr::DrawHud), Var<void*>(kMirrorPtr), *cam};
+                   Var<int>(addr::DrawHud), *cam};
   if (!UpdateAnchor()) g->anchor = ToVec3(cam->Position);
   g->rig.maxDist = g->cfg.maxDistance;
   g->rig.moveSpeed = g->cfg.moveSpeed;
@@ -164,8 +184,7 @@ void Enter() {
   g->focalIdx = lens::Closest(lens::kFocals, focal);
   g->sel = RowFocal;
   g->uiHidden = false;
-  Var<float>(addr::GameSpeed) = kPauseSpeed;
-  Var<void*>(kMirrorPtr) = nullptr;
+  g_freezeWorld = true;
   GetCursorPos(&g->cursorAtEnter);
   g->input.SetMouseCapture(true);
   g->state = State::Active;
@@ -179,11 +198,11 @@ void Exit(const char* why) {
   if (g->state == State::Off) return;
   g->capture.Abort("PHOTO MODE CLOSED");
   CameraParams* cam = PlayerCamera();
+  g_freezeWorld = false;
   Var<float>(addr::GameSpeed) = g->saved.gameSpeed;
   Var<int>(addr::g_DepthOfFieldEnable) = g->saved.dofEnable;
   Var<int>(addr::g_MotionBlurEnable) = g->saved.mbEnable;
   Var<int>(addr::DrawHud) = g->saved.drawHud;
-  Var<void*>(kMirrorPtr) = g->saved.mirror;
   cam->FieldOfView = g->saved.cam.FieldOfView;
   cam->FocalDistance = g->saved.cam.FocalDistance;
   cam->DepthOfField = g->saved.cam.DepthOfField;
@@ -218,7 +237,7 @@ void StartCapture() {
     Toast(err);
     return;
   }
-  // Clean frame: game FX off (we do our own DOF/blur), HUD + our UI off, mirror off.
+  // Clean frame: game FX off (we do our own DOF/blur), FE off (HUD + our UI) via drawHud.
   Var<int>(addr::g_DepthOfFieldEnable) = 0;
   Var<int>(addr::g_MotionBlurEnable) = 0;
   Var<int>(addr::DrawHud) = 0;
@@ -226,7 +245,8 @@ void StartCapture() {
 }
 
 void EndCapture() {
-  Var<float>(addr::GameSpeed) = kPauseSpeed;
+  g_freezeWorld = true;
+  Var<float>(addr::GameSpeed) = g->saved.gameSpeed;
   Var<int>(addr::DrawHud) = g->saved.drawHud;
   g->state = State::Active;
 }
@@ -409,7 +429,10 @@ void Tick() {
     } else {
       float speed = 0;
       g->capture.BeginFrame(g->lastDt, &speed);
-      Var<float>(addr::GameSpeed) = speed > kPauseSpeed ? speed : kPauseSpeed;
+      // Shutter samples advance the world by a small, non-zero time step through the normal
+      // (unpaused) loop path; otherwise the world stays on the game's own pause path.
+      g_freezeWorld = speed <= 0;
+      Var<float>(addr::GameSpeed) = speed > 0 ? speed : g->saved.gameSpeed;
       ApplyCamera();
     }
   }
@@ -482,6 +505,15 @@ bool Install() {
   ok &= hook::Create(addr::eViewPlatInfo_Update, &ProjDetour, &oProj, "eViewPlatInfo::Update");
   ok &= hook::Create(addr::cFEng_Render, &FeRenderDetour, &oFeRender, "cFEng::Render");
   ok &= d3d::InstallResetHook();
+  // Verify the exact bytes before redirecting the pause decision (movzx eax,al; cmp eax,ebx).
+  const uint8_t expect[5] = {0x0F, 0xB6, 0xC0, 0x3B, 0xC3};
+  if (std::memcmp(reinterpret_cast<void*>(kPauseDecision), expect, 5) == 0) {
+    mem::MakeJmp(kPauseDecision, reinterpret_cast<void*>(&PauseDecisionStub));
+    U2LOG("pause decision @ %08X redirected", static_cast<unsigned>(kPauseDecision));
+  } else {
+    U2LOG("pause decision @ %08X has unexpected bytes (another mod?); photo mode disabled", static_cast<unsigned>(kPauseDecision));
+    ok = false;
+  }
   d3d::AddResetListener(&OnDeviceReset);
   if (!ok) {
     U2LOG("some hooks failed; photo mode disabled");
