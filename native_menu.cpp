@@ -40,6 +40,9 @@ auto GetHelpBarFNGName = Fn<const char*(__cdecl*)()>(0x50CEA0);
 auto FEngShowPackage = Fn<void(__cdecl*)(const char*, const char*, unsigned, int)>(0x555F10);
 auto FEngSetLastButton = Fn<void(__cdecl*)(const char*, int)>(0x50B8C0);
 auto HelpBar_Show = Fn<void(__fastcall*)(void*, void*)>(0x54E6A0);
+// Selects the menu keyboard action map while racing (writes byte 0x870754, which the per-frame map
+// selector 0x5CFBF0 checks). The game does the same for the in-world dyno screen (0x557AEE).
+auto SetMenuKeyboardMap = Fn<void(__cdecl*)(char)>(0x5B7ED0);
 auto HelpBar_SyncByMask = Fn<void(__fastcall*)(void*, void*, unsigned, const char*)>(0x54E6E0);
 using FactoryFn = void*(__cdecl*)(void*);
 
@@ -58,6 +61,8 @@ struct Row {
 };
 std::vector<Row> g_rows;
 int g_pendingActivate = -1;
+int g_releasePauseBlockIn = 0;  // frames until the pause-key block is lifted after closing
+int g_inputLogIn = 0;
 bool g_pendingBack = false;
 std::string g_title, g_status;
 
@@ -220,7 +225,10 @@ bool Open() {
   g_pendingActivate = -1;
   g_pendingBack = false;
   AddFngToUIObject_1(kPkg, nullptr);
+  SetMenuKeyboardMap(1);
   Var<uint8_t>(kPauseKeyBlock) = 1;
+  g_releasePauseBlockIn = 0;
+  g_inputLogIn = 10;
   g_open = true;
   U2LOG("menu: opened (factory ran synchronously: %s)", g_menu ? "yes" : "no");
   return true;
@@ -233,7 +241,9 @@ void Close() {
   const char* bar = GetHelpBarFNGName();
   if (IsFNGLoaded(bar)) RemoveFNGFromUIObject(bar);
   RemoveFngAndJoyHandlers(kPkg);
-  Var<uint8_t>(kPauseKeyBlock) = 0;
+  SetMenuKeyboardMap(0);
+  // Lift the pause-key block a few frames later so an Esc still held from closing can't pause.
+  g_releasePauseBlockIn = 3;
   g_open = false;
   g_menu = nullptr;
   g_rows.clear();
@@ -248,7 +258,18 @@ int CurrentRow() {
   return cur ? RowId(cur) : -1;
 }
 
+void Tick() {
+  if (g_releasePauseBlockIn > 0 && --g_releasePauseBlockIn == 0 && !g_open) Var<uint8_t>(kPauseKeyBlock) = 0;
+}
+
 void Update(const std::string& title, const std::string& status) {
+  if (g_open && g_inputLogIn > 0 && --g_inputLogIn == 0) {
+    auto pkg = reinterpret_cast<uint8_t*>(u2::feng::FindPackage(kPkg));
+    auto feng = Var<uint8_t*>(0x8384C4) ? *reinterpret_cast<uint8_t**>(Var<uint8_t*>(0x8384C4) + 8) : nullptr;
+    U2LOG("menu input: mapctx=%d menuMap=%d inputsEnabled=%d pkg+1C=%X +24=%X +8C=%X", Var<int>(0x870788),
+          Var<uint8_t>(0x870754), feng ? feng[1] : -1, pkg ? *reinterpret_cast<uint32_t*>(pkg + 0x1C) : 0,
+          pkg ? *reinterpret_cast<uint32_t*>(pkg + 0x24) : 0, pkg ? *reinterpret_cast<uint32_t*>(pkg + 0x8C) : 0);
+  }
   if (g_wantOurs && g_wantFrames > 0 && --g_wantFrames == 0) {
     g_wantOurs = false;
     U2LOG("menu: factory was never called for %s", kPkg);

@@ -33,6 +33,7 @@ bool IsMenuPackage(const char* name);  // our package (drawn in the scaled pass)
 bool Open();                                     // call from frame code (not inside FE callbacks)
 void Close();                                    // same
 bool IsOpen();
+void Tick();                                     // every frame, even when photo mode is off
 void Update(const std::string& title, const std::string& status);  // per frame: redraw, run deferred actions
 int CurrentRow();                                // -1 if none
 

@@ -386,6 +386,7 @@ void Tick() {
     g->endSceneHooked = true;
   }
   g->frameArmed = true;
+  menu::Tick();
   dev::Poll();
   g->input.Update();
   if (g->toastTime > 0) g->toastTime -= dt;
