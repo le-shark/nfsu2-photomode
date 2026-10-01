@@ -1,7 +1,6 @@
 #pragma once
 #include <string>
 
-#include "ui.h"
 
 namespace photomode {
 
@@ -21,8 +20,6 @@ struct Settings {
   std::string outputDir;         // default <game>\screenshots
   bool antialias = true;
   int defaultQuality = 1;
-  // [UI]
-  UiLayout layout;
   // [Debug]
   bool verbose = false;
 

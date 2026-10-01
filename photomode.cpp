@@ -25,6 +25,8 @@ namespace {
 using namespace u2;
 
 constexpr uintptr_t kMirrorPtr = 0x7FEE40;  // read once at 0x5CC0CA; null = no rear-view mirror quad
+// "Paused" game speed. NFSU2_CameraToolkit pauses with 0.01 rather than 0 (InputHandle.h).
+constexpr float kPauseSpeed = 0.01f;
 
 enum class State { Off, Active, Capturing };
 enum Row { RowCamera, RowFocal, RowRoll, RowFocus, RowAperture, RowShutter, RowPreview, RowQuality, RowResolution, RowTake, RowCount };
@@ -50,7 +52,7 @@ struct PhotoMode {
   int focalIdx = 10, fstopIdx = 3, shutterIdx = 0, qualityIdx = 1, tiles = 1;
   bool focusAuto = true;
   float focusDist = 5;
-  bool previewFx = true;
+  bool previewFx = false;   // native DOF/MB preview is opt-in until verified in-game
   bool uiHidden = false;
   std::string toast;
   float toastTime = 0;
@@ -58,7 +60,7 @@ struct PhotoMode {
   Vec3 anchor{};
   LARGE_INTEGER lastQpc{}, qpcFreq{};
   float lastDt = 1 / 60.f;
-  bool inOwnSetCamera = false;
+  alignas(16) bMatrix4 camMatrix{};  // world->view matrix applied in the SetCameraMatrix hook
   bool frameArmed = false;    // main-frame EndScene pending
   bool endSceneHooked = false;
   float postExitLog = 0;      // seconds left to log game state after exit
@@ -120,16 +122,13 @@ std::string NewPicturePath() {
 }
 
 // ---- camera ---------------------------------------------------------------------------------
-void ApplyCamera(float dt) {
+// Computes the photo camera's matrix; the SetCameraMatrix hook applies it the way
+// NFSU2_CameraToolkit does (replace *matrix and FOV, then call the original).
+void ApplyCamera() {
   CameraParams* cam = PlayerCamera();
   Vec3 eye, target, up;
   g->rig.Compute(g->anchor, &eye, &target, &up);
-  alignas(16) bMatrix4 m;
-  CreateLookAtMatrix(&m, eye, target, up);
-  g->inOwnSetCamera = true;
-  oSetCameraMatrix(cam, nullptr, &m, dt);
-  g->inOwnSetCamera = false;
-  cam->FieldOfView = FocalToGameFov(Focal(), FovCal());
+  CreateLookAtMatrix(&g->camMatrix, eye, target, up);
 
   bool nativeDof = g->state == State::Active && g->previewFx && FStop() > 0;
   bool nativeMb = g->state == State::Active && g->previewFx && lens::kShutters[g->shutterIdx] > 0;
@@ -161,10 +160,11 @@ void Enter() {
   g->focalIdx = lens::Closest(lens::kFocals, focal);
   g->sel = RowFocal;
   g->uiHidden = false;
-  Var<float>(addr::GameSpeed) = 0;
+  Var<float>(addr::GameSpeed) = kPauseSpeed;
   Var<void*>(kMirrorPtr) = nullptr;
   g->input.SetMouseCapture(true);
   g->state = State::Active;
+  ApplyCamera();  // the hook needs a valid matrix from the very next frame
   U2LOG("enter: cam pos (%.1f %.1f %.1f) dir (%.2f %.2f %.2f) fov %u (%.0fmm) car (%.1f %.1f %.1f)", cam->Position.x,
         cam->Position.y, cam->Position.z, cam->Direction.x, cam->Direction.y, cam->Direction.z, cam->FieldOfView, focal,
         g->anchor.x, g->anchor.y, g->anchor.z);
@@ -182,7 +182,7 @@ void Exit(const char* why) {
   cam->FieldOfView = g->saved.cam.FieldOfView;
   cam->FocalDistance = g->saved.cam.FocalDistance;
   cam->DepthOfField = g->saved.cam.DepthOfField;
-  g->ui.Detach();
+  g->ui.Clear();
   g->input.SetMouseCapture(false);
   g->state = State::Off;
   g->postExitLog = 3;
@@ -219,7 +219,7 @@ void StartCapture() {
 }
 
 void EndCapture() {
-  Var<float>(addr::GameSpeed) = 0;
+  Var<float>(addr::GameSpeed) = kPauseSpeed;
   Var<int>(addr::DrawHud) = g->saved.drawHud;
   g->state = State::Active;
 }
@@ -398,17 +398,17 @@ void Tick() {
     } else {
       float speed = 0;
       g->capture.BeginFrame(g->lastDt, &speed);
-      Var<float>(addr::GameSpeed) = speed;
-      ApplyCamera(g->lastDt * speed);
+      Var<float>(addr::GameSpeed) = speed > kPauseSpeed ? speed : kPauseSpeed;
+      ApplyCamera();
     }
   }
   if (g->state == State::Active) {
     HandleControls(dt);
     if (g->state == State::Off) return;
-    if (g->state == State::Active) ApplyCamera(0);
+    if (g->state == State::Active) ApplyCamera();
   }
-  if (g->uiHidden && g->state == State::Active && g->toastTime <= 0) g->ui.HideAll();
-  else g->ui.Draw(BuildMenu(), g->cfg.layout);
+  if (g->uiHidden && g->state == State::Active && g->toastTime <= 0) g->ui.Clear();
+  else g->ui.Draw(BuildMenu());
   g->lastDt = dt > 0 ? dt : g->lastDt;
 }
 
@@ -419,7 +419,10 @@ void __cdecl FrameDetour() {
 }
 
 void __fastcall SetCameraMatrixDetour(CameraParams* cam, void* edx, bMatrix4* m, float dt) {
-  if (g->state != State::Off && !g->inOwnSetCamera && cam == PlayerCamera()) return;  // we own the player camera
+  if (g->state != State::Off && cam == PlayerCamera()) {
+    *m = g->camMatrix;
+    cam->FieldOfView = FocalToGameFov(Focal(), FovCal());
+  }
   oSetCameraMatrix(cam, edx, m, dt);
 }
 

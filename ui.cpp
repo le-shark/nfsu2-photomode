@@ -1,5 +1,6 @@
 #include "ui.h"
 
+#include <algorithm>
 #include <cstring>
 
 #include "u2sdk/feng.h"
@@ -17,122 +18,82 @@ feng::FEPackage* FindActive(const char* name) {
   }
   return nullptr;
 }
+
+struct Found {
+  uint32_t hash;
+  float x, y;
+};
 }  // namespace
 
 bool Ui::Attach() {
   feng::FEPackage* p = FindActive(kPkg);
   if (!p) {
+    mapped_ = false;
     pkg_ = nullptr;
-    labels_.clear();
     if (!requested_) {
-      U2LOG("ui: showing %s", kPkg);
-      feng::PushOverlayPackage(kPkg);
-      U2LOG("ui: pushed");
+      U2LOG("ui: AddFngToUIObject_1(%s)", kPkg);
+      feng::ShowPackage(kPkg);
       requested_ = true;
-      ownsPackage_ = true;
     }
     return false;
   }
   requested_ = false;
-  if (p == pkg_ && !labels_.empty()) return true;
-
-  // Map every string object of the package (list head at pkg+0x4C, next at obj+0x04).
+  if (p == pkg_ && mapped_) return true;
   pkg_ = p;
-  labels_.clear();
+
+  // Collect the string objects (list at pkg+0x4C, next at obj+4) and sort them into the grid by
+  // their authored positions: columns left->right, rows top->bottom.
+  std::vector<Found> found;
   for (auto o = static_cast<uint8_t*>(feng::PackageObjects(p)); o; o = *reinterpret_cast<uint8_t**>(o + 4)) {
-    auto obj = reinterpret_cast<feng::FEObject*>(o);
-    uint32_t type = *reinterpret_cast<uint32_t*>(o + 0x18);
-    if (type != 2) continue;
-    Label l{obj, *reinterpret_cast<uint32_t*>(o + 0x10), "", 0, 0, 0, false};
-    float cx = 0, cy = 0;
-    feng::GetCenter(obj, &cx, &cy);
-    U2LOG("ui: label %08X at (%.1f, %.1f) flags %08X", l.hash, cx, cy, feng::ObjectFlags(obj));
-    feng::SetInvisible(obj);
-    labels_.push_back(l);
+    if (*reinterpret_cast<uint32_t*>(o + 0x18) != 2) continue;
+    Found f{*reinterpret_cast<uint32_t*>(o + 0x10), 0, 0};
+    feng::GetCenter(reinterpret_cast<feng::FEObject*>(o), &f.x, &f.y);
+    found.push_back(f);
   }
-  U2LOG("ui: %s attached, %zu labels", kPkg, labels_.size());
-  dumpPending_ = 3;
-  return !labels_.empty();
+  if (found.size() < static_cast<size_t>(kCols * kRows)) {
+    U2LOG("ui: only %zu labels in %s", found.size(), kPkg);
+    return false;
+  }
+  std::sort(found.begin(), found.end(), [](const Found& a, const Found& b) { return a.x < b.x || (a.x == b.x && a.y < b.y); });
+  for (int c = 0; c < kCols; ++c)
+    for (int r = 0; r < kRows; ++r) grid_[c][r] = Label{found[c * kRows + r].hash, std::string("\x01")};  // force first print
+  mapped_ = true;
+  U2LOG("ui: mapped %d x %d labels, top-left %08X at (%.1f, %.1f)", kCols, kRows, grid_[0][0].hash, found[0].x, found[0].y);
+  return true;
 }
 
-void Ui::Set(size_t i, const std::string& text, float x, float y, uint32_t color) {
-  if (i >= labels_.size()) return;
-  Label& l = labels_[i];
-  if (l.text != text) {
-    feng::Print(kPkg, l.hash, text.c_str());
-    l.text = text;
-  }
-  if (l.x != x || l.y != y) {
-    feng::SetCenter(l.obj, x, y);
-    l.x = x;
-    l.y = y;
-  }
-  if (l.color != color) {
-    feng::SetColor(l.obj, color);
-    l.color = color;
-  }
-  if (!l.visible || (feng::ObjectFlags(l.obj) & 1)) {
-    feng::SetVisible(l.obj);
-    // Flag 0x2 is required for these labels to draw (yugecin, nfsu2-re "ScreenPrintf.fng").
-    feng::ObjectFlags(l.obj) |= 0x2 | 0x400000;
-    l.visible = true;
-  }
+void Ui::Set(int col, int row, const std::string& text) {
+  if (col < 0 || col >= kCols || row < 0 || row >= kRows) return;
+  Label& l = grid_[col][row];
+  if (l.text == text) return;
+  feng::Print(kPkg, l.hash, text.c_str());
+  l.text = text;
 }
 
-void Ui::DumpFirstLabel() {
-  if (labels_.empty()) return;
-  auto o = reinterpret_cast<uint8_t*>(labels_[0].obj);
-  auto d = *reinterpret_cast<uint32_t**>(o + 0x2C);
-  U2LOG("ui: label0 flags %08X data %08X %08X %08X %08X | %08X %08X %08X %08X | %08X %08X %08X %08X",
-        feng::ObjectFlags(labels_[0].obj), d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10], d[11]);
-}
-
-void Ui::Draw(const MenuView& v, const UiLayout& L) {
+void Ui::Draw(const MenuView& v) {
   if (!Attach()) return;
-  if (dumpPending_ > 0 && --dumpPending_ == 0) DumpFirstLabel();
-  size_t i = 0;
-  float y = L.y;
-  Set(i++, v.title, L.x, y, L.colorTitle);
-  y += L.lineHeight * 1.5f;
-  for (auto& r : v.rows) {
-    uint32_t c = r.selected ? L.colorSelected : L.colorNormal;
-    Set(i++, r.name, L.x, y, c);
-    Set(i++, r.selected && !r.value.empty() ? "< " + r.value + " >" : r.value, L.x + L.valueOffset, y, c);
-    y += L.lineHeight;
+  std::string cells[kCols][kRows];
+  cells[0][0] = v.title;
+  int r = 2;
+  for (auto& row : v.rows) {
+    if (r >= kRows) break;
+    cells[0][r] = (row.selected ? "> " : "   ") + row.name;
+    cells[1][r] = row.selected && !row.value.empty() ? "< " + row.value + " >" : row.value;
+    ++r;
   }
-  if (!v.toast.empty()) Set(i++, v.toast, L.x, y + L.lineHeight * 0.5f, L.colorTitle);
-  if (!v.help.empty()) Set(i++, v.help, L.x, L.helpY, L.colorHelp);
-  // Hide whatever is left from previous frames.
-  for (; i < labels_.size(); ++i)
-    if (labels_[i].visible) {
-      feng::SetInvisible(labels_[i].obj);
-      labels_[i].visible = false;
-    }
+  if (!v.toast.empty() && r + 1 < kRows) cells[0][r + 1] = v.toast;
+  if (!v.help.empty()) cells[0][kRows - 1] = v.help;
+  for (int c = 0; c < kCols; ++c)
+    for (int i = 0; i < kRows; ++i) Set(c, i, cells[c][i]);
 }
 
-void Ui::HideAll() {
-  if (!pkg_ || FindActive(kPkg) != pkg_) {
-    labels_.clear();
+void Ui::Clear() {
+  if (!mapped_ || FindActive(kPkg) != pkg_) {
+    mapped_ = false;
     pkg_ = nullptr;
     return;
   }
-  for (auto& l : labels_)
-    if (l.visible) {
-      feng::SetInvisible(l.obj);
-      l.visible = false;
-    }
-}
-void Ui::Detach() {
-  HideAll();
-  if (ownsPackage_) {
-    if (FindActive(kPkg)) {
-      U2LOG("ui: removing %s", kPkg);
-      feng::RemovePackage(kPkg);
-    }
-  }
-  ownsPackage_ = false;
-  requested_ = false;
-  pkg_ = nullptr;
-  labels_.clear();
+  for (int c = 0; c < kCols; ++c)
+    for (int i = 0; i < kRows; ++i) Set(c, i, "");
 }
 }  // namespace photomode
