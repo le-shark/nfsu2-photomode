@@ -488,53 +488,6 @@ void __fastcall ProjDetour(void* plat, void* edx, eView* view, float a, float b,
   m[2] = Mul(m[0], m[1]);
 }
 
-// ---- menu side panel (docs/kb/fe-rendering.md) ----------------------------------------------
-// FE draws are flushed one package at a time by UIData vtable slot 9 (0x79BCFC = 0x537480 ->
-// 0x5371F0), and every FE vertex is transformed by the world matrix set through 0x5BDDE0
-// (cdecl(const float m[16], int view); set once per frame at 0x5CC08D, which WidescreenFix FEScale
-// redirects). That matrix works in clip space (-1..1). To draw only our menu as a side panel we
-// wrap its package draw: base * (scale about the screen centre + offset), then restore the base.
-// 0x5BDDE0 skips the update if the same pointer is passed again, so two buffers are used.
-using FeSetTransformFn = void(__cdecl*)(const float*, int);
-FeSetTransformFn oFeSetTransform;
-alignas(16) float g_feBase[16];
-bool g_feBaseValid = false;
-void __cdecl FeSetTransformDetour(const float* m, int view) {
-  if (m && view == 0) {
-    std::memcpy(g_feBase, m, sizeof g_feBase);
-    g_feBaseValid = true;
-  }
-  oFeSetTransform(m, view);
-}
-
-using DrawPackageFn = void(__fastcall*)(void*, void*, void*);
-DrawPackageFn oDrawPackage = reinterpret_cast<DrawPackageFn>(0x537480);
-void __fastcall DrawPackageDetour(void* ui, void* edx, void* pkg) {
-  const menu::Layout& L = menu::GetLayout();
-  bool panel = g->state != State::Off && g_feBaseValid && pkg &&
-               menu::IsMenuPackage(feng::PackageName(static_cast<feng::FEPackage*>(pkg))) &&
-               (L.scale != 1.0f || L.x != 0 || L.y != 0);
-  if (!panel) return oDrawPackage(ui, edx, pkg);
-  // Canvas pixels -> clip space with the game's own constants (2/640, 2/480; WidescreenFix may
-  // change the first), read live.
-  float tx = L.x * Var<float>(0x79AC10), ty = -L.y * Var<float>(0x79AC14);
-  alignas(16) static Mat4 mine, base;
-  std::memcpy(&base, g_feBase, sizeof base);
-  Mat4 o = Mat4::Identity();
-  o.m[0][0] = o.m[1][1] = L.scale;
-  o.m[3][0] = tx;
-  o.m[3][1] = ty;
-  mine = Mul(o, base);
-  oFeSetTransform(&mine.m[0][0], 0);
-  oDrawPackage(ui, edx, pkg);
-  oFeSetTransform(&base.m[0][0], 0);
-  static bool logged = false;
-  if (!logged) {
-    logged = true;
-    U2LOG("menu panel: scale %.2f offset (%.0f, %.0f) px -> clip (%.3f, %.3f)", L.scale, L.x, L.y, tx, ty);
-  }
-}
-
 // While photo mode is up only our menu and the PC help bar are drawn (HUD, minimap, messages hidden).
 void __fastcall FeRenderDetour(void* feng, void* edx) {
   if (g->state == State::Off || !g->hudFilter) return oFeRender(feng, edx);
@@ -563,9 +516,9 @@ bool Install() {
   g->cfg.Load();
   g->qualityIdx = g->cfg.defaultQuality < 0 ? 0 : (g->cfg.defaultQuality > 2 ? 2 : g->cfg.defaultQuality);
   QueryPerformanceFrequency(&g->qpcFreq);
-  // Park the cursor at the left edge, outside the menu's hit area, so FE mouse hover can't change
-  // the selected row while the mouse steers the camera.
-  g->input.SetCapturePoint(0.06f, 0.5f);
+  // Park the cursor at the right edge, away from the menu bar on the left, so FE mouse hover can't
+  // change the selected row while the mouse steers the camera.
+  g->input.SetCapturePoint(0.94f, 0.5f);
   if (!hook::Init()) return false;
   bool ok = true;
   ok &= hook::Create(0x5D2850, &FrameDetour, &oFrame, "RenderFrame");
@@ -575,10 +528,6 @@ bool Install() {
   ok &= hook::Create(addr::cFEng_Render, &FeRenderDetour, &oFeRender, "cFEng::Render");
   ok &= d3d::InstallResetHook();
   ok &= menu::Install(menu::Callbacks{RowCount, &RowLabel, &RowValue, &Adjust, &Activate, &MenuBack}, g->cfg.menuLayout);
-  ok &= hook::Create(0x5BDDE0, &FeSetTransformDetour, &oFeSetTransform, "FE SetTransform");
-  // UIData vtable slot 9 = per-package draw; only one UIData instance exists (ctor 0x5372FF).
-  if (Var<uintptr_t>(0x79BCFC) == 0x537480) mem::Write<void*>(0x79BCFC, reinterpret_cast<void*>(&DrawPackageDetour));
-  else U2LOG("FE package-draw slot already patched (another mod?); menu stays full size");
   // Verify the exact bytes before redirecting the pause decision (movzx eax,al; cmp eax,ebx).
   const uint8_t expect[5] = {0x0F, 0xB6, 0xC0, 0x3B, 0xC3};
   if (std::memcmp(reinterpret_cast<void*>(kPauseDecision), expect, 5) == 0) {

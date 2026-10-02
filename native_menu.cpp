@@ -2,6 +2,9 @@
 
 #include <windows.h>
 
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 
@@ -107,9 +110,12 @@ void __fastcall ToggleAct(void* w, void*, const char* /*pkg*/, unsigned msg) {
   }
 }
 
+void HideScrollbar(const char* pkg);
+
 // Screen message handler: base UIWidgetMenu first (navigation, LEFT/RIGHT -> row Act, tick).
 void __fastcall MenuNotify(void* self, void*, unsigned msg, void* obj, int p1, int p2) {
   UIWidgetMenu_Notify(self, nullptr, msg, obj, p1, p2);
+  HideScrollbar(*reinterpret_cast<const char**>(static_cast<uint8_t*>(self) + 4));
   if (msg == kMsgAccept) {
     void* cur = *reinterpret_cast<void**>(static_cast<uint8_t*>(self) + 0x54);
     if (cur) g_pendingActivate = RowId(cur);
@@ -156,6 +162,152 @@ void ApplyBacking(const char* pkg) {
   }
 }
 
+// ---- sidebar layout ---------------------------------------------------------------------------
+// Everything stays at native size: the window frame is reshaped into a full-height bar at the left
+// edge and the row columns are moved into it. Objects are changed with the engine's own setters,
+// as the game does at 0x4C6793 (flags |= 0x400000; SetSize; SetPosition). Both rewrite the base key
+// of the matching track in every script (0x5178D0), so INIT and the other scripts keep the new values.
+auto FEObject_SetPosition = Fn<void(__fastcall*)(void*, void*, const float*, bool)>(0x517C10);  // thiscall, ret 8
+auto FEObject_SetSize = Fn<void(__fastcall*)(void*, void*, const float*, bool)>(0x517DB0);      // thiscall, ret 8
+
+// FEObject: +0x04 next sibling, +0x2C data, group +0x64 first child. Data (FEngLib BaseObject.Read):
+// +0x00 colour, +0x10 pivot, +0x1C position, +0x28 rotation quaternion (x,y,z,w), +0x38 size.
+// Positions are the object centre, relative to the parent group (topLeft = pos - size/2, 0x51D09E).
+uint8_t* Next(uint8_t* o) { return *reinterpret_cast<uint8_t**>(o + 4); }
+uint8_t* FirstChild(uint8_t* g) { return *reinterpret_cast<uint8_t**>(g + 0x64); }
+float* Pos(uint8_t* o) { return reinterpret_cast<float*>(*reinterpret_cast<uint8_t**>(o + 0x2C) + 0x1C); }
+float* Rot(uint8_t* o) { return reinterpret_cast<float*>(*reinterpret_cast<uint8_t**>(o + 0x2C) + 0x28); }
+float* Size(uint8_t* o) { return reinterpret_cast<float*>(*reinterpret_cast<uint8_t**>(o + 0x2C) + 0x38); }
+// Frame edges are 8 x 574 images turned a quarter about Z (quaternion z = +-0.707), so their
+// on-screen width and height are swapped.
+bool QuarterTurn(uint8_t* o) { return std::fabs(std::fabs(Rot(o)[2]) - 0.70710678f) < 0.05f; }
+
+void SetGeometry(uint8_t* o, float x, float y, float w, float h) {
+  float pos[3] = {x, y, Pos(o)[2]};
+  float size[3] = {w, h, Size(o)[2]};
+  *reinterpret_cast<uint32_t*>(o + 0x1C) |= 0x400000;
+  FEObject_SetSize(o, nullptr, size, false);
+  FEObject_SetPosition(o, nullptr, pos, false);
+}
+
+struct Rect {
+  float l, t, r, b;
+};
+
+uint8_t* Obj(const char* pkg, const char* name) {
+  auto o = reinterpret_cast<uint8_t*>(u2::feng::FindObject(pkg, u2::feng::HashUpper(name)));
+  if (!o) U2LOG("menu: %s not found", name);
+  return o;
+}
+
+// Screen-space extent of a group's children (origin = the group's absolute position).
+bool ChildBounds(uint8_t* group, float ox, float oy, Rect& out) {
+  bool any = false;
+  for (uint8_t* c = FirstChild(group); c; c = Next(c)) {
+    float hw = std::fabs(Size(c)[0]) / 2, hh = std::fabs(Size(c)[1]) / 2;
+    if (QuarterTurn(c)) std::swap(hw, hh);
+    float x = ox + Pos(c)[0], y = oy + Pos(c)[1];
+    Rect r{x - hw, y - hh, x + hw, y + hh};
+    out = any ? Rect{(std::min)(out.l, r.l), (std::min)(out.t, r.t), (std::max)(out.r, r.r), (std::max)(out.b, r.b)} : r;
+    any = true;
+  }
+  return any;
+}
+
+// 9-slice mapping along one axis: pieces spanning the middle stretch (keeping their distance to
+// both edges); the others keep their size and follow the nearer edge.
+void MapAxis(float lo, float hi, float oldLo, float oldHi, float newLo, float newHi, float& outC, float& outE) {
+  if (hi - lo > (oldHi - oldLo) / 2) {
+    lo = newLo + (lo - oldLo);
+    hi = newHi - (oldHi - hi);
+  } else {
+    float d = (lo + hi) / 2 < (oldLo + oldHi) / 2 ? newLo - oldLo : newHi - oldHi;
+    lo += d;
+    hi += d;
+  }
+  outC = (lo + hi) / 2;
+  outE = (hi - lo) / 2;
+}
+
+// Reshape one frame group (rounded box / outline). Its distance to the reference box is kept.
+void ReshapeFrame(uint8_t* group, float ox, float oy, const Rect& ref, const Rect& bar) {
+  Rect old;
+  if (!group || !ChildBounds(group, ox, oy, old)) return;
+  Rect dst{bar.l + (old.l - ref.l), bar.t + (old.t - ref.t), bar.r - (ref.r - old.r), bar.b - (ref.b - old.b)};
+  for (uint8_t* c = FirstChild(group); c; c = Next(c)) {
+    float hw = std::fabs(Size(c)[0]) / 2, hh = std::fabs(Size(c)[1]) / 2;
+    bool turned = QuarterTurn(c);
+    if (turned) std::swap(hw, hh);
+    float x = ox + Pos(c)[0], y = oy + Pos(c)[1], nx, ny, nhw, nhh;
+    MapAxis(x - hw, x + hw, old.l, old.r, dst.l, dst.r, nx, nhw);
+    MapAxis(y - hh, y + hh, old.t, old.b, dst.t, dst.b, ny, nhh);
+    if (turned) std::swap(nhw, nhh);
+    SetGeometry(c, nx - ox, ny - oy, 2 * nhw, 2 * nhh);
+  }
+}
+
+void HideObject(const char* pkg, const char* name) {
+  if (auto o = u2::feng::FindObject(pkg, u2::feng::HashUpper(name))) u2::feng::SetInvisible(o);
+}
+
+// The scroll bar is shown again by the base handler every tick (0x544490 -> 0x538080), so this
+// runs after every base message. All rows fit, so it is never needed.
+void HideScrollbar(const char* pkg) {
+  for (const char* n : {"SCROLLBAR_BACKING", "SCROLLBAR_HANDLE", "SCROLLBAR_ARROW_1", "SCROLLBAR_ARROW_2"})
+    HideObject(pkg, n);
+}
+
+// Called after the UIWidgetMenu ctor (which read the row geometry from TITLE_MASTER/DATA_MASTER,
+// 0x51FF80) and before the rows are added (each row copies these fields, FEStatWidget ctor 0x51E1B0).
+void ApplySidebar(uint8_t* m, const char* pkg, int rows) {
+  uint8_t* nig = Obj(pkg, "NON_INTERACTIVE_GROUP");
+  uint8_t* big = Obj(pkg, "BIG MENU BACKING");
+  Rect ref;
+  if (!nig || !big || !ChildBounds(big, Pos(nig)[0] + Pos(big)[0], Pos(nig)[1] + Pos(big)[1], ref)) return;
+  // Visible canvas: x = +-1/[0x79AC10] (WidescreenFix hor+ rewrites 2/640, Frontend.ixx), y = +-240.
+  const float halfW = 1.0f / Var<float>(0x79AC10);
+  const Rect bar{-halfW + g_layout.margin, -240 + g_layout.margin, -halfW + g_layout.margin + g_layout.width,
+                 240 - g_layout.margin};
+  const float dxL = bar.l - ref.l, dxR = bar.r - ref.r, dyT = bar.t - ref.t;
+
+  // Frame: black backing, white inner panel, green outline.
+  for (const char* name : {"BIG MENU BACKING", "SMALLER MENU BACKING", "BORDER"}) {
+    uint8_t* g = Obj(pkg, name);
+    if (g) ReshapeFrame(g, Pos(nig)[0] + Pos(g)[0], Pos(nig)[1] + Pos(g)[1], ref, bar);
+  }
+  // Header texts follow the top-left / top-right corner.
+  if (uint8_t* h = Obj(pkg, "HEADER_TEXT")) SetGeometry(h, Pos(h)[0] + dxL, Pos(h)[1] + dyT, Size(h)[0], Size(h)[1]);
+  if (uint8_t* h = Obj(pkg, "HEADER_TEXT2")) SetGeometry(h, Pos(h)[0] + dxR, Pos(h)[1] + dyT, Size(h)[0], Size(h)[1]);
+
+  // Rows (UIWidgetMenu fields, 0x51FF80): +0xF4/+0xF8 start (top-left of row 1), +0xFC/+0x100 next
+  // row, +0x104 row width, +0x10C max title size, +0x114 max data size, +0x11C/+0x120 data top-left.
+  // The arrows sit just outside the data column (toggle Position 0x52DAC0).
+  auto f = [m](int off) -> float& { return *reinterpret_cast<float*>(m + off); };
+  constexpr float kArrow = 24, kRightPad = 16;  // arrow image width (JSON), gap to the bar edge
+  float startX = f(0xF4) + dxL, startY = f(0xF8) + dyT;
+  float dataW = g_layout.valueWidth, dataX = bar.r - kRightPad - kArrow - dataW;
+  f(0xF4) = f(0xFC) = startX;
+  f(0xF8) = f(0x100) = startY;
+  f(0x11C) = dataX;
+  f(0x120) = startY;
+  f(0x114) = dataW;
+  f(0x10C) = dataX - kArrow - startX;
+  f(0x104) = std::fabs(startX - (dataX + dataW));
+  *reinterpret_cast<int*>(m + 0x134) = rows;  // visible rows: everything fits, no scrolling
+
+  // Parts this screen never uses: slider pieces, console back prompt, scroll bar.
+  char name[32];
+  for (const char* part : {"SLIDER_BEG_%d", "SLIDER_END_%d", "SLIDER_HANDLE_%d", "SLIDER_BASE_%d", "SLIDER_KNOB_%d"})
+    for (int i = 1; i <= 7; ++i) {
+      std::snprintf(name, sizeof name, part, i);
+      HideObject(pkg, name);
+    }
+  for (const char* n : {"UI_COMMON_BACK", "U2_SCROLLER_CORNER", "U2_SCROLLER_CORNER(65)"}) HideObject(pkg, n);
+  HideScrollbar(pkg);
+  U2LOG("menu: sidebar bar (%.0f,%.0f)-(%.0f,%.0f) from frame (%.0f,%.0f)-(%.0f,%.0f); rows x=%.0f data x=%.0f w=%.0f",
+        bar.l, bar.t, bar.r, bar.b, ref.l, ref.t, ref.r, ref.b, startX, dataX, dataW);
+}
+
 void* __cdecl Factory(void* showData) {
   if (!g_wantOurs) return g_origFactory(showData);
   g_wantOurs = false;
@@ -164,14 +316,14 @@ void* __cdecl Factory(void* showData) {
   UIWidgetMenu_ctor(menu, nullptr, showData);
   *static_cast<void**>(menu) = g_menuVtbl;
   auto m = static_cast<uint8_t*>(menu);
-  *reinterpret_cast<int*>(m + 0x134) = 8;  // visible rows, as PauseOptions
   const char* pkg = *reinterpret_cast<const char**>(m + 4);
+  int n = g_cb.rowCount < kMaxRows ? g_cb.rowCount : kMaxRows;
+  ApplySidebar(m, pkg, n);
 
   u2::feng::Print(pkg, u2::feng::HashUpper("Header_text"), g_title.c_str());
   u2::feng::Print(pkg, u2::feng::HashUpper("Header_text2"), g_status.c_str());
 
   g_rows.clear();
-  int n = g_cb.rowCount < kMaxRows ? g_cb.rowCount : kMaxRows;
   for (int i = 0; i < n; ++i) {
     void* w = GameMalloc(kWidgetSize);
     if (!w) break;

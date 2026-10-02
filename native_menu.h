@@ -19,17 +19,19 @@ struct Callbacks {
   void (*back)();                                // BACK pressed (called from frame code)
 };
 
-// Side-panel layout: our package is drawn in its own pass with this canvas-space scale/offset
-// applied on top of the FE transform (640x480 FE canvas, origin at the centre).
+// Sidebar layout, in FE canvas units (480 high, origin at the centre; with WidescreenFix the
+// visible width is 480 * aspect). The package is drawn at native size; only the window frame is
+// reshaped into a full-height bar at the left edge and the row columns are moved to fit it.
 struct Layout {
-  float scale = 0.6f;
-  float x = 226, y = -82;       // canvas offset after scaling
+  float width = 340;            // bar width (outer black backing)
+  float margin = 16;            // gap between the bar and the screen edges
+  float valueWidth = 110;       // width of the "< value >" column between the arrows
   int backingAlpha = 140;       // 0..255 alpha of the menu backing panels (transparency)
 };
 
 bool Install(const Callbacks& cb, const Layout& layout);
 const Layout& GetLayout();
-bool IsMenuPackage(const char* name);  // our package (drawn in the scaled pass)
+bool IsMenuPackage(const char* name);  // our package while the menu is open
 bool Open();                                     // call from frame code (not inside FE callbacks)
 void Close();                                    // same
 bool IsOpen();
