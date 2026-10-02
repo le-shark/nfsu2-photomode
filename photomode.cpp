@@ -9,6 +9,7 @@
 #include <string>
 
 #include "capture.h"
+#include "follow.h"
 #include "lens.h"
 #include "rig.h"
 #include "settings.h"
@@ -60,6 +61,9 @@ struct Saved {
   CameraParams cam;
 };
 
+// Center / Closest = autofocus on the target car's centre / nearest corner.
+enum class FocusMode { Center, Closest, Manual };
+
 struct PhotoMode {
   Settings cfg;
   Input input;
@@ -71,10 +75,11 @@ struct PhotoMode {
   // menu values
   int sel = RowFocal;
   int focalIdx = 10, fstopIdx = lens::kDefaultFStop, shutterIdx = 0, qualityIdx = 1, tiles = 1;
-  bool focusAuto = true;
+  FocusMode focusMode = FocusMode::Center;
   float focusDist = 5;
-  bool panWithCar = true;   // free camera follows the car during a shutter exposure
-  Vec3 captureAnchor{};
+  Follow follow = Follow::Rig;  // how the camera follows the target car while the shutter is open
+  CamPose captureCam{};         // camera and car when the shutter opened
+  CarPose captureCar{};
   bool uiHidden = false;
   std::string toast;
   float toastTime = 0;
@@ -177,19 +182,47 @@ void LogCars() {
     if (!c) continue;
     auto di = *reinterpret_cast<uint8_t**>(c + 0x14);
     Vec3 p = CarPosition(c);
-    U2LOG("  car %d %p driverType=%d class=%d mode=%d pos (%.1f %.1f %.1f)", i, c, di ? *reinterpret_cast<int*>(di + 4) : -1,
-          *reinterpret_cast<int*>(c + 0x24), *reinterpret_cast<int*>(c + 0x28), p.x, p.y, p.z);
+    auto m = reinterpret_cast<const float*>(c + 0x90);
+    U2LOG("  car %d %p driverType=%d class=%d mode=%d pos (%.1f %.1f %.1f) rows (%.2f %.2f %.2f) (%.2f %.2f %.2f) (%.2f %.2f %.2f)", i, c,
+          di ? *reinterpret_cast<int*>(di + 4) : -1, *reinterpret_cast<int*>(c + 0x24), *reinterpret_cast<int*>(c + 0x28), p.x, p.y,
+          p.z, m[0], m[1], m[2], m[4], m[5], m[6], m[8], m[9], m[10]);
   }
 }
 
-float AutoFocusDistance() {
+// Target car (orbit target, else the player) as a pose: Car+0x50 position, Car+0x90 orientation
+// rows (row 0 = forward; traffic spawner 0x42C8E7, NFSU2_CameraToolkit dllmain.cpp:151).
+uint8_t* TargetCar() { return g->target ? g->target : Var<uint8_t*>(addr::PlayerCarState); }
+CarPose TargetCarPose() {
+  CarPose c{g->anchor, {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}}};
+  if (uint8_t* car = TargetCar()) {
+    auto m = reinterpret_cast<const float*>(car + 0x90);
+    c.pos = CarPosition(car);
+    for (int r = 0; r < 3; ++r) c.axis[r] = {m[r * 4], m[r * 4 + 1], m[r * 4 + 2]};
+  }
+  return c;
+}
+
+CamPose RigPose() {
   Vec3 eye, target, up;
   g->rig.Compute(g->anchor, &eye, &target, &up);
-  Vec3 f = Normalize(target - eye);
-  float d = Dot(g->anchor + Vec3{0, 0, 0.5f} - eye, f);
+  return {eye, Normalize(target - eye), up};
+}
+
+// Autofocus: the car's centre, or the nearest corner of an approximate car box (photographers
+// focus on the near headlight).
+float AutoFocusDistance(FocusMode mode) {
+  CamPose cam = RigPose();
+  float d = mode == FocusMode::Closest ? NearestCarDepth(cam, TargetCarPose())
+                                                  : Dot(g->anchor + Vec3{0, 0, 0.5f} - cam.eye, cam.fwd);
   return d < 0.3f ? 0.3f : d;
 }
-float FocusDistance() { return g->focusAuto ? AutoFocusDistance() : g->focusDist; }
+float FocusDistance() { return g->focusMode == FocusMode::Manual ? g->focusDist : AutoFocusDistance(g->focusMode); }
+
+// Camera pose for this frame: the rig, or while the shutter is open the shutter-follow pose.
+CamPose CurrentPose() {
+  if (g->state == State::Capturing) return FollowPose(g->follow, g->captureCam, g->captureCar, TargetCarPose());
+  return RigPose();
+}
 
 std::string NewPicturePath() {
   CreateDirectoryA(g->cfg.outputDir.c_str(), nullptr);
@@ -213,15 +246,8 @@ std::string NewPicturePath() {
 // function NFSU2_CameraToolkit drives.
 void ApplyCamera(float dt) {
   CameraParams* cam = PlayerCamera();
-  Vec3 eye, target, up;
-  g->rig.Compute(g->anchor, &eye, &target, &up);
-  // Free camera + shutter: pan with the car during the exposure (tracking shot).
-  if (g->state == State::Capturing && g->rig.mode == RigMode::Free && g->panWithCar) {
-    Vec3 d = g->anchor - g->captureAnchor;
-    eye += d;
-    target += d;
-  }
-  CreateLookAtMatrix(&g->camMatrix, eye, target, up);
+  CamPose p = CurrentPose();
+  CreateLookAtMatrix(&g->camMatrix, p.eye, p.eye + p.fwd, p.up);
   cam->FieldOfView = FocalToGameFov(Focal(), FovCal());
   oSetCameraMatrix(cam, nullptr, &g->camMatrix, dt);
 }
@@ -306,14 +332,15 @@ void StartCapture() {
   }
   // Clean frame: FE off (HUD + our UI) via drawHud. Native DOF/MB are already off in photo mode.
   Var<int>(addr::DrawHud) = 0;
-  g->captureAnchor = g->anchor;
+  g->captureCam = RigPose();
+  g->captureCar = TargetCarPose();
   g->state = State::Capturing;
 }
 
 void EndCapture() {
-  // A panning exposure moved the free camera along with the car: keep it where the exposure
-  // ended instead of snapping back to where it started.
-  if (g->rig.mode == RigMode::Free && g->panWithCar) g->rig.eye += g->anchor - g->captureAnchor;
+  // The camera stays where the exposure ended instead of snapping back to where it started.
+  CamPose end = CurrentPose();
+  g->rig.SetPose(end.eye, end.fwd, end.up, g->anchor);
   g_freezeWorld = true;
   Var<float>(addr::GameSpeed) = g->saved.gameSpeed;
   Var<int>(addr::DrawHud) = g->saved.drawHud;
@@ -332,15 +359,15 @@ void Adjust(int row, int dir) {
     case RowFocal: g->focalIdx = clampi(g->focalIdx + dir, 0, lens::Count(lens::kFocals) - 1); break;
     case RowRoll: g->rig.roll = Clamp(std::round(g->rig.roll) + dir, -90, 90); break;
     case RowFocus:
-      if (g->focusAuto) {
-        g->focusDist = AutoFocusDistance();
-        g->focusAuto = false;
+      if (g->focusMode != FocusMode::Manual) {
+        g->focusDist = AutoFocusDistance(g->focusMode);
+        g->focusMode = FocusMode::Manual;
       }
       g->focusDist = Clamp(g->focusDist * (dir > 0 ? 1.08f : 1 / 1.08f), 0.3f, 500.f);
       break;
     case RowAperture: g->fstopIdx = clampi(g->fstopIdx + dir, 0, lens::Count(lens::kFStops) - 1); break;
     case RowShutter: g->shutterIdx = clampi(g->shutterIdx + dir, 0, lens::Count(lens::kShutters) - 1); break;
-    case RowPan: g->panWithCar = !g->panWithCar; break;
+    case RowPan: g->follow = static_cast<Follow>(wrap(static_cast<int>(g->follow) + dir, static_cast<int>(Follow::Count))); break;
     case RowQuality: g->qualityIdx = wrap(g->qualityIdx + dir, lens::Count(lens::kQualitySamples)); break;
     case RowResolution: g->tiles = clampi(g->tiles + dir, 1, lens::kMaxTiles); break;
     default: break;
@@ -351,14 +378,23 @@ bool IsActionRow(int row) { return row == RowTake; }
 
 void Activate(int row) {
   if (row == RowTake) StartCapture();
-  else if (row == RowFocus) g->focusAuto = !g->focusAuto;
+  else if (row == RowFocus) {  // Enter cycles Center -> Closest -> Manual (at the current distance)
+    switch (g->focusMode) {
+      case FocusMode::Center: g->focusMode = FocusMode::Closest; break;
+      case FocusMode::Closest:
+        g->focusDist = AutoFocusDistance(FocusMode::Closest);
+        g->focusMode = FocusMode::Manual;
+        break;
+      case FocusMode::Manual: g->focusMode = FocusMode::Center; break;
+    }
+  }
   else Adjust(row, 1);
 }
 
 // Row texts for the native menu (native_menu.cpp draws them into UI_PauseOptions.fng).
 std::string RowLabel(int row) {
   static const char* names[RowCount] = {"Camera",  "Target", "Focal Length", "Roll",       "Focus",     "Aperture",
-                                        "Shutter", "Pan With Car", "Quality",    "Resolution", "Take Picture"};
+                                        "Shutter", "Shutter Follow", "Quality",    "Resolution", "Take Picture"};
   return row >= 0 && row < RowCount ? names[row] : "";
 }
 
@@ -370,12 +406,13 @@ std::string RowValue(int row) {
     case RowFocal: std::snprintf(b, sizeof b, "%.0f mm", Focal()); break;
     case RowRoll: std::snprintf(b, sizeof b, "%+.0f", g->rig.roll); break;
     case RowFocus:
-      if (g->focusAuto) std::snprintf(b, sizeof b, "Auto (%.1f m)", AutoFocusDistance());
+      if (g->focusMode == FocusMode::Center) std::snprintf(b, sizeof b, "Center %.1f m", AutoFocusDistance(g->focusMode));
+      else if (g->focusMode == FocusMode::Closest) std::snprintf(b, sizeof b, "Closest %.1f m", AutoFocusDistance(g->focusMode));
       else std::snprintf(b, sizeof b, "%.1f m", g->focusDist);
       break;
     case RowAperture: lens::FormatFStop(b, sizeof b, FStop()); break;
     case RowShutter: return lens::kShutterNames[g->shutterIdx];
-    case RowPan: return g->rig.mode == RigMode::Free ? (g->panWithCar ? "On" : "Off") : "Orbit follows";
+    case RowPan: return FollowName(g->follow);
     case RowQuality: std::snprintf(b, sizeof b, "%s", lens::kQualityNames[g->qualityIdx]); break;
     case RowResolution: std::snprintf(b, sizeof b, "%dx", g->tiles); break;
     case RowTake: return "";

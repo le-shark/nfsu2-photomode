@@ -59,6 +59,25 @@ struct Rig {
     }
   }
 
+  // Continue from an arbitrary camera pose (e.g. where a shutter-follow exposure ended). Free mode
+  // takes it as is; orbit mode keeps the position and roll and aims at the pivot again.
+  void SetPose(const Vec3& camEye, const Vec3& camFwd, const Vec3& camUp, const Vec3& anchor) {
+    Vec3 f = u2::Normalize(camFwd);
+    Vec3 r = u2::Normalize(u2::Cross(f, Vec3{0, 0, 1}));
+    if (u2::Length(r) > 0.5f) {
+      Vec3 up0 = u2::Cross(r, f);  // unrolled up, as in Compute
+      roll = u2::Clamp(std::atan2(u2::Dot(u2::Cross(f, up0), camUp), u2::Dot(up0, camUp)) * u2::kRadToDeg, -90.f, 90.f);
+    }
+    if (mode == RigMode::Orbit) {
+      Vec3 pivot = anchor + Vec3{0, 0, orbitHeight};
+      f = u2::Normalize(pivot - camEye);
+      orbitDist = u2::Clamp(u2::Length(pivot - camEye), 1.0f, maxDist);
+    }
+    yaw = std::atan2(f.y, f.x) * u2::kRadToDeg;
+    pitch = u2::Clamp(std::asin(u2::Clamp(f.z, -1.f, 1.f)) * u2::kRadToDeg, -89.f, 89.f);
+    eye = camEye;
+  }
+
   void Update(const RigInput& in, float dt, const Vec3& anchor) {
     yaw += in.lookYawDeg;
     pitch = u2::Clamp(pitch + in.lookPitchDeg, -89.f, 89.f);
