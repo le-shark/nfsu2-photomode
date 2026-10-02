@@ -17,6 +17,7 @@ struct Callbacks {
   void (*adjust)(int row, int dir);              // LEFT/RIGHT on a row
   void (*activate)(int row);                     // ACCEPT / click on a row (called from frame code)
   void (*back)();                                // BACK pressed (called from frame code)
+  bool (*isAction)(int row);                     // button row: no < > arrows, LEFT/RIGHT ignored
 };
 
 // Sidebar layout, in FE canvas units (480 high, origin at the centre; with WidescreenFix the
@@ -35,6 +36,10 @@ bool IsMenuPackage(const char* name);  // our package while the menu is open
 bool Open();                                     // call from frame code (not inside FE callbacks)
 void Close();                                    // same
 bool IsOpen();
+// Hide/show without unloading: the package stays loaded (no rebuild hitch); while hidden it is
+// not drawn (see IsHidden) and takes no input.
+void SetHidden(bool hidden);
+bool IsHidden();
 void Tick();                                     // every frame, even when photo mode is off
 void Update(const std::string& title, const std::string& status);  // per frame: redraw, run deferred actions
 int CurrentRow();                                // -1 if none

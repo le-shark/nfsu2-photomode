@@ -282,6 +282,8 @@ void Adjust(int row, int dir) {
   }
 }
 
+bool IsActionRow(int row) { return row == RowTake; }
+
 void Activate(int row) {
   if (row == RowTake) StartCapture();
   else if (row == RowFocus) g->focusAuto = !g->focusAuto;
@@ -449,8 +451,8 @@ void Tick() {
     if (g->state == State::Active) ApplyCamera(g->lastDt);
   }
   if (g->state != State::Off) {
-    if (g->uiHidden && g->state == State::Active) menu::Close();
-    else if (!menu::IsOpen()) menu::Open();
+    if (!menu::IsOpen()) menu::Open();
+    menu::SetHidden(g->uiHidden && g->state == State::Active);
     menu::Update("Photo Mode", StatusText());
   }
   g->lastDt = dt > 0 ? dt : g->lastDt;
@@ -488,15 +490,18 @@ void __fastcall ProjDetour(void* plat, void* edx, eView* view, float a, float b,
   m[2] = Mul(m[0], m[1]);
 }
 
-// While photo mode is up only our menu and the PC help bar are drawn (HUD, minimap, messages hidden).
+// While photo mode is up only our menu and the PC help bar are drawn (HUD, minimap, messages hidden);
+// H hides those two as well.
 void __fastcall FeRenderDetour(void* feng, void* edx) {
-  if (g->state == State::Off || !g->hudFilter) return oFeRender(feng, edx);
+  bool hideMenu = menu::IsHidden();
+  if (g->state == State::Off || (!g->hudFilter && !hideMenu)) return oFeRender(feng, edx);
   void* saved[64];
   feng::FEPackage* pkgs[64];
   int n = 0;
   for (auto p = feng::FirstActivePackage(); p && n < 64; p = feng::NextPackage(p)) {
     const char* name = feng::PackageName(p);
-    if (menu::IsMenuPackage(name) || (name && !_stricmp(name, "UI_PC_Help_Bar.fng"))) continue;
+    bool ours = menu::IsMenuPackage(name) || (name && !_stricmp(name, "UI_PC_Help_Bar.fng"));
+    if (ours ? !hideMenu : !g->hudFilter) continue;
     pkgs[n] = p;
     saved[n] = feng::PackageObjects(p);
     feng::PackageObjects(p) = nullptr;
@@ -527,7 +532,7 @@ bool Install() {
   ok &= hook::Create(addr::eViewPlatInfo_Update, &ProjDetour, &oProj, "eViewPlatInfo::Update");
   ok &= hook::Create(addr::cFEng_Render, &FeRenderDetour, &oFeRender, "cFEng::Render");
   ok &= d3d::InstallResetHook();
-  ok &= menu::Install(menu::Callbacks{RowCount, &RowLabel, &RowValue, &Adjust, &Activate, &MenuBack}, g->cfg.menuLayout);
+  ok &= menu::Install(menu::Callbacks{RowCount, &RowLabel, &RowValue, &Adjust, &Activate, &MenuBack, &IsActionRow}, g->cfg.menuLayout);
   // Verify the exact bytes before redirecting the pause decision (movzx eax,al; cmp eax,ebx).
   const uint8_t expect[5] = {0x0F, 0xB6, 0xC0, 0x3B, 0xC3};
   if (std::memcmp(reinterpret_cast<void*>(kPauseDecision), expect, 5) == 0) {

@@ -33,6 +33,7 @@ auto UIWidgetMenu_Notify = Fn<void(__fastcall*)(void*, void*, unsigned, void*, i
 auto UIWidgetMenu_SetInitialOption = Fn<void(__fastcall*)(void*, void*, int)>(0x539650);  // Unlimiter InGameFunctions.h:182
 auto UIWidgetMenu_AddToggleOption = Fn<int(__fastcall*)(void*, void*, void*, bool)>(0x54F170);
 auto FEToggleWidget_ctor = Fn<void*(__fastcall*)(void*, void*, float*, float*, float*, float*, bool)>(0x51E230);
+auto FEToggleWidget_Show = Fn<void(__fastcall*)(void*, void*)>(0x50D5D0);  // FEngSetVisible on title, data, arrows, backing
 auto FEToggleWidget_BlinkArrows = Fn<void(__fastcall*)(void*, void*, unsigned)>(0x51E6B0);
 auto FEngPrintf = Fn<void(__cdecl*)(void*, const char*, ...)>(0x537BE0);               // Unlimiter InGameFunctions.h:135
 auto AddFngToUIObject_1 = Fn<void(__cdecl*)(const char*, void*)>(0x555E80);            // push + AddJoyHandlers
@@ -67,6 +68,8 @@ int g_pendingActivate = -1;
 int g_releasePauseBlockIn = 0;  // frames until the pause-key block is lifted after closing
 int g_inputLogIn = 0;
 bool g_pendingBack = false;
+bool g_hidden = false;
+uint32_t g_savedPortMask[2];  // pkg+0x24 of our package and the help bar while hidden
 std::string g_title, g_status;
 
 void* g_menuVtbl[5];
@@ -76,6 +79,7 @@ constexpr size_t kWidgetSize = 0x58;  // 0x54 FEToggleWidget + our row id (0x58 
 int& RowId(void* w) { return *reinterpret_cast<int*>(static_cast<uint8_t*>(w) + 0x54); }
 void* LabelString(void* w) { return *reinterpret_cast<void**>(static_cast<uint8_t*>(w) + 0x2C); }
 void* ValueString(void* w) { return *reinterpret_cast<void**>(static_cast<uint8_t*>(w) + 0x30); }
+bool IsAction(void* w) { return g_cb.isAction && g_cb.isAction(RowId(w)); }
 
 Row* FindRow(void* w) {
   for (auto& r : g_rows)
@@ -99,9 +103,18 @@ void DrawRow(void* w, bool force) {
 
 void __fastcall ToggleDraw(void* w, void*) { DrawRow(w, true); }
 
+// Show (slot 5): button rows hide their arrow images (+0x4C/+0x50) again, as the widget's own
+// Hide 0x50D610 does. The highlight scripts only animate colour, so the arrows stay hidden.
+void __fastcall ToggleShow(void* w, void*) {
+  FEToggleWidget_Show(w, nullptr);
+  if (!IsAction(w)) return;
+  for (int off : {0x4C, 0x50})
+    u2::feng::SetInvisible(*reinterpret_cast<u2::feng::FEObject**>(static_cast<uint8_t*>(w) + off));
+}
+
 // Act: same shape as the game's toggle rows (e.g. 0x4C3C70): change value, BlinkArrows, Draw.
 void __fastcall ToggleAct(void* w, void*, const char* /*pkg*/, unsigned msg) {
-  if (msg == kMsgLeft || msg == kMsgRight) {
+  if ((msg == kMsgLeft || msg == kMsgRight) && !IsAction(w)) {
     g_cb.adjust(RowId(w), msg == kMsgRight ? 1 : -1);
     FEToggleWidget_BlinkArrows(w, nullptr, msg);
     DrawRow(w, true);
@@ -367,6 +380,7 @@ bool Install(const Callbacks& cb, const Layout& layout) {
   std::memcpy(g_toggleVtbl, reinterpret_cast<void*>(0x79B3B8), sizeof g_toggleVtbl);  // FEToggleWidget vtable
   g_toggleVtbl[1] = reinterpret_cast<void*>(&ToggleAct);
   g_toggleVtbl[3] = reinterpret_cast<void*>(&ToggleDraw);
+  g_toggleVtbl[5] = reinterpret_cast<void*>(&ToggleShow);
   u2::mem::Write<FactoryFn>(kFactorySlot, &Factory);
   U2LOG("menu: factory installed");
   return true;
@@ -393,8 +407,30 @@ bool Open() {
   return true;
 }
 
+// The FE skips a package's pad/keyboard input entirely when its port mask pkg+0x24 is 0
+// (ProcessPadsForPackage 0x54D4B0, check at 0x54D4BC; docs/kb/fe-input.md).
+void SetHidden(bool hidden) {
+  if (!g_open || hidden == g_hidden) return;
+  const char* pkgs[2] = {kPkg, GetHelpBarFNGName()};
+  for (int i = 0; i < 2; ++i) {
+    auto p = reinterpret_cast<uint8_t*>(u2::feng::FindPackage(pkgs[i]));
+    if (!p) continue;
+    auto& mask = *reinterpret_cast<uint32_t*>(p + 0x24);
+    if (hidden) {
+      g_savedPortMask[i] = mask;
+      mask = 0;
+    } else {
+      mask = g_savedPortMask[i];
+    }
+  }
+  g_hidden = hidden;
+}
+
+bool IsHidden() { return g_open && g_hidden; }
+
 void Close() {
   if (!g_open) return;
+  SetHidden(false);
   g_wantOurs = false;
   FEngSetLastButton(kPkg, 0);
   const char* bar = GetHelpBarFNGName();
