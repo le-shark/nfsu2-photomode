@@ -250,6 +250,9 @@ void StartCapture() {
 }
 
 void EndCapture() {
+  // A panning exposure moved the free camera along with the car: keep it where the exposure
+  // ended instead of snapping back to where it started.
+  if (g->rig.mode == RigMode::Free && g->panWithCar) g->rig.eye += g->anchor - g->captureAnchor;
   g_freezeWorld = true;
   Var<float>(addr::GameSpeed) = g->saved.gameSpeed;
   Var<int>(addr::DrawHud) = g->saved.drawHud;
