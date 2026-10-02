@@ -182,9 +182,10 @@ float* Size(uint8_t* o) { return reinterpret_cast<float*>(*reinterpret_cast<uint
 // on-screen width and height are swapped.
 bool QuarterTurn(uint8_t* o) { return std::fabs(std::fabs(Rot(o)[2]) - 0.70710678f) < 0.05f; }
 
+// w/h are magnitudes; the original sign is kept (negative sizes mirror an image).
 void SetGeometry(uint8_t* o, float x, float y, float w, float h) {
   float pos[3] = {x, y, Pos(o)[2]};
-  float size[3] = {w, h, Size(o)[2]};
+  float size[3] = {std::copysign(w, Size(o)[0]), std::copysign(h, Size(o)[1]), Size(o)[2]};
   *reinterpret_cast<uint32_t*>(o + 0x1C) |= 0x400000;
   FEObject_SetSize(o, nullptr, size, false);
   FEObject_SetPosition(o, nullptr, pos, false);
@@ -260,7 +261,10 @@ void HideScrollbar(const char* pkg) {
 // Called after the UIWidgetMenu ctor (which read the row geometry from TITLE_MASTER/DATA_MASTER,
 // 0x51FF80) and before the rows are added (each row copies these fields, FEStatWidget ctor 0x51E1B0).
 void ApplySidebar(uint8_t* m, const char* pkg, int rows) {
-  uint8_t* nig = Obj(pkg, "NON_INTERACTIVE_GROUP");
+  *reinterpret_cast<int*>(m + 0x134) = rows;  // visible rows (ctor default 7): everything fits, no scrolling
+  // The group's real name ends with a space: hash 0x8D7E0C53 (FEngLib decode and the nfsu2-re
+  // runtime object dump of UI_PauseOptionsMain.fng, docs.txt).
+  uint8_t* nig = Obj(pkg, "NON_INTERACTIVE_GROUP ");
   uint8_t* big = Obj(pkg, "BIG MENU BACKING");
   Rect ref;
   if (!nig || !big || !ChildBounds(big, Pos(nig)[0] + Pos(big)[0], Pos(nig)[1] + Pos(big)[1], ref)) return;
@@ -284,7 +288,11 @@ void ApplySidebar(uint8_t* m, const char* pkg, int rows) {
   // The arrows sit just outside the data column (toggle Position 0x52DAC0).
   auto f = [m](int off) -> float& { return *reinterpret_cast<float*>(m + off); };
   constexpr float kArrow = 24, kRightPad = 16;  // arrow image width (JSON), gap to the bar edge
+  // The PC help bar (UI_PC_Help_Bar.fng, FEngLib decode) puts Back at y 194..218 inside the bar's
+  // bottom, as the original window framed it. Rows must end above it: shrink the step if needed.
+  constexpr float kHelpBarTop = 186;
   float startX = f(0xF4) + dxL, startY = f(0xF8) + dyT;
+  if (rows > 0) f(0x108) = (std::min)(f(0x108), std::floor((kHelpBarTop - startY) / rows));
   float dataW = g_layout.valueWidth, dataX = bar.r - kRightPad - kArrow - dataW;
   f(0xF4) = f(0xFC) = startX;
   f(0xF8) = f(0x100) = startY;
@@ -293,7 +301,6 @@ void ApplySidebar(uint8_t* m, const char* pkg, int rows) {
   f(0x114) = dataW;
   f(0x10C) = dataX - kArrow - startX;
   f(0x104) = std::fabs(startX - (dataX + dataW));
-  *reinterpret_cast<int*>(m + 0x134) = rows;  // visible rows: everything fits, no scrolling
 
   // Parts this screen never uses: slider pieces, console back prompt, scroll bar.
   char name[32];
@@ -304,8 +311,8 @@ void ApplySidebar(uint8_t* m, const char* pkg, int rows) {
     }
   for (const char* n : {"UI_COMMON_BACK", "U2_SCROLLER_CORNER", "U2_SCROLLER_CORNER(65)"}) HideObject(pkg, n);
   HideScrollbar(pkg);
-  U2LOG("menu: sidebar bar (%.0f,%.0f)-(%.0f,%.0f) from frame (%.0f,%.0f)-(%.0f,%.0f); rows x=%.0f data x=%.0f w=%.0f",
-        bar.l, bar.t, bar.r, bar.b, ref.l, ref.t, ref.r, ref.b, startX, dataX, dataW);
+  U2LOG("menu: sidebar bar (%.0f,%.0f)-(%.0f,%.0f) from frame (%.0f,%.0f)-(%.0f,%.0f); rows x=%.0f y=%.0f step=%.0f data x=%.0f w=%.0f",
+        bar.l, bar.t, bar.r, bar.b, ref.l, ref.t, ref.r, ref.b, startX, startY, f(0x108), dataX, dataW);
 }
 
 void* __cdecl Factory(void* showData) {
