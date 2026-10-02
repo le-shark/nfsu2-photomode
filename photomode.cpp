@@ -52,7 +52,7 @@ __declspec(naked) void PauseDecisionStub() {
 }
 
 enum class State { Off, Active, Capturing };
-enum Row { RowCamera, RowFocal, RowRoll, RowFocus, RowAperture, RowShutter, RowPan, RowQuality, RowResolution, RowTake, RowCount };
+enum Row { RowCamera, RowTarget, RowFocal, RowRoll, RowFocus, RowAperture, RowShutter, RowPan, RowQuality, RowResolution, RowTake, RowCount };
 
 struct Saved {
   float gameSpeed;
@@ -80,6 +80,7 @@ struct PhotoMode {
   float toastTime = 0;
 
   Vec3 anchor{};
+  uint8_t* target = nullptr;  // orbit target car (World car array entry); null = player
   LARGE_INTEGER lastQpc{}, qpcFreq{};
   float lastDt = 1 / 60.f;
   alignas(16) bMatrix4 camMatrix{};  // world->view matrix applied in the SetCameraMatrix hook
@@ -116,11 +117,69 @@ void Toast(const std::string& s, float seconds = 3) {
   U2LOG("toast: %s", s.c_str());
 }
 
+// Target cars: the player and active AI racers (u2::RacerCars). Index into that list, or -1.
+int TargetIndex(const RacerCar* cars, int n) {
+  for (int i = 0; i < n; ++i)
+    if (cars[i].car == g->target) return i;
+  return -1;
+}
+
 bool UpdateAnchor() {
+  RacerCar cars[kMaxCars];
+  int n = RacerCars(cars, kMaxCars);
+  if (g->target && TargetIndex(cars, n) < 0) g->target = nullptr;  // gone or parked: back to the player
+  if (g->target) {
+    g->anchor = CarPosition(g->target);
+    return true;
+  }
   Vec3 p;
   if (!PlayerCarPosition(&p)) return false;
   g->anchor = p;
   return true;
+}
+
+std::string TargetName() {
+  RacerCar cars[kMaxCars];
+  int n = RacerCars(cars, kMaxCars), i = TargetIndex(cars, n);
+  if (i < 0 || cars[i].isPlayer) return "You";
+  int racer = 0;
+  for (int k = 0; k <= i; ++k) racer += cars[k].isPlayer ? 0 : 1;
+  char b[32];
+  std::snprintf(b, sizeof b, "Racer %d", racer);
+  return b;
+}
+
+// Orbit only: in free mode a new target would drag the camera through the distance clamp.
+void CycleTarget(int dir) {
+  if (g->rig.mode != RigMode::Orbit) {
+    Toast("TARGET: ORBIT CAMERA ONLY");
+    return;
+  }
+  RacerCar cars[kMaxCars];
+  int n = RacerCars(cars, kMaxCars);
+  if (n < 2) {
+    Toast("NO OTHER RACERS");
+    return;
+  }
+  int i = TargetIndex(cars, n);
+  if (i < 0) i = 0;
+  g->target = cars[((i + dir) % n + n) % n].car;
+  UpdateAnchor();
+}
+
+void LogCars() {
+  auto w = Var<uint8_t*>(addr::pWorld);
+  if (!w) return;
+  int total = *reinterpret_cast<int*>(w + 0x10);
+  U2LOG("cars: total=%d players=%d racers+players=%d", total, *reinterpret_cast<int*>(w + 0x14), *reinterpret_cast<int*>(w + 0x18));
+  for (int i = 0; i < total && i < kMaxCars; ++i) {
+    auto c = reinterpret_cast<uint8_t**>(w + 0x1C)[i];
+    if (!c) continue;
+    auto di = *reinterpret_cast<uint8_t**>(c + 0x14);
+    Vec3 p = CarPosition(c);
+    U2LOG("  car %d %p driverType=%d class=%d mode=%d pos (%.1f %.1f %.1f)", i, c, di ? *reinterpret_cast<int*>(di + 4) : -1,
+          *reinterpret_cast<int*>(c + 0x24), *reinterpret_cast<int*>(c + 0x28), p.x, p.y, p.z);
+  }
 }
 
 float AutoFocusDistance() {
@@ -174,6 +233,8 @@ void Enter() {
   CameraParams* cam = PlayerCamera();
   g->saved = Saved{Var<float>(addr::GameSpeed), Var<int>(addr::g_DepthOfFieldEnable), Var<int>(addr::g_MotionBlurEnable),
                    Var<int>(addr::DrawHud), *cam};
+  g->target = nullptr;
+  LogCars();
   if (!UpdateAnchor()) g->anchor = ToVec3(cam->Position);
   g->rig.maxDist = g->cfg.maxDistance;
   g->rig.moveSpeed = g->cfg.moveSpeed;
@@ -264,6 +325,7 @@ void Adjust(int row, int dir) {
   auto wrap = [](int v, int n) { return (v % n + n) % n; };
   auto clampi = [](int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); };
   switch (row) {
+    case RowTarget: CycleTarget(dir); break;
     case RowCamera:
       g->rig.SetMode(g->rig.mode == RigMode::Orbit ? RigMode::Free : RigMode::Orbit, g->anchor);
       break;
@@ -295,7 +357,7 @@ void Activate(int row) {
 
 // Row texts for the native menu (native_menu.cpp draws them into UI_PauseOptions.fng).
 std::string RowLabel(int row) {
-  static const char* names[RowCount] = {"Camera",  "Focal Length", "Roll",       "Focus",     "Aperture",
+  static const char* names[RowCount] = {"Camera",  "Target", "Focal Length", "Roll",       "Focus",     "Aperture",
                                         "Shutter", "Pan With Car", "Quality",    "Resolution", "Take Picture"};
   return row >= 0 && row < RowCount ? names[row] : "";
 }
@@ -304,6 +366,7 @@ std::string RowValue(int row) {
   char b[64] = "";
   switch (row) {
     case RowCamera: return g->rig.mode == RigMode::Orbit ? "Orbit" : "Free";
+    case RowTarget: return TargetName();
     case RowFocal: std::snprintf(b, sizeof b, "%.0f mm", Focal()); break;
     case RowRoll: std::snprintf(b, sizeof b, "%+.0f", g->rig.roll); break;
     case RowFocus:
@@ -362,7 +425,12 @@ void HandleControls(float dt) {
   float ySign = g->cfg.invertY ? -1.f : 1.f;
   ri.lookYawDeg = (-in.MouseDX() * g->cfg.mouseSensitivity - pad.rx * g->cfg.stickLookSpeed * dt) * zoomScale;
   ri.lookPitchDeg = (-in.MouseDY() * g->cfg.mouseSensitivity + pad.ry * g->cfg.stickLookSpeed * dt) * zoomScale * ySign;
-  float roll = key('C') - key('Z') + (in.PadDown(PadRB) ? 1.f : 0.f) - (in.PadDown(PadLB) ? 1.f : 0.f);
+  // [ / ] (and LB / RB in orbit mode) switch the orbit target; LB / RB roll in free mode.
+  bool orbit = g->rig.mode == RigMode::Orbit;
+  if (in.KeyPressed(VK_OEM_4) || (orbit && in.PadPressed(PadLB))) CycleTarget(-1);
+  if (in.KeyPressed(VK_OEM_6) || (orbit && in.PadPressed(PadRB))) CycleTarget(1);
+  float padRoll = orbit ? 0.f : (in.PadDown(PadRB) ? 1.f : 0.f) - (in.PadDown(PadLB) ? 1.f : 0.f);
+  float roll = key('C') - key('Z') + padRoll;
   ri.rollDeg = roll * g->cfg.rollSpeed * dt;
   g->rig.Update(ri, dt, g->anchor);
 }
