@@ -40,14 +40,10 @@ auto AddFngToUIObject_1 = Fn<void(__cdecl*)(const char*, void*)>(0x555E80);     
 auto RemoveFngAndJoyHandlers = Fn<void(__cdecl*)(const char*)>(0x558F00);              // what the game pairs with it
 auto RemoveFNGFromUIObject = Fn<void(__cdecl*)(const char*)>(0x5379A0);
 auto IsFNGLoaded = Fn<bool(__cdecl*)(const char*)>(0x52CF60);
-auto GetHelpBarFNGName = Fn<const char*(__cdecl*)()>(0x50CEA0);
-auto FEngShowPackage = Fn<void(__cdecl*)(const char*, const char*, unsigned, int)>(0x555F10);
 auto FEngSetLastButton = Fn<void(__cdecl*)(const char*, int)>(0x50B8C0);
-auto HelpBar_Show = Fn<void(__fastcall*)(void*, void*)>(0x54E6A0);
 // Selects the menu keyboard action map while racing (writes byte 0x870754, which the per-frame map
 // selector 0x5CFBF0 checks). The game does the same for the in-world dyno screen (0x557AEE).
 auto SetMenuKeyboardMap = Fn<void(__cdecl*)(char)>(0x5B7ED0);
-auto HelpBar_SyncByMask = Fn<void(__fastcall*)(void*, void*, unsigned, const char*)>(0x54E6E0);
 using FactoryFn = void*(__cdecl*)(void*);
 
 // ---- state ----------------------------------------------------------------------------------
@@ -69,7 +65,7 @@ int g_releasePauseBlockIn = 0;  // frames until the pause-key block is lifted af
 int g_inputLogIn = 0;
 bool g_pendingBack = false;
 bool g_hidden = false;
-uint32_t g_savedPortMask[2];  // pkg+0x24 of our package and the help bar while hidden
+uint32_t g_savedPortMask;  // our package's pkg+0x24 while hidden
 std::string g_title, g_status;
 
 void* g_menuVtbl[5];
@@ -134,19 +130,6 @@ void __fastcall MenuNotify(void* self, void*, unsigned msg, void* obj, int p1, i
     if (cur) g_pendingActivate = RowId(cur);
   } else if (msg == kMsgBack) {
     g_pendingBack = true;  // never tear down from inside the FE update
-  }
-}
-
-void PushHelpBar(const char* ownPkg) {
-  // Same sequence as the UI_Pause ctor (0x4EB489..0x4EB4CD); mask 0x10400 = one line + Back.
-  const char* bar = GetHelpBarFNGName();
-  if (!IsFNGLoaded(bar)) {
-    FEngShowPackage(bar, ownPkg, 0xFF, 0);
-    void* hb = Var<void*>(0x8384D8);
-    if (hb) {
-      HelpBar_Show(hb, nullptr);
-      HelpBar_SyncByMask(hb, nullptr, 0x10400, ownPkg);
-    }
   }
 }
 
@@ -301,11 +284,11 @@ void ApplySidebar(uint8_t* m, const char* pkg, int rows) {
   // The arrows sit just outside the data column (toggle Position 0x52DAC0).
   auto f = [m](int off) -> float& { return *reinterpret_cast<float*>(m + off); };
   constexpr float kArrow = 24, kRightPad = 16;  // arrow image width (JSON), gap to the bar edge
-  // The PC help bar (UI_PC_Help_Bar.fng, FEngLib decode) puts Back at y 194..218 inside the bar's
-  // bottom, as the original window framed it. Rows must end above it: shrink the step if needed.
-  constexpr float kHelpBarTop = 186;
+  // Rows end inside the inner panel (SMALLER MENU BACKING ends 32 above the outer frame) with a
+  // small gap; shrink the step if they don't fit.
+  const float rowsBottom = bar.b - 38;
   float startX = f(0xF4) + dxL, startY = f(0xF8) + dyT;
-  if (rows > 0) f(0x108) = (std::min)(f(0x108), std::floor((kHelpBarTop - startY) / rows));
+  if (rows > 0) f(0x108) = (std::min)(f(0x108), std::floor((rowsBottom - startY) / rows));
   float dataW = g_layout.valueWidth, dataX = bar.r - kRightPad - kArrow - dataW;
   f(0xF4) = f(0xFC) = startX;
   f(0xF8) = f(0x100) = startY;
@@ -356,7 +339,6 @@ void* __cdecl Factory(void* showData) {
   }
   UIWidgetMenu_SetInitialOption(menu, nullptr, 0);
   ApplyBacking(pkg);
-  PushHelpBar(pkg);
   g_menu = menu;
   U2LOG("menu: built native screen %p with %zu rows", menu, g_rows.size());
   return menu;
@@ -411,16 +393,13 @@ bool Open() {
 // (ProcessPadsForPackage 0x54D4B0, check at 0x54D4BC; docs/kb/fe-input.md).
 void SetHidden(bool hidden) {
   if (!g_open || hidden == g_hidden) return;
-  const char* pkgs[2] = {kPkg, GetHelpBarFNGName()};
-  for (int i = 0; i < 2; ++i) {
-    auto p = reinterpret_cast<uint8_t*>(u2::feng::FindPackage(pkgs[i]));
-    if (!p) continue;
+  if (auto p = reinterpret_cast<uint8_t*>(u2::feng::FindPackage(kPkg))) {
     auto& mask = *reinterpret_cast<uint32_t*>(p + 0x24);
     if (hidden) {
-      g_savedPortMask[i] = mask;
+      g_savedPortMask = mask;
       mask = 0;
     } else {
-      mask = g_savedPortMask[i];
+      mask = g_savedPortMask;
     }
   }
   g_hidden = hidden;
@@ -433,8 +412,6 @@ void Close() {
   SetHidden(false);
   g_wantOurs = false;
   FEngSetLastButton(kPkg, 0);
-  const char* bar = GetHelpBarFNGName();
-  if (IsFNGLoaded(bar)) RemoveFNGFromUIObject(bar);
   RemoveFngAndJoyHandlers(kPkg);
   SetMenuKeyboardMap(0);
   // Lift the pause-key block a few frames later so an Esc still held from closing can't pause.

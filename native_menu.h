@@ -2,7 +2,7 @@
 // Native in-game options screen for photo mode.
 //
 // Reuses the game's own in-race options package UI_PauseOptions.fng (title box, highlight bar,
-// "Label  < Value >" rows, PC help bar) with our own screen object, the way NFSU2 Extra Options
+// "Label  < Value >" rows) with our own screen object, the way NFSU2 Extra Options
 // builds custom screens (LanguageSelectScreen.h: own factory in the FNGData table + own vtable) and
 // NFSU2Unlimiter builds widget rows (BuyPerformanceParts.h: UIWidgetMenu + FEStatWidget, custom
 // widget vtables, FEngPrintf on the row labels). Addresses/semantics: docs/kb/native-screen.md.

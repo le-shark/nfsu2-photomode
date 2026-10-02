@@ -493,8 +493,7 @@ void __fastcall ProjDetour(void* plat, void* edx, eView* view, float a, float b,
   m[2] = Mul(m[0], m[1]);
 }
 
-// While photo mode is up only our menu and the PC help bar are drawn (HUD, minimap, messages hidden);
-// H hides those two as well.
+// While photo mode is up only our menu is drawn (HUD, minimap, messages hidden); H hides it too.
 void __fastcall FeRenderDetour(void* feng, void* edx) {
   bool hideMenu = menu::IsHidden();
   if (g->state == State::Off || (!g->hudFilter && !hideMenu)) return oFeRender(feng, edx);
@@ -503,7 +502,7 @@ void __fastcall FeRenderDetour(void* feng, void* edx) {
   int n = 0;
   for (auto p = feng::FirstActivePackage(); p && n < 64; p = feng::NextPackage(p)) {
     const char* name = feng::PackageName(p);
-    bool ours = menu::IsMenuPackage(name) || (name && !_stricmp(name, "UI_PC_Help_Bar.fng"));
+    bool ours = menu::IsMenuPackage(name);
     if (ours ? !hideMenu : !g->hudFilter) continue;
     pkgs[n] = p;
     saved[n] = feng::PackageObjects(p);
