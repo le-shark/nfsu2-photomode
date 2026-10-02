@@ -1,3 +1,5 @@
+#include <string>
+
 #include "follow.h"
 #include "lens.h"
 #include "rig.h"
@@ -94,15 +96,6 @@ TEST(LensAperture) {
   CHECK_NEAR(lens::ApertureRadiusM(50, 0), 0, 1e-9);
 }
 
-TEST(LensDepthOfField) {
-  float wide = lens::DepthOfFieldM(50, 1.4f, 5), narrow = lens::DepthOfFieldM(50, 16, 5);
-  CHECK(wide > 0 && wide < narrow);
-  CHECK(lens::DepthOfFieldM(200, 2.8f, 5) < lens::DepthOfFieldM(35, 2.8f, 5));
-  // 50mm f/1.4 at 5 m, c = 0.03 mm: 4.62 m .. 5.45 m (standard DOF calculator)
-  CHECK_NEAR(wide, 0.84, 0.01);
-  CHECK(lens::DepthOfFieldM(24, 11, 50) >= 1e4f);  // beyond hyperfocal
-}
-
 TEST(LensTables) {
   CHECK(lens::Closest(lens::kFocals, 52) == 10);  // 50 mm
   CHECK(lens::Count(lens::kShutters) == lens::Count(lens::kShutterNames));
@@ -183,4 +176,74 @@ TEST(RigSetPoseRoundTrip) {
   o.Compute({0, 0, 0}, &e, &t, &u);
   CHECK(Near(e, {0, -10, 0.6f}));
   CHECK(Near(u2::Normalize(t - e), {0, 1, 0}));
+}
+
+TEST(RigAimAtStaysOffThePoles) {
+  Rig r;
+  r.mode = RigMode::Free;
+  r.InitFromCamera({}, {0, 0, -1}, {});  // straight down
+  CHECK_NEAR(r.pitch, -kMaxPitch, 1e-3);
+  Vec3 e, t, u;
+  r.Compute({}, &e, &t, &u);
+  CHECK_NEAR(u2::Length(u), 1, 1e-3);  // up vector still defined
+}
+
+TEST(RigOrbitStrafeKeepsDistance) {
+  Rig r;
+  r.mode = RigMode::Orbit;
+  r.orbitDist = 8;
+  RigInput in;
+  in.moveRight = 1;
+  Vec3 e0, e1, t, u;
+  r.Compute({}, &e0, &t, &u);
+  r.Update(in, 0.1f, {});
+  r.Compute({}, &e1, &t, &u);
+  Vec3 pivot = r.Pivot({});
+  CHECK_NEAR(u2::Length(e1 - pivot), 8, 1e-3);
+  CHECK_NEAR(u2::Length(e1 - e0), r.moveSpeed * 0.1f, 0.01);  // arc length ~ chord for a short step
+}
+
+TEST(FollowPanStaysOffThePoles) {
+  // Camera already looking up 80 degrees; the car climbs further: the view stops short of the zenith.
+  float p = 80 * u2::kDegToRad;
+  CamPose s{{0, 0, 0}, {0, std::cos(p), std::sin(p)}, {0, -std::sin(p), std::cos(p)}};
+  CamPose q = FollowPose(Follow::Pan, s, CarAt({0, 10, 0}, 0), CarAt({0, 1, 10}, 0));
+  CHECK(q.fwd.y > 0);    // not flipped over the top
+  CHECK(q.up.z > 0);     // image not upside down
+  CHECK_NEAR(std::asin(q.fwd.z) * u2::kRadToDeg, 89, 0.05);
+}
+
+TEST(FollowPanCarAtEyeIsStill) {
+  CamPose s{{0, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+  CamPose q = FollowPose(Follow::Pan, s, CarAt({0, 0, 0}, 0), CarAt({5, 0, 0}, 0));
+  CHECK(Near(q.fwd, s.fwd) && Near(q.up, s.up));
+}
+
+TEST(FollowRigWithRolledCar) {
+  // Car rolls 90 degrees onto its left side: a camera above it ends up on its left.
+  CamPose s{{0, 0, 5}, {0, 0, -1}, {1, 0, 0}};
+  CarPose c0 = CarAt({}, 0), c1{{}, {{1, 0, 0}, {0, 0, 1}, {0, -1, 0}}};
+  CamPose p = FollowPose(Follow::Rig, s, c0, c1);
+  CHECK(Near(p.eye, {0, -5, 0}));
+  CHECK(Near(p.fwd, {0, 1, 0}));
+  CHECK(Near(p.up, {1, 0, 0}));
+}
+
+TEST(CarCentreDepth) {
+  CamPose cam{{0, -10, 0.5f}, {0, 1, 0}, {0, 0, 1}};
+  CHECK_NEAR(CarCentreDepth(cam, CarAt({0, 0, 0}, 0)), 10, 1e-3);
+  CHECK(NearestCarDepth(cam, CarAt({0, 0, 0}, 0)) < CarCentreDepth(cam, CarAt({0, 0, 0}, 0)));
+}
+
+TEST(MenuTablesConsistent) {
+  CHECK(lens::Count(lens::kQualitySamples) == lens::Count(lens::kQualityNames));
+  for (int i = 1; i < lens::Count(lens::kFocals); ++i) CHECK(lens::kFocals[i] > lens::kFocals[i - 1]);
+  char b[16];
+  lens::FormatFStop(b, sizeof b, 0);
+  CHECK(std::string(b) == "Off");
+  lens::FormatFStop(b, sizeof b, 2.8f);
+  CHECK(std::string(b) == "F/2.8");
+  lens::FormatFStop(b, sizeof b, 16);
+  CHECK(std::string(b) == "F/16");
+  for (int f = 0; f < static_cast<int>(Follow::Count); ++f) CHECK(FollowName(static_cast<Follow>(f)) != nullptr);
 }

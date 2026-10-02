@@ -16,6 +16,8 @@ struct RigInput {
 
 enum class RigMode { Orbit = 0, Free = 1 };
 
+inline constexpr float kMinOrbitDist = 1, kMaxPitch = 89, kMaxRoll = 90;  // metres, degrees
+
 struct Rig {
   RigMode mode = RigMode::Orbit;
   Vec3 eye;              // free mode position
@@ -30,16 +32,22 @@ struct Rig {
     return {std::cos(p) * std::cos(y), std::cos(p) * std::sin(y), std::sin(p)};
   }
   Vec3 Forward() const { return Forward(yaw, pitch); }
+  Vec3 Pivot(const Vec3& anchor) const { return anchor + Vec3{0, 0, orbitHeight}; }
+
+  // Yaw/pitch looking along `dir` (pitch kept off the poles, where the up vector is undefined).
+  void AimAt(const Vec3& dir) {
+    Vec3 d = u2::Normalize(dir);
+    yaw = std::atan2(d.y, d.x) * u2::kRadToDeg;
+    pitch = u2::Clamp(std::asin(u2::Clamp(d.z, -1.f, 1.f)) * u2::kRadToDeg, -kMaxPitch, kMaxPitch);
+  }
+  void SetOrbitDist(float d) { orbitDist = u2::Clamp(d, kMinOrbitDist, maxDist); }
 
   // Start from the game camera's position/direction, anchored on the car.
   void InitFromCamera(const Vec3& camPos, const Vec3& camDir, const Vec3& anchor) {
-    Vec3 d = u2::Normalize(camDir);
-    yaw = std::atan2(d.y, d.x) * u2::kRadToDeg;
-    pitch = std::asin(u2::Clamp(d.z, -1.f, 1.f)) * u2::kRadToDeg;
+    AimAt(camDir);
     roll = 0;
     eye = camPos;
-    Vec3 pivot = anchor + Vec3{0, 0, orbitHeight};
-    orbitDist = u2::Clamp(u2::Length(camPos - pivot), 1.0f, maxDist);
+    SetOrbitDist(u2::Length(camPos - Pivot(anchor)));
   }
 
   void SetMode(RigMode m, const Vec3& anchor) {
@@ -49,13 +57,9 @@ struct Rig {
     mode = m;
     if (m == RigMode::Free) {
       eye = e;
-    } else {
-      // Keep looking at the car from the current spot.
-      Vec3 pivot = anchor + Vec3{0, 0, orbitHeight};
-      Vec3 d = u2::Normalize(pivot - e);
-      yaw = std::atan2(d.y, d.x) * u2::kRadToDeg;
-      pitch = std::asin(u2::Clamp(d.z, -1.f, 1.f)) * u2::kRadToDeg;
-      orbitDist = u2::Clamp(u2::Length(pivot - e), 1.0f, maxDist);
+    } else {  // keep looking at the car from the current spot
+      AimAt(Pivot(anchor) - e);
+      SetOrbitDist(u2::Length(Pivot(anchor) - e));
     }
   }
 
@@ -66,22 +70,20 @@ struct Rig {
     Vec3 r = u2::Normalize(u2::Cross(f, Vec3{0, 0, 1}));
     if (u2::Length(r) > 0.5f) {
       Vec3 up0 = u2::Cross(r, f);  // unrolled up, as in Compute
-      roll = u2::Clamp(std::atan2(u2::Dot(u2::Cross(f, up0), camUp), u2::Dot(up0, camUp)) * u2::kRadToDeg, -90.f, 90.f);
+      roll = u2::Clamp(std::atan2(u2::Dot(u2::Cross(f, up0), camUp), u2::Dot(up0, camUp)) * u2::kRadToDeg, -kMaxRoll, kMaxRoll);
     }
     if (mode == RigMode::Orbit) {
-      Vec3 pivot = anchor + Vec3{0, 0, orbitHeight};
-      f = u2::Normalize(pivot - camEye);
-      orbitDist = u2::Clamp(u2::Length(pivot - camEye), 1.0f, maxDist);
+      f = Pivot(anchor) - camEye;
+      SetOrbitDist(u2::Length(f));
     }
-    yaw = std::atan2(f.y, f.x) * u2::kRadToDeg;
-    pitch = u2::Clamp(std::asin(u2::Clamp(f.z, -1.f, 1.f)) * u2::kRadToDeg, -89.f, 89.f);
+    AimAt(f);
     eye = camEye;
   }
 
   void Update(const RigInput& in, float dt, const Vec3& anchor) {
     yaw += in.lookYawDeg;
-    pitch = u2::Clamp(pitch + in.lookPitchDeg, -89.f, 89.f);
-    roll = u2::Clamp(roll + in.rollDeg, -90.f, 90.f);
+    pitch = u2::Clamp(pitch + in.lookPitchDeg, -kMaxPitch, kMaxPitch);
+    roll = u2::Clamp(roll + in.rollDeg, -kMaxRoll, kMaxRoll);
     float step = moveSpeed * in.speedMul * dt;
     if (mode == RigMode::Free) {
       Vec3 f = Forward();
@@ -91,7 +93,7 @@ struct Rig {
       float l = u2::Length(off);
       if (l > maxDist) eye = anchor + off * (maxDist / l);
     } else {
-      orbitDist = u2::Clamp(orbitDist - in.moveForward * step, 1.0f, maxDist);
+      SetOrbitDist(orbitDist - in.moveForward * step);
       // strafing circles the car: arc length `step` at radius orbitDist
       yaw -= in.moveRight * step / orbitDist * u2::kRadToDeg;
       orbitHeight = u2::Clamp(orbitHeight + in.moveUp * step, -2.f, maxDist);
@@ -103,8 +105,7 @@ struct Rig {
     if (mode == RigMode::Free) {
       *outEye = eye;
     } else {
-      Vec3 pivot = anchor + Vec3{0, 0, orbitHeight};
-      *outEye = pivot - f * orbitDist;
+      *outEye = Pivot(anchor) - f * orbitDist;
     }
     *outTarget = *outEye + f;
     Vec3 r = u2::Normalize(u2::Cross(f, Vec3{0, 0, 1}));

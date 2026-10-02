@@ -21,6 +21,9 @@ using u2::Var;
 constexpr const char* kPkg = "UI_PauseOptions.fng";
 constexpr uintptr_t kFactorySlot = 0x7F81F4;      // FNGData[UI_PauseOptions.fng].create, orig 0x4EB650
 constexpr uintptr_t kPauseKeyBlock = 0x861E78;    // Career+0x7138: JOY_EVENT_PAUSE handler ignores pause when set
+constexpr uintptr_t kMenuKeyboardMap = 0x870754;  // byte written by 0x5B7ED0 (fe-input.md)
+constexpr uintptr_t kJoyHandlersOn = 0x8384B8;    // set by AddJoyHandlers 0x52CDD0, cleared by 0x50C680
+constexpr uintptr_t kKeyboardMapCtx = 0x870788;   // action map in use (1 = menu), cached by 0x5CFBF0
 constexpr int kMaxRows = 11;
 constexpr unsigned kMsgLeft = 0x9120409E, kMsgRight = 0xB5971BF1, kMsgAccept = 0x406415E3, kMsgBack = 0x911AB364,
                    kMsgSelect = 0xC407210;
@@ -38,7 +41,9 @@ auto FEToggleWidget_BlinkArrows = Fn<void(__fastcall*)(void*, void*, unsigned)>(
 auto FEngPrintf = Fn<void(__cdecl*)(void*, const char*, ...)>(0x537BE0);               // Unlimiter InGameFunctions.h:135
 auto AddFngToUIObject_1 = Fn<void(__cdecl*)(const char*, void*)>(0x555E80);            // push + AddJoyHandlers
 auto RemoveFngAndJoyHandlers = Fn<void(__cdecl*)(const char*)>(0x558F00);              // what the game pairs with it
-auto RemoveFNGFromUIObject = Fn<void(__cdecl*)(const char*)>(0x5379A0);
+// Registers the FE joy handlers unless [0x8384B8] says they already are; thiscall(pUIData), as
+// AddFngToUIObject_1 calls it at 0x555EA2..0x555EA8.
+auto AddJoyHandlers = Fn<void(__fastcall*)(void*, void*)>(0x52CDD0);
 auto IsFNGLoaded = Fn<bool(__cdecl*)(const char*)>(0x52CF60);
 auto FEngSetLastButton = Fn<void(__cdecl*)(const char*, int)>(0x50B8C0);
 // Selects the menu keyboard action map while racing (writes byte 0x870754, which the per-frame map
@@ -50,19 +55,20 @@ using FactoryFn = void*(__cdecl*)(void*);
 Callbacks g_cb{};
 Layout g_layout{};
 FactoryFn g_origFactory = nullptr;
+bool g_verbose = false;
 bool g_wantOurs = false;     // next UI_PauseOptions.fng construction is ours
-int g_wantFrames = 0;
 void* g_menu = nullptr;      // our UIWidgetMenu while open
 bool g_open = false;
 struct Row {
   uint8_t* widget;
-  int id;
   std::string label, value;
 };
 std::vector<Row> g_rows;
 int g_pendingActivate = -1;
-int g_releasePauseBlockIn = 0;  // frames until the pause-key block is lifted after closing
-int g_inputLogIn = 0;
+int g_releasePauseBlockIn = 0;  // frames until the pause-key block is restored after closing
+int g_inputLogIn = 0;           // verbose: frames until the input state is logged
+uint8_t g_savedPauseBlock = 0, g_savedKeyboardMap = 0;
+bool g_joyHandlersWereOn = false;
 bool g_pendingBack = false;
 bool g_hidden = false;
 uint32_t g_savedPortMask;  // our package's pkg+0x24 while hidden
@@ -133,29 +139,40 @@ void __fastcall MenuNotify(void* self, void*, unsigned msg, void* obj, int p1, i
   }
 }
 
+// ---- FE objects -------------------------------------------------------------------------------
+// FEObject: +0x04 next sibling, +0x2C data, group +0x64 first child. Data (FEngLib BaseObject.Read):
+// +0x00 colour, +0x10 pivot, +0x1C position, +0x28 rotation quaternion (x,y,z,w), +0x38 size.
+// Positions are the object centre, relative to the parent group (topLeft = pos - size/2, 0x51D09E).
+uint8_t* Next(uint8_t* o) { return *reinterpret_cast<uint8_t**>(o + 4); }
+uint8_t* FirstChild(uint8_t* g) { return *reinterpret_cast<uint8_t**>(g + 0x64); }
+float* Pos(uint8_t* o) { return reinterpret_cast<float*>(*reinterpret_cast<uint8_t**>(o + 0x2C) + 0x1C); }
+float* Rot(uint8_t* o) { return reinterpret_cast<float*>(*reinterpret_cast<uint8_t**>(o + 0x2C) + 0x28); }
+float* Size(uint8_t* o) { return reinterpret_cast<float*>(*reinterpret_cast<uint8_t**>(o + 0x2C) + 0x38); }
+uint32_t& Flags(uint8_t* o) { return *reinterpret_cast<uint32_t*>(o + 0x1C); }
+constexpr uint32_t kObjDirty = 0x400000;  // needs update (FEngSetColor 0x51D843, 0x4C6793)
+constexpr uint32_t kObjGroup = 5;         // type at +0x18
+
+uint8_t* Obj(const char* pkg, const char* name) {
+  auto o = reinterpret_cast<uint8_t*>(u2::feng::FindObject(pkg, u2::feng::HashUpper(name)));
+  if (!o) U2LOG("menu: %s not found", name);
+  return o;
+}
+
 // Backing panels only have an INIT script, so alpha changes after startup stick.
-// Group children: first child at +0x64, next sibling at +0x04 (see FEngSetVisible 0x50CA50).
 void SetAlphaRecursive(uint8_t* obj, int alpha) {
-  for (; obj; obj = *reinterpret_cast<uint8_t**>(obj + 4)) {
-    auto data = *reinterpret_cast<int**>(obj + 0x2C);
-    if (data) {
-      data[3] = data[3] * alpha / 255;                       // FEObjData color: B, G, R, A ints
-      *reinterpret_cast<uint32_t*>(obj + 0x1C) |= 0x400000;  // needs update (as FEngSetColor 0x51D843)
+  for (; obj; obj = Next(obj)) {
+    if (auto data = *reinterpret_cast<int**>(obj + 0x2C)) {
+      data[3] = data[3] * alpha / 255;  // FEObjData color: B, G, R, A ints
+      Flags(obj) |= kObjDirty;
     }
-    if (*reinterpret_cast<uint32_t*>(obj + 0x18) == 5) SetAlphaRecursive(*reinterpret_cast<uint8_t**>(obj + 0x64), alpha);
+    if (*reinterpret_cast<uint32_t*>(obj + 0x18) == kObjGroup) SetAlphaRecursive(FirstChild(obj), alpha);
   }
 }
 
 void ApplyBacking(const char* pkg) {
   if (g_layout.backingAlpha >= 255) return;
-  for (const char* name : {"BIG MENU BACKING", "SMALLER MENU BACKING"}) {
-    auto group = reinterpret_cast<uint8_t*>(u2::feng::FindObject(pkg, u2::feng::HashUpper(name)));
-    if (!group) {
-      U2LOG("menu: %s not found", name);
-      continue;
-    }
-    SetAlphaRecursive(*reinterpret_cast<uint8_t**>(group + 0x64), g_layout.backingAlpha);
-  }
+  for (const char* name : {"BIG MENU BACKING", "SMALLER MENU BACKING"})
+    if (uint8_t* group = Obj(pkg, name)) SetAlphaRecursive(FirstChild(group), g_layout.backingAlpha);
 }
 
 // ---- sidebar layout ---------------------------------------------------------------------------
@@ -165,15 +182,6 @@ void ApplyBacking(const char* pkg) {
 // of the matching track in every script (0x5178D0), so INIT and the other scripts keep the new values.
 auto FEObject_SetPosition = Fn<void(__fastcall*)(void*, void*, const float*, bool)>(0x517C10);  // thiscall, ret 8
 auto FEObject_SetSize = Fn<void(__fastcall*)(void*, void*, const float*, bool)>(0x517DB0);      // thiscall, ret 8
-
-// FEObject: +0x04 next sibling, +0x2C data, group +0x64 first child. Data (FEngLib BaseObject.Read):
-// +0x00 colour, +0x10 pivot, +0x1C position, +0x28 rotation quaternion (x,y,z,w), +0x38 size.
-// Positions are the object centre, relative to the parent group (topLeft = pos - size/2, 0x51D09E).
-uint8_t* Next(uint8_t* o) { return *reinterpret_cast<uint8_t**>(o + 4); }
-uint8_t* FirstChild(uint8_t* g) { return *reinterpret_cast<uint8_t**>(g + 0x64); }
-float* Pos(uint8_t* o) { return reinterpret_cast<float*>(*reinterpret_cast<uint8_t**>(o + 0x2C) + 0x1C); }
-float* Rot(uint8_t* o) { return reinterpret_cast<float*>(*reinterpret_cast<uint8_t**>(o + 0x2C) + 0x28); }
-float* Size(uint8_t* o) { return reinterpret_cast<float*>(*reinterpret_cast<uint8_t**>(o + 0x2C) + 0x38); }
 // Frame edges are 8 x 574 images turned a quarter about Z (quaternion z = +-0.707), so their
 // on-screen width and height are swapped.
 bool QuarterTurn(uint8_t* o) { return std::fabs(std::fabs(Rot(o)[2]) - 0.70710678f) < 0.05f; }
@@ -182,7 +190,7 @@ bool QuarterTurn(uint8_t* o) { return std::fabs(std::fabs(Rot(o)[2]) - 0.7071067
 void SetGeometry(uint8_t* o, float x, float y, float w, float h) {
   float pos[3] = {x, y, Pos(o)[2]};
   float size[3] = {std::copysign(w, Size(o)[0]), std::copysign(h, Size(o)[1]), Size(o)[2]};
-  *reinterpret_cast<uint32_t*>(o + 0x1C) |= 0x400000;
+  Flags(o) |= kObjDirty;
   FEObject_SetSize(o, nullptr, size, false);
   FEObject_SetPosition(o, nullptr, pos, false);
 }
@@ -190,12 +198,6 @@ void SetGeometry(uint8_t* o, float x, float y, float w, float h) {
 struct Rect {
   float l, t, r, b;
 };
-
-uint8_t* Obj(const char* pkg, const char* name) {
-  auto o = reinterpret_cast<uint8_t*>(u2::feng::FindObject(pkg, u2::feng::HashUpper(name)));
-  if (!o) U2LOG("menu: %s not found", name);
-  return o;
-}
 
 // Screen-space extent of a group's children (origin = the group's absolute position).
 bool ChildBounds(uint8_t* group, float ox, float oy, Rect& out) {
@@ -265,7 +267,7 @@ void ApplySidebar(uint8_t* m, const char* pkg, int rows) {
   Rect ref;
   if (!nig || !big || !ChildBounds(big, Pos(nig)[0] + Pos(big)[0], Pos(nig)[1] + Pos(big)[1], ref)) return;
   // Visible canvas: x = +-1/[0x79AC10] (WidescreenFix hor+ rewrites 2/640, Frontend.ixx), y = +-240.
-  const float halfW = 1.0f / Var<float>(0x79AC10);
+  const float halfW = 1.0f / Var<float>(u2::addr::FECanvasScaleX);
   const Rect bar{-halfW + g_layout.margin, -240 + g_layout.margin, -halfW + g_layout.margin + g_layout.width,
                  240 - g_layout.margin};
   const float dxL = bar.l - ref.l, dxR = bar.r - ref.r, dyT = bar.t - ref.t;
@@ -285,7 +287,8 @@ void ApplySidebar(uint8_t* m, const char* pkg, int rows) {
   auto f = [m](int off) -> float& { return *reinterpret_cast<float*>(m + off); };
   constexpr float kArrow = 24, kRightPad = 16;  // arrow image width (JSON), gap to the bar edge
   // Rows end inside the inner panel (SMALLER MENU BACKING ends 32 above the outer frame) with a
-  // small gap; shrink the step if they don't fit.
+  // small gap; shrink the step if they don't fit. The row step is +0x108 plus the spacing +0x128
+  // (0x54F0BF), which the ctor sets to 0 (0x5528C2).
   const float rowsBottom = bar.b - 38;
   float startX = f(0xF4) + dxL, startY = f(0xF8) + dyT;
   if (rows > 0) f(0x108) = (std::min)(f(0x108), std::floor((rowsBottom - startY) / rows));
@@ -334,7 +337,7 @@ void* __cdecl Factory(void* showData) {
                         reinterpret_cast<float*>(m + 0x114), reinterpret_cast<float*>(m + 0x11C), true);
     *static_cast<void**>(w) = g_toggleVtbl;
     RowId(w) = i;
-    g_rows.push_back(Row{static_cast<uint8_t*>(w), i, "", ""});
+    g_rows.push_back(Row{static_cast<uint8_t*>(w), "", ""});
     UIWidgetMenu_AddToggleOption(menu, nullptr, w, true);  // binds OPTION_NAME_n etc. and calls Draw
   }
   UIWidgetMenu_SetInitialOption(menu, nullptr, 0);
@@ -345,15 +348,15 @@ void* __cdecl Factory(void* showData) {
 }
 }  // namespace
 
-const Layout& GetLayout() { return g_layout; }
 bool IsMenuPackage(const char* name) { return g_open && name && _stricmp(name, kPkg) == 0; }
 
-bool Install(const Callbacks& cb, const Layout& layout) {
+bool Install(const Callbacks& cb, const Layout& layout, bool verbose) {
   g_cb = cb;
   g_layout = layout;
+  g_verbose = verbose;
   auto cur = Var<FactoryFn>(kFactorySlot);
   if (reinterpret_cast<uintptr_t>(cur) != 0x4EB650) {
-    U2LOG("menu: FNGData[%s] factory is %p, expected 004EB650 (another mod?); native menu disabled", kPkg, cur);
+    U2LOG("menu: FNGData[%s] factory is %p, expected 004EB650 (another mod?); photo mode disabled", kPkg, cur);
     return false;
   }
   g_origFactory = cur;
@@ -368,24 +371,39 @@ bool Install(const Callbacks& cb, const Layout& layout) {
   return true;
 }
 
+void Uninstall() {
+  if (g_origFactory) u2::mem::Write<FactoryFn>(kFactorySlot, g_origFactory);
+  g_origFactory = nullptr;
+}
+
 bool Open() {
   if (g_open) return true;
   if (IsFNGLoaded(kPkg)) {
     U2LOG("menu: %s already loaded, not opening", kPkg);
     return false;
   }
-  g_wantOurs = true;
-  g_wantFrames = 30;
   g_menu = nullptr;
   g_pendingActivate = -1;
   g_pendingBack = false;
-  AddFngToUIObject_1(kPkg, nullptr);
+  g_joyHandlersWereOn = Var<int>(kJoyHandlersOn) != 0;
+  g_wantOurs = true;
+  AddFngToUIObject_1(kPkg, nullptr);  // runs our factory synchronously
+  g_wantOurs = false;
+  if (!g_menu) {
+    U2LOG("menu: factory was not called for %s", kPkg);
+    RemoveFngAndJoyHandlers(kPkg);
+    if (g_joyHandlersWereOn) AddJoyHandlers(Var<void*>(u2::addr::pFEng), nullptr);
+    return false;
+  }
+  g_savedKeyboardMap = Var<uint8_t>(kMenuKeyboardMap);
   SetMenuKeyboardMap(1);
-  Var<uint8_t>(kPauseKeyBlock) = 1;
+  // While a restore from the last close is pending, the block byte still holds our 1.
+  if (g_releasePauseBlockIn == 0) g_savedPauseBlock = Var<uint8_t>(kPauseKeyBlock);
   g_releasePauseBlockIn = 0;
-  g_inputLogIn = 10;
+  Var<uint8_t>(kPauseKeyBlock) = 1;
+  g_inputLogIn = g_verbose ? 10 : 0;
   g_open = true;
-  U2LOG("menu: opened (factory ran synchronously: %s)", g_menu ? "yes" : "no");
+  U2LOG("menu: opened");
   return true;
 }
 
@@ -410,11 +428,13 @@ bool IsHidden() { return g_open && g_hidden; }
 void Close() {
   if (!g_open) return;
   SetHidden(false);
-  g_wantOurs = false;
   FEngSetLastButton(kPkg, 0);
   RemoveFngAndJoyHandlers(kPkg);
-  SetMenuKeyboardMap(0);
-  // Lift the pause-key block a few frames later so an Esc still held from closing can't pause.
+  // The joy handlers are global, not per package: if another screen needs them (registered
+  // before us, or a pause screen that came up meanwhile), register them again.
+  if (g_joyHandlersWereOn || u2::IsGamePaused()) AddJoyHandlers(Var<void*>(u2::addr::pFEng), nullptr);
+  SetMenuKeyboardMap(g_savedKeyboardMap);
+  // Restore the pause-key block a few frames later so an Esc still held from closing can't pause.
   g_releasePauseBlockIn = 3;
   g_open = false;
   g_menu = nullptr;
@@ -424,29 +444,20 @@ void Close() {
 
 bool IsOpen() { return g_open; }
 
-int CurrentRow() {
-  if (!g_menu) return -1;
-  void* cur = *reinterpret_cast<void**>(static_cast<uint8_t*>(g_menu) + 0x54);
-  return cur ? RowId(cur) : -1;
-}
-
+// Restores the saved pause-key block, unless the game changed it meanwhile (it writes the byte
+// itself at 0x501221, 0x50161D and 0x5004B0).
 void Tick() {
-  if (g_releasePauseBlockIn > 0 && --g_releasePauseBlockIn == 0 && !g_open) Var<uint8_t>(kPauseKeyBlock) = 0;
+  if (g_releasePauseBlockIn > 0 && --g_releasePauseBlockIn == 0 && !g_open && Var<uint8_t>(kPauseKeyBlock) == 1)
+    Var<uint8_t>(kPauseKeyBlock) = g_savedPauseBlock;
 }
 
 void Update(const std::string& title, const std::string& status) {
-  if (g_open && g_inputLogIn > 0 && --g_inputLogIn == 0) {
+  if (!g_open) return;
+  if (g_inputLogIn > 0 && --g_inputLogIn == 0) {
     auto pkg = reinterpret_cast<uint8_t*>(u2::feng::FindPackage(kPkg));
-    auto feng = Var<uint8_t*>(0x8384C4) ? *reinterpret_cast<uint8_t**>(Var<uint8_t*>(0x8384C4) + 8) : nullptr;
-    U2LOG("menu input: mapctx=%d menuMap=%d inputsEnabled=%d pkg+1C=%X +24=%X +8C=%X", Var<int>(0x870788),
-          Var<uint8_t>(0x870754), feng ? feng[1] : -1, pkg ? *reinterpret_cast<uint32_t*>(pkg + 0x1C) : 0,
-          pkg ? *reinterpret_cast<uint32_t*>(pkg + 0x24) : 0, pkg ? *reinterpret_cast<uint32_t*>(pkg + 0x8C) : 0);
+    U2LOG("menu input: mapctx=%d menuMap=%d joyHandlers=%d pkg+24=%X", Var<int>(kKeyboardMapCtx),
+          Var<uint8_t>(kMenuKeyboardMap), Var<int>(kJoyHandlersOn), pkg ? *reinterpret_cast<uint32_t*>(pkg + 0x24) : 0);
   }
-  if (g_wantOurs && g_wantFrames > 0 && --g_wantFrames == 0) {
-    g_wantOurs = false;
-    U2LOG("menu: factory was never called for %s", kPkg);
-  }
-  if (!g_open || !g_menu) return;
   if (title != g_title) {
     g_title = title;
     u2::feng::Print(kPkg, u2::feng::HashUpper("Header_text"), g_title.c_str());

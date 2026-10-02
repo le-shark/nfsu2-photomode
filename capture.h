@@ -2,6 +2,7 @@
 // Accumulation capture: renders N jittered frames per tile (lens position, sub-pixel offset,
 // optional shutter time slice), reads each finished frame back at EndScene, averages in linear
 // light on the CPU, stitches tiles and writes a PNG on a worker thread.
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -16,7 +17,7 @@ namespace photomode {
 
 struct CaptureParams {
   int samples = 128;
-  int tiles = 1;            // 1..4 (image is tiles x tiles screens)
+  int tiles = 1;            // 1..lens::kMaxTiles (image is tiles x tiles screens)
   float lensRadius = 0;     // metres, 0 = pinhole
   float focusDist = 10;     // metres
   float shutterSec = 0;     // 0 = no motion blur
@@ -47,7 +48,7 @@ class Capture {
   bool Saving() const;
 
  private:
-  void Release();
+  void Release();  // surfaces and buffers
   void ResolveTile();
   void Finish();
   void Notify(const std::string& m);
@@ -62,7 +63,7 @@ class Capture {
   IDirect3DSurface9* sys_ = nullptr;
   std::vector<float> accum_;
   std::vector<uint8_t> image_;
-  int accumCount_ = 0;
+  std::atomic<int> saving_{0};  // PNG writer threads still running
 
   mutable std::mutex msgMutex_;
   std::string message_;

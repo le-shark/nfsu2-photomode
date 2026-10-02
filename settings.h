@@ -3,7 +3,6 @@
 
 #include "native_menu.h"
 
-
 namespace photomode {
 
 struct Settings {
@@ -25,7 +24,7 @@ struct Settings {
   // [Menu]
   menu::Layout menuLayout;
   // [Debug]
-  bool verbose = false;
+  bool verbose = false;          // extra diagnostics in the log (cars, menu input, state after exit)
 
   void Load();
 };

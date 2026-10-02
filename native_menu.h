@@ -30,8 +30,8 @@ struct Layout {
   int backingAlpha = 140;       // 0..255 alpha of the menu backing panels (transparency)
 };
 
-bool Install(const Callbacks& cb, const Layout& layout);
-const Layout& GetLayout();
+bool Install(const Callbacks& cb, const Layout& layout, bool verbose);
+void Uninstall();                                // puts the original factory back
 bool IsMenuPackage(const char* name);  // our package while the menu is open
 bool Open();                                     // call from frame code (not inside FE callbacks)
 void Close();                                    // same
@@ -42,6 +42,5 @@ void SetHidden(bool hidden);
 bool IsHidden();
 void Tick();                                     // every frame, even when photo mode is off
 void Update(const std::string& title, const std::string& status);  // per frame: redraw, run deferred actions
-int CurrentRow();                                // -1 if none
 
 }  // namespace photomode::menu

@@ -3,19 +3,17 @@
 #include <d3d9.h>
 #include <windows.h>
 
-#include <atomic>
 #include <cmath>
 #include <new>
 #include <thread>
 
-#include "u2sdk/log.h"
-
+#include "lens.h"
 #include "u2sdk/dev.h"
+#include "u2sdk/log.h"
 
 namespace photomode {
 namespace {
-constexpr int kWarmupFrames = 3;  // let the game settle after hiding the HUD / disabling FX
-std::atomic<int> g_saving{0};
+constexpr int kWarmupFrames = 3;  // let the game settle after hiding the HUD
 
 struct SrgbTables {
   float toLinear[256];
@@ -41,7 +39,7 @@ const SrgbTables& Tables() {
 bool Capture::Start(IDirect3DDevice9* dev, const CaptureParams& p, std::string* error) {
   Release();
   p_ = p;
-  p_.tiles = p.tiles < 1 ? 1 : (p.tiles > 4 ? 4 : p.tiles);
+  p_.tiles = u2::ClampInt(p.tiles, 1, lens::kMaxTiles);
   if (p_.samples < 1) p_.samples = 1;
 
   IDirect3DSurface9* bb = nullptr;
@@ -70,7 +68,6 @@ bool Capture::Start(IDirect3DDevice9* dev, const CaptureParams& p, std::string* 
     return false;
   }
   seq_ = 0;
-  accumCount_ = 0;
   total_ = p_.samples * p_.tiles * p_.tiles;
   warmup_ = kWarmupFrames;
   armed_ = false;
@@ -109,6 +106,8 @@ void Capture::BeginFrame(float lastFrameDt, float* nextGameSpeed) {
     armed_ = false;
     return;
   }
+  // Last frame's sample was not read back (e.g. device lost): keep the world still until it is.
+  if (armed_) return;
   armed_ = true;
   // Shutter: advance the simulation by shutter/samples between consecutive samples
   // (only for 1x captures; the world can't be rewound for the next tile).
@@ -144,7 +143,6 @@ void Capture::OnEndScene(IDirect3DDevice9* dev) {
     }
   }
   sys_->UnlockRect();
-  ++accumCount_;
   ++seq_;
   if (seq_ % p_.samples == 0) ResolveTile();
   if (seq_ >= total_) Finish();
@@ -153,7 +151,7 @@ void Capture::OnEndScene(IDirect3DDevice9* dev) {
 void Capture::ResolveTile() {
   int tile = seq_ / p_.samples - 1;
   int tx = tile % p_.tiles, ty = tile / p_.tiles;
-  float inv = accumCount_ > 0 ? 1.0f / accumCount_ : 0;
+  float inv = 1.0f / p_.samples;
   const uint8_t* enc = Tables().toSrgb;
   size_t stride = static_cast<size_t>(width_) * p_.tiles * 3;
   for (int y = 0; y < height_; ++y) {
@@ -165,7 +163,6 @@ void Capture::ResolveTile() {
     }
   }
   std::fill(accum_.begin(), accum_.end(), 0.0f);
-  accumCount_ = 0;
 }
 
 void Capture::Finish() {
@@ -173,18 +170,15 @@ void Capture::Finish() {
   int w = width_ * p_.tiles, h = height_ * p_.tiles;
   std::string path = p_.outPath;
   auto img = std::make_shared<std::vector<uint8_t>>(std::move(image_));
-  image_.clear();
-  accum_.clear();
-  accum_.shrink_to_fit();
   Release();
-  ++g_saving;
+  ++saving_;
   Notify("SAVING...");
   std::thread([this, img, w, h, path] {
     bool ok = u2::dev::SavePng(path, w, h, img->data());
     U2LOG("png %s (%dx%d): %s", path.c_str(), w, h, ok ? "saved" : "FAILED");
     std::string name = path.substr(path.find_last_of("\\/") + 1);
     Notify(ok ? "SAVED " + name : "SAVE FAILED");
-    --g_saving;
+    --saving_;
   }).detach();
 }
 
@@ -193,20 +187,18 @@ void Capture::Abort(const char* reason) {
   U2LOG("capture aborted: %s", reason);
   active_ = false;
   Release();
-  image_.clear();
-  image_.shrink_to_fit();
-  accum_.clear();
-  accum_.shrink_to_fit();
   Notify(std::string("CAPTURE FAILED: ") + reason);
 }
 
 float Capture::Progress() const { return total_ ? static_cast<float>(seq_) / total_ : 0; }
 
-bool Capture::Saving() const { return g_saving.load() > 0; }
+bool Capture::Saving() const { return saving_ > 0; }
 
 void Capture::Release() {
   if (rt_) { rt_->Release(); rt_ = nullptr; }
   if (sys_) { sys_->Release(); sys_ = nullptr; }
+  std::vector<float>().swap(accum_);
+  std::vector<uint8_t>().swap(image_);
 }
 
 void Capture::Notify(const std::string& m) {

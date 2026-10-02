@@ -2,8 +2,6 @@
 
 #include <windows.h>
 
-#include <cstdlib>
-
 #include "u2sdk/ini.h"
 #include "u2sdk/log.h"
 
