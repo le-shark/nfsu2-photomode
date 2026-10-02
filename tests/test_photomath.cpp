@@ -105,4 +105,7 @@ TEST(LensDepthOfField) {
 TEST(LensTables) {
   CHECK(lens::Closest(lens::kFocals, 52) == 10);  // 50 mm
   CHECK(lens::Count(lens::kShutters) == lens::Count(lens::kShutterNames));
+  CHECK_NEAR(lens::kFStops[lens::kDefaultFStop], 2.8, 1e-4);
+  for (int i = 2; i < lens::Count(lens::kFStops); ++i) CHECK(lens::kFStops[i] > lens::kFStops[i - 1]);
+  for (int i = 2; i < lens::Count(lens::kShutters); ++i) CHECK(lens::kShutters[i] > lens::kShutters[i - 1]);
 }

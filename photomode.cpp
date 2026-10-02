@@ -70,7 +70,7 @@ struct PhotoMode {
 
   // menu values
   int sel = RowFocal;
-  int focalIdx = 10, fstopIdx = 3, shutterIdx = 0, qualityIdx = 1, tiles = 1;
+  int focalIdx = 10, fstopIdx = lens::kDefaultFStop, shutterIdx = 0, qualityIdx = 1, tiles = 1;
   bool focusAuto = true;
   float focusDist = 5;
   bool panWithCar = true;   // free camera follows the car during a shutter exposure

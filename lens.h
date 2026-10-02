@@ -6,9 +6,12 @@
 namespace photomode::lens {
 
 inline constexpr float kFocals[] = {10, 12, 14, 16, 18, 20, 24, 28, 35, 40, 50, 60, 70, 85, 100, 135, 150, 200, 250, 300};
-inline constexpr float kFStops[] = {0 /*off*/, 1.4f, 2, 2.8f, 4, 5.6f, 8, 11, 16, 22};
-inline constexpr float kShutters[] = {0 /*off*/, 1 / 250.f, 1 / 125.f, 1 / 60.f, 1 / 30.f, 1 / 15.f};
-inline constexpr const char* kShutterNames[] = {"OFF", "1/250", "1/125", "1/60", "1/30", "1/15"};
+inline constexpr float kFStops[] = {0 /*off*/, 1.0f, 1.2f, 1.4f, 2, 2.8f, 4, 5.6f, 8, 11, 16, 22};
+inline constexpr int kDefaultFStop = 5;  // F/2.8
+inline constexpr float kShutters[] = {0 /*off*/, 1 / 1000.f, 1 / 500.f, 1 / 250.f, 1 / 125.f, 1 / 60.f,
+                                      1 / 30.f,  1 / 15.f,   1 / 8.f,   1 / 4.f,   1 / 2.f,   1};
+inline constexpr const char* kShutterNames[] = {"OFF",  "1/1000", "1/500", "1/250", "1/125", "1/60",
+                                                "1/30", "1/15",   "1/8",   "1/4",   "1/2",   "1 s"};
 inline constexpr int kQualitySamples[] = {32, 128, 256};
 inline constexpr const char* kQualityNames[] = {"DRAFT", "HIGH", "ULTRA"};
 inline constexpr int kMaxTiles = 4;
