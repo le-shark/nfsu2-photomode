@@ -126,6 +126,7 @@ struct PhotoMode {
   Supersample super;
   Accum bigAccum{"accum2x"};
   int savedStreaks = -1, savedFog = -1, savedRain = -1;  // -1 = not changed
+  bool rezeroNativeFx = false;  // a device reset put the player's DOF/MB flags back; zero them again
   SampleKey accKey{};          // what the accumulated image shows
   float stillTime = 0;         // seconds the key has not changed
   FramePlan frame;
@@ -707,6 +708,13 @@ void Tick() {
     g->endSceneHooked = true;
   }
   g->frameArmed = true;
+  if (g->rezeroNativeFx) {  // after a device reset (OnDeviceReset); the reset frame itself draws nothing
+    g->rezeroNativeFx = false;
+    if (g->state != State::Off) {
+      Var<int>(addr::g_DepthOfFieldEnable) = 0;
+      Var<int>(addr::g_MotionBlurEnable) = 0;
+    }
+  }
   menu::Tick();
   g->input.Update();
   if (g->toastTime > 0) g->toastTime -= dt;
@@ -737,7 +745,8 @@ void Tick() {
 
   if (g->state == State::Capturing) {
     // An accumulator error mid-capture would otherwise plan the same sample forever.
-    if (g->accum.Failed()) g->capture.Abort("NO GPU ACCUMULATION");
+    if (g->accum.Failed() || (g->capture.Params().supersample && g->bigAccum.Failed()))
+      g->capture.Abort("NO GPU ACCUMULATION");
     if (g->input.KeyPressed(VK_ESCAPE) || g->input.KeyPressed(g->cfg.hotkey) || g->input.PadPressed(PadB)) {
       g->capture.Abort("CANCELLED");
       // Esc / pad B also reach the FE as Back, possibly a frame later: don't let them exit too.
@@ -821,6 +830,8 @@ void __cdecl Render3DDetour() {
     if (g->frame.region >= 0) acc.ShowRegion(dev, QuarterUv(g->frame.region));  // 2x resolve, 1:1
     else acc.Show(dev);  // a 2x mean is box-filtered down to the screen
     g->frame.shown = true;
+  } else if (super && g->frame.show && g->accum.Count() > 0) {
+    g->accum.Show(dev);  // 2x capture before its first sample: keep the 1x preview on screen
   }
   if (g->frame.hold) {  // keep this (preview or live) frame for the tile capture, then start empty
     g->accum.Hold(dev);
@@ -881,6 +892,18 @@ void OnDeviceReset() {
   FreeSupersample();
   g->frame = {};
   SetUncapped(false);
+  // The game re-creates its render targets inside this reset (0x5D1C40 -> 0x5BA780 -> 0x5BB840),
+  // gated by the effect flags: the blur RTs 0x86EB88/0x86EB0C need motion blur, DOF, bleach or rain
+  // (0x5BB852..0x5BB87B); the streak buffers 0x86F2E4/0x86FF70 need streaks or overbright
+  // (0x5BB899..0x5BB8A9, else nulled at 0x5BB9D8). With our zeros still in place they would be
+  // skipped, and restoring the flags later crashes on the missing target (0x5C6223, 0x5C6BEF).
+  // This listener runs before the game's handler (d3d.cpp), so put the player's values back now.
+  RestoreCaptureEffects();
+  if (g->state != State::Off) {
+    Var<int>(addr::g_DepthOfFieldEnable) = g->saved.dofEnable;
+    Var<int>(addr::g_MotionBlurEnable) = g->saved.mbEnable;
+    g->rezeroNativeFx = true;
+  }
 }
 }  // namespace
 
