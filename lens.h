@@ -14,7 +14,7 @@ inline constexpr const char* kShutterNames[] = {"Off",  "1/1000", "1/500", "1/25
                                                 "1/30", "1/15",   "1/8",   "1/4",   "1/2",   "1 s"};
 inline constexpr int kQualitySamples[] = {32, 128, 256};
 inline constexpr const char* kQualityNames[] = {"Draft", "High", "Ultra"};
-inline constexpr int kMaxTiles = 4;
+inline constexpr int kMaxTiles = 2;  // 2x: supersampled (tiles only as fallback)
 
 template <typename T, int N>
 constexpr int Count(const T (&)[N]) { return N; }

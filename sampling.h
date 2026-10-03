@@ -62,6 +62,17 @@ inline u2::ProjAdjust SampleAdjust(const SampleParams& p, int s, int tile, int w
 // world-anchored (9 headlight projector, 0x10..0x15 env-map faces) or the mirror (3) are not.
 inline bool IsSampledView(int id) { return id == 1 || id == 4; }
 
+// A rectangle in texture coordinates (0..1).
+struct UvRect {
+  float u0, v0, u1, v1;
+};
+// Quarter q (0..3: left-right, then top-bottom) of a 2x image: a 2x supersampled photo is read back
+// one quarter per resolve frame, into the same slots as 2x2 tiles (tile index q).
+inline UvRect QuarterUv(int q) {
+  float u = (q % 2) * 0.5f, v = (q / 2) * 0.5f;
+  return {u, v, u + 0.5f, v + 0.5f};
+}
+
 // sRGB transfer functions (IEC 61966-2-1); the shaders use the same constants.
 inline float SrgbToLinear(float c) { return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f); }
 inline float LinearToSrgb(float l) { return l <= 0.0031308f ? l * 12.92f : 1.055f * std::pow(l, 1 / 2.4f) - 0.055f; }

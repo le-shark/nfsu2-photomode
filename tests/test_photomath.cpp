@@ -309,6 +309,24 @@ TEST(SampleAdjustAppliesToMainAndRoadReflectionViews) {
   for (int id : {0, 2, 3, 5, 9, 16, 21}) CHECK(!IsSampledView(id));
 }
 
+TEST(QuarterUvCoversImage) {
+  const float want[4][4] = {{0, 0, .5f, .5f}, {.5f, 0, 1, .5f}, {0, .5f, .5f, 1}, {.5f, .5f, 1, 1}};
+  for (int q = 0; q < 4; ++q) {
+    UvRect r = QuarterUv(q);
+    CHECK(r.u0 == want[q][0] && r.v0 == want[q][1] && r.u1 == want[q][2] && r.v1 == want[q][3]);
+  }
+}
+
+TEST(SupersampleJitterIsHalf) {
+  SampleParams p{128, 1, 0, 5, true};
+  u2::ProjAdjust big = SampleAdjust(p, 7, 0, 3840, 2160), one = SampleAdjust(p, 7, 0, 1920, 1080);
+  CHECK_NEAR(big.jitterX, one.jitterX / 2, 1e-9);
+  CHECK_NEAR(big.jitterY, one.jitterY / 2, 1e-9);
+  CHECK(big.tiles == 1 && big.tx == 0 && big.ty == 0);
+}
+
+TEST(MaxTilesIsTwo) { CHECK(lens::kMaxTiles == 2); }
+
 TEST(SrgbRoundTrip) {
   for (float v : {0.0f, 0.04f, 0.5f, 1.0f}) CHECK_NEAR(LinearToSrgb(SrgbToLinear(v)), v, 1e-5);
   CHECK_NEAR(SrgbToLinear(0.5f), 0.21404, 1e-4);
