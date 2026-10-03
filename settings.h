@@ -21,6 +21,9 @@ struct Settings {
   std::string outputDir;         // default <game>\screenshots
   bool antialias = true;
   int defaultQuality = 1;
+  // [Preview]
+  bool previewEnable = true;     // live DOF/AA preview once the camera is still
+  float previewDelay = 0.15f;    // seconds of stillness before it starts
   // [Menu]
   menu::Layout menuLayout;
   // [Debug]

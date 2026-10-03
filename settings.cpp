@@ -35,6 +35,9 @@ void Settings::Load() {
   antialias = ini.GetBool("Capture", "AntiAliasing", antialias);
   defaultQuality = ini.GetInt("Capture", "DefaultQuality", defaultQuality);
 
+  previewEnable = ini.GetBool("Preview", "Enable", previewEnable);
+  previewDelay = ini.GetFloat("Preview", "Delay", previewDelay);
+
   menuLayout.width = ini.GetFloat("Menu", "Width", menuLayout.width);
   menuLayout.margin = ini.GetFloat("Menu", "Margin", menuLayout.margin);
   menuLayout.valueWidth = ini.GetFloat("Menu", "ValueWidth", menuLayout.valueWidth);

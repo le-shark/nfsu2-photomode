@@ -7,10 +7,12 @@
 #include <ctime>
 #include <string>
 
+#include "accum.h"
 #include "capture.h"
 #include "follow.h"
 #include "lens.h"
 #include "rig.h"
+#include "sampling.h"
 #include "settings.h"
 #include "native_menu.h"
 #include "u2sdk/d3d.h"
@@ -56,13 +58,21 @@ enum class State { Off, Active, Capturing };
 enum Row { RowCamera, RowTarget, RowFocal, RowRoll, RowFocus, RowAperture, RowShutter, RowFollow, RowQuality, RowResolution, RowTake, RowCount };
 
 constexpr float kMinFocusM = 0.3f, kMaxFocusM = 500;
-constexpr float kBackGuardSec = 0.3f;  // after a key cancels a capture, the same press must not also exit
+constexpr float kBackGuardSec = 0.3f;
+constexpr float kMinFrameLimit = 1 / 1800.f;  // see addr::FrameLimit  // after a key cancels a capture, the same press must not also exit
 
 struct Saved {
   float gameSpeed;
   int dofEnable, mbEnable, drawHud;
   uint16_t fov;
   uint8_t cursorVisible;
+};
+
+// What the Render3D post-hook does this frame (decided in Tick, before the frame renders).
+struct FramePlan {
+  bool sample = false;  // fold this frame into the accumulator (projection jittered by adj)
+  bool show = false;    // draw the accumulated image over the scene
+  ProjAdjust adj;
 };
 
 // Center / Closest = autofocus on the target car's centre / nearest corner. Aim = whatever the
@@ -103,6 +113,16 @@ struct PhotoMode {
   float postExitLog = 0;      // verbose: seconds left to log game state after exit
   int debugShot = 0;
   POINT cursorAtEnter{};
+
+  // GPU accumulation (live preview and capture)
+  Accum accum;
+  SampleKey accKey{};          // what the accumulated image shows
+  float stillTime = 0;         // seconds the key has not changed
+  FramePlan frame;
+  bool uncapped = false;       // frame limiter lowered (SetUncapped)
+  float savedFrameLimit = 0;
+  int savedMirror = 0;
+  LARGE_INTEGER previewStart{};
 };
 PhotoMode* g = nullptr;
 
@@ -118,6 +138,7 @@ MoverUpdateFn oCubicMoverUpdate;
 ProjFn oProj;
 FeRenderFn oFeRender;
 FrameFn oFrame;
+FrameFn oRender3D;
 EndSceneFn oEndScene;
 
 // ---- helpers --------------------------------------------------------------------------------
@@ -239,6 +260,57 @@ void UpdateAim() {
 
 float FocusDistance() { return g->focusMode == FocusMode::Manual ? g->focusDist : AutoFocusDistance(g->focusMode); }
 
+// ---- GPU accumulation --------------------------------------------------------------------
+// While samples are accumulated with the world frozen, the game's frame limiter (busy wait in
+// 0x57EAD0 on addr::FrameLimit, 1/60 with WidescreenFix FPSLimit=-1) only slows us down.
+void SetUncapped(bool on) {
+  if (on == g->uncapped) return;
+  if (on) {
+    g->savedFrameLimit = Var<float>(addr::FrameLimit);
+    Var<float>(addr::FrameLimit) = kMinFrameLimit;
+  } else {
+    Var<float>(addr::FrameLimit) = g->savedFrameLimit;
+  }
+  g->uncapped = on;
+}
+
+SampleKey CurrentKey() {
+  CamPose c = RigPose();
+  SampleParams p{lens::kQualitySamples[g->qualityIdx], 1, lens::ApertureRadiusM(Focal(), FStop()), FocusDistance(),
+                 g->cfg.antialias};
+  return {c.eye, c.fwd, c.up, FocalToGameFov(Focal(), FovCal()), p, 0};
+}
+
+// Live preview: once the camera and settings have been still for [Preview] Delay, accumulate
+// jittered samples (the same ones a photo uses) up to the quality's sample count and show the mean.
+void UpdatePreview(float dt) {
+  SampleKey key = CurrentKey();
+  if (key == g->accKey) {
+    g->stillTime += dt;
+  } else {
+    g->accum.Reset();
+    g->accKey = key;
+    g->stillTime = 0;
+  }
+  bool ready = g->accum.Ensure(Device());
+  int n = g->accum.Count();
+  bool sample = ready && g->cfg.previewEnable && g->stillTime >= g->cfg.previewDelay &&
+                (key.p.lensRadius > 0 || key.p.antialias) && n < key.p.samples;
+  g->frame.sample = sample;
+  g->frame.show = ready && n > 0;
+  g->frame.adj = sample ? SampleAdjust(key.p, n, 0, g->accum.Width(), g->accum.Height()) : ProjAdjust{};
+  SetUncapped(sample);
+  if (!g->cfg.verbose) return;
+  if (sample && n == 0) QueryPerformanceCounter(&g->previewStart);
+  if (!sample && n == key.p.samples && g->previewStart.QuadPart) {
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    double ms = 1000.0 * (now.QuadPart - g->previewStart.QuadPart) / g->qpcFreq.QuadPart;
+    U2LOG("preview: %d samples in %.0f ms (%.0f/s)", n, ms, n * 1000.0 / (ms > 0 ? ms : 1));
+    g->previewStart.QuadPart = 0;
+  }
+}
+
 // Camera pose for this frame: the rig, or while the shutter is open the shutter-follow pose.
 CamPose CurrentPose() {
   if (g->state == State::Capturing) return FollowPose(g->follow, g->captureCam, g->captureCar, TargetCarPose());
@@ -298,6 +370,12 @@ void Enter() {
   GetCursorPos(&g->cursorAtEnter);
   Var<uint8_t>(addr::FECursorVisible) = 0;  // hide the FE cursor, like the game's showcase photo shoot (0x4CEE11)
   g->input.SetMouseCapture(true);
+  // Rear-view mirror off: it is drawn after Render3D, outside drawHud (0x5CC0D7), and would be in photos.
+  g->savedMirror = Var<int>(addr::MirrorOverride);
+  Var<int>(addr::MirrorOverride) = 1;
+  g->accum.Reset();
+  g->stillTime = 0;
+  g->frame = {};
   g->state = State::Active;
   ApplyCamera(0);
   // Camera::StopUpdating (set only by mods such as ExOpts) makes SetCameraMatrix ignore us.
@@ -309,6 +387,10 @@ void Enter() {
 void Exit(const char* why) {
   if (g->state == State::Off) return;
   g->capture.Abort("PHOTO MODE CLOSED");
+  g->frame = {};
+  g->accum.Reset();
+  SetUncapped(false);
+  Var<int>(addr::MirrorOverride) = g->savedMirror;
   g_freezeWorld = false;
   Var<float>(addr::GameSpeed) = g->saved.gameSpeed;
   Var<int>(addr::g_DepthOfFieldEnable) = g->saved.dofEnable;
@@ -553,6 +635,8 @@ void Tick() {
   UpdateAnchor();
 
   if (g->state == State::Capturing) {
+    g->frame = {};
+    SetUncapped(false);
     if (g->input.KeyPressed(VK_ESCAPE) || g->input.KeyPressed(g->cfg.hotkey) || g->input.PadPressed(PadB)) {
       g->capture.Abort("CANCELLED");
       // Esc / pad B also reach the FE as Back, possibly a frame later: don't let them exit too.
@@ -575,6 +659,7 @@ void Tick() {
     if (g->state == State::Active) {
       ApplyCamera(g->lastDt);
       if (g->focusMode == FocusMode::Aim) UpdateAim();
+      UpdatePreview(dt);
     }
   }
   if (!menu::Open()) {
@@ -590,6 +675,20 @@ void Tick() {
 void __cdecl FrameDetour() {
   Tick();
   oFrame();
+}
+
+// Pre-FE point: the backbuffer holds the 3D scene + game post FX; the 2D pass 0x5CBF40(0) with the
+// mirror, letterbox and FE comes next (0x5D2B5A..0x5D2B60). Skipped by the game on frames without 3D.
+void __cdecl Render3DDetour() {
+  oRender3D();
+  if (g->state == State::Off) return;
+  IDirect3DDevice9* dev = Device();
+  if (!g->accum.Ensure(dev)) return;
+  if (g->frame.sample) {
+    g->accum.AddSample(dev);
+    g->frame.sample = false;  // one sample per planned frame
+  }
+  if (g->frame.show) g->accum.Show(dev);
 }
 
 // Any other mover that still targets the player camera gets our matrix instead.
@@ -608,7 +707,7 @@ void __fastcall CubicMoverUpdateDetour(void* mover, void* edx) {
 
 void __fastcall ProjDetour(void* plat, void* edx, eView* view, float a, float b, int c) {
   oProj(plat, edx, view, a, b, c);
-  const ProjAdjust* adj = g->state == State::Capturing ? g->capture.Adjust() : nullptr;
+  const ProjAdjust* adj = g->state == State::Capturing ? g->capture.Adjust() : g->frame.sample ? &g->frame.adj : nullptr;
   if (!adj || !view || view->Id != 1 || !plat) return;
   auto m = static_cast<Mat4*>(plat);  // [0] view, [1] proj, [2] viewproj
   m[0] = AdjustView(m[0], *adj);
@@ -635,7 +734,12 @@ void __fastcall FeRenderDetour(void* feng, void* edx) {
   for (int i = 0; i < n; ++i) feng::PackageObjects(pkgs[i]) = saved[i];
 }
 
-void OnDeviceReset() { g->capture.Abort("DEVICE RESET"); }
+void OnDeviceReset() {
+  g->capture.Abort("DEVICE RESET");
+  g->accum.OnDeviceReset();  // DEFAULT-pool targets must be released before the game's Reset
+  g->frame = {};
+  SetUncapped(false);
+}
 }  // namespace
 
 bool Install() {
@@ -658,6 +762,7 @@ bool Install() {
   ok &= hook::Create(addr::CubicCameraMover_Update, &CubicMoverUpdateDetour, &oCubicMoverUpdate, "CubicCameraMover::Update");
   ok &= hook::Create(addr::eViewPlatInfo_Update, &ProjDetour, &oProj, "eViewPlatInfo::Update");
   ok &= hook::Create(addr::cFEng_Render, &FeRenderDetour, &oFeRender, "cFEng::Render");
+  ok &= hook::Create(addr::Render3D, &Render3DDetour, &oRender3D, "Render3D");
   ok &= d3d::InstallResetHook();
   if (!ok) {
     U2LOG("some hooks failed; photo mode disabled");
