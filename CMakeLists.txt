@@ -17,5 +17,6 @@ u2_add_script(photomode NFSU2PhotoMode
   native_menu.cpp
   capture.cpp
   accum.cpp
+  supersample.cpp
   ${SHADER_HEADERS})
 target_include_directories(photomode PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
