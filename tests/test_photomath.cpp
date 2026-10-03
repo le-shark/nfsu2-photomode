@@ -235,6 +235,21 @@ TEST(CarCentreDepth) {
   CHECK(NearestCarDepth(cam, CarAt({0, 0, 0}, 0)) < CarCentreDepth(cam, CarAt({0, 0, 0}, 0)));
 }
 
+TEST(RayCarBoxHit) {
+  CarPose car = CarAt({0, 0, 0}, 0);  // box centre (0, 0, 0.5), half 2.2 x 0.9 x 0.65
+  // Side on, from 10 m to the left: enters at y = 0.9.
+  CHECK_NEAR(RayCarBoxHit({0, 10, 0.5f}, {0, -1, 0}, car, 500), 9.1, 1e-3);
+  // Head on along the car: enters at x = 2.2.
+  CHECK_NEAR(RayCarBoxHit({20, 0, 0.5f}, {-1, 0, 0}, car, 500), 17.8, 1e-3);
+  // Rotated car (90 deg): its length now runs along y.
+  CHECK_NEAR(RayCarBoxHit({0, 10, 0.5f}, {0, -1, 0}, CarAt({0, 0, 0}, 90), 500), 7.8, 1e-3);
+  // Misses: passes over the roof, points away, beyond maxT, eye inside the box.
+  CHECK(RayCarBoxHit({0, 10, 2}, {0, -1, 0}, car, 500) < 0);
+  CHECK(RayCarBoxHit({0, 10, 0.5f}, {0, 1, 0}, car, 500) < 0);
+  CHECK(RayCarBoxHit({0, 10, 0.5f}, {0, -1, 0}, car, 5) < 0);
+  CHECK(RayCarBoxHit({0, 0, 0.5f}, {0, -1, 0}, car, 500) < 0);
+}
+
 TEST(MenuTablesConsistent) {
   CHECK(lens::Count(lens::kQualitySamples) == lens::Count(lens::kQualityNames));
   for (int i = 1; i < lens::Count(lens::kFocals); ++i) CHECK(lens::kFocals[i] > lens::kFocals[i - 1]);

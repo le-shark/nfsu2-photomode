@@ -65,8 +65,9 @@ struct Saved {
   uint8_t cursorVisible;
 };
 
-// Center / Closest = autofocus on the target car's centre / nearest corner.
-enum class FocusMode { Center, Closest, Manual };
+// Center / Closest = autofocus on the target car's centre / nearest corner. Aim = whatever the
+// view's centre ray hits first (static world or any car).
+enum class FocusMode { Center, Closest, Aim, Manual };
 
 struct PhotoMode {
   Settings cfg;
@@ -80,6 +81,10 @@ struct PhotoMode {
   int focalIdx = 10, fstopIdx = lens::kDefaultFStop, shutterIdx = 0, qualityIdx = 1, tiles = 1;
   FocusMode focusMode = FocusMode::Center;
   float focusDist = 5;
+  float aimDist = 10;           // last aim hit; kept while the ray hits nothing
+  bool aimHit = false;          // the ray hit something this frame
+  int aimLogged = -2;           // verbose: last logged aim source (-1 none, 0 world, 1 car)
+  float aimLoggedDist = 0;
   Follow follow = Follow::Rig;  // how the camera follows the target car while the shutter is open
   CamPose captureCam{};         // camera and car when the shutter opened
   CarPose captureCar{};
@@ -200,11 +205,38 @@ CamPose RigPose() {
 // Autofocus: the car's centre, or the nearest corner of an approximate car box (photographers
 // focus on the near headlight).
 float AutoFocusDistance(FocusMode mode) {
+  if (mode == FocusMode::Aim) return g->aimDist;
   CamPose cam = RigPose();
   CarPose car = TargetCarPose();
   float d = mode == FocusMode::Closest ? NearestCarDepth(cam, car) : CarCentreDepth(cam, car);
   return d < kMinFocusM ? kMinFocusM : d;
 }
+// Aim autofocus: nearest hit of the view's centre ray on the static world (u2::WorldRayHit) or a
+// car box (every car in play, not only the target). With no hit the last distance is kept.
+void UpdateAim() {
+  CamPose cam = RigPose();
+  Vec3 dir = Normalize(cam.fwd);
+  float best = kMaxFocusM;
+  int source = -1;
+  if (float d; WorldRayHit(cam.eye, dir, kMaxFocusM, &d) && d < best) best = d, source = 0;
+  uint8_t* cars[kMaxCars];
+  for (int i = 0, n = ActiveCars(cars, kMaxCars); i < n; ++i) {
+    Vec3 axes[3];
+    CarAxes(cars[i], axes);
+    float d = RayCarBoxHit(cam.eye, dir, {CarPosition(cars[i]), {axes[0], axes[1], axes[2]}}, best);
+    if (d >= 0 && d < best) best = d, source = 1;
+  }
+  g->aimHit = source >= 0;
+  if (g->aimHit) g->aimDist = best < kMinFocusM ? kMinFocusM : best;
+  if (g->cfg.verbose && (source != g->aimLogged || std::fabs(g->aimDist - g->aimLoggedDist) > 0.1f * g->aimLoggedDist)) {
+    static const char* names[] = {"none", "world", "car"};
+    U2LOG("aim: %s %.2f m (eye %.1f %.1f %.1f dir %.2f %.2f %.2f)", names[source + 1], g->aimDist, cam.eye.x, cam.eye.y,
+          cam.eye.z, dir.x, dir.y, dir.z);
+    g->aimLogged = source;
+    g->aimLoggedDist = g->aimDist;
+  }
+}
+
 float FocusDistance() { return g->focusMode == FocusMode::Manual ? g->focusDist : AutoFocusDistance(g->focusMode); }
 
 // Camera pose for this frame: the rig, or while the shutter is open the shutter-follow pose.
@@ -364,11 +396,15 @@ bool IsActionRow(int row) { return row == RowTake; }
 void Activate(int row) {
   if (g->state != State::Active) return;
   if (row == RowTake) StartCapture();
-  else if (row == RowFocus) {  // Enter cycles Center -> Closest -> Manual (at the current distance)
+  else if (row == RowFocus) {  // Enter cycles Center -> Closest -> Aim -> Manual (at the current distance)
     switch (g->focusMode) {
       case FocusMode::Center: g->focusMode = FocusMode::Closest; break;
       case FocusMode::Closest:
-        g->focusDist = AutoFocusDistance(FocusMode::Closest);
+        g->focusMode = FocusMode::Aim;
+        UpdateAim();
+        break;
+      case FocusMode::Aim:
+        g->focusDist = g->aimDist;
         g->focusMode = FocusMode::Manual;
         break;
       case FocusMode::Manual: g->focusMode = FocusMode::Center; break;
@@ -393,6 +429,8 @@ std::string RowValue(int row) {
     case RowRoll: std::snprintf(b, sizeof b, "%+.0f", g->rig.roll); break;
     case RowFocus:
       if (g->focusMode == FocusMode::Manual) std::snprintf(b, sizeof b, "%.1f m", g->focusDist);
+      else if (g->focusMode == FocusMode::Aim)
+        std::snprintf(b, sizeof b, g->aimHit ? "Aim %.1f m" : "Aim -- (%.1f m)", g->aimDist);
       else
         std::snprintf(b, sizeof b, "%s %.1f m", g->focusMode == FocusMode::Center ? "Center" : "Closest",
                       AutoFocusDistance(g->focusMode));
@@ -537,7 +575,10 @@ void Tick() {
   } else {
     HandleControls(dt);
     if (g->state == State::Off) return;
-    if (g->state == State::Active) ApplyCamera(g->lastDt);
+    if (g->state == State::Active) {
+      ApplyCamera(g->lastDt);
+      if (g->focusMode == FocusMode::Aim) UpdateAim();
+    }
   }
   if (!menu::Open()) {
     Exit("menu unavailable");

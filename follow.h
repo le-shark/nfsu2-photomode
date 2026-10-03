@@ -2,6 +2,7 @@
 // How the camera follows the target car while the shutter is open, and car-based autofocus.
 // Pure math (no game calls), so it's unit-tested on the host. World is Z-up.
 #include <cmath>
+#include <utility>
 
 #include "u2sdk/u2math.h"
 
@@ -103,6 +104,31 @@ inline float NearestCarDepth(const CamPose& cam, const CarPose& car) {
     if (d < best) best = d;
   }
   return best;
+}
+
+// Distance along the ray eye + dir * t (dir unit length) to where it enters the car box, or -1 if it
+// misses within maxT (aim autofocus). A box that contains the eye is ignored, so a camera inside a
+// car focuses past it.
+inline float RayCarBoxHit(const Vec3& eye, const Vec3& dir, const CarPose& car, float maxT) {
+  Vec3 b[3];
+  detail::Basis(car, b);
+  Vec3 o = detail::ToLocal(b, eye - (car.pos + b[2] * kCarCentreUp)), d = detail::ToLocal(b, dir);
+  const float half[3] = {kCarHalfLen, kCarHalfWid, kCarHalfHgt}, oo[3] = {o.x, o.y, o.z}, dd[3] = {d.x, d.y, d.z};
+  float t0 = 0, t1 = maxT;
+  bool inside = true;
+  for (int i = 0; i < 3; ++i) {  // slab test
+    if (std::fabs(oo[i]) > half[i]) inside = false;
+    if (std::fabs(dd[i]) < 1e-8f) {
+      if (std::fabs(oo[i]) > half[i]) return -1;
+      continue;
+    }
+    float a = (-half[i] - oo[i]) / dd[i], c = (half[i] - oo[i]) / dd[i];
+    if (a > c) std::swap(a, c);
+    if (a > t0) t0 = a;
+    if (c < t1) t1 = c;
+    if (t0 > t1) return -1;
+  }
+  return inside ? -1 : t0;
 }
 
 }  // namespace photomode
