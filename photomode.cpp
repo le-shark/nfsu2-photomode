@@ -72,6 +72,7 @@ struct Saved {
 struct FramePlan {
   bool sample = false;  // fold this frame into the accumulator (projection jittered by adj)
   bool show = false;    // draw the accumulated image over the scene
+  bool shown = false;   // set by the Render3D hook when it drew the mean this frame
   ProjAdjust adj;
 };
 
@@ -123,6 +124,9 @@ struct PhotoMode {
   float savedFrameLimit = 0;
   int savedMirror = 0;
   LARGE_INTEGER previewStart{};
+  bool captureContinued = false;  // the capture started from the preview's samples
+  int captureFromSample = 0;
+  LARGE_INTEGER captureStart{};
 };
 PhotoMode* g = nullptr;
 
@@ -133,6 +137,7 @@ using ProjFn = void(__fastcall*)(void*, void*, eView*, float, float, int);
 using FeRenderFn = void(__fastcall*)(void*, void*);
 using FrameFn = void(__cdecl*)();
 using EndSceneFn = HRESULT(__stdcall*)(IDirect3DDevice9*);
+using PresentFn = HRESULT(__stdcall*)(IDirect3DDevice9*, const RECT*, const RECT*, HWND, const RGNDATA*);
 SetCameraMatrixFn oSetCameraMatrix;
 MoverUpdateFn oCubicMoverUpdate;
 ProjFn oProj;
@@ -140,6 +145,7 @@ FeRenderFn oFeRender;
 FrameFn oFrame;
 FrameFn oRender3D;
 EndSceneFn oEndScene;
+PresentFn oPresent;
 
 // ---- helpers --------------------------------------------------------------------------------
 float FovCal() { return g->cfg.fovCalibration > 0 ? g->cfg.fovCalibration : kDefaultVertFovScale; }
@@ -311,9 +317,10 @@ void UpdatePreview(float dt) {
   }
 }
 
-// Camera pose for this frame: the rig, or while the shutter is open the shutter-follow pose.
+// Camera pose for this frame: the rig, or while a shutter exposure runs the shutter-follow pose.
 CamPose CurrentPose() {
-  if (g->state == State::Capturing) return FollowPose(g->follow, g->captureCam, g->captureCar, TargetCarPose());
+  if (g->state == State::Capturing && g->capture.Params().shutterSec > 0)
+    return FollowPose(g->follow, g->captureCam, g->captureCar, TargetCarPose());
   return RigPose();
 }
 
@@ -416,6 +423,10 @@ void StartCapture() {
     Toast("STILL SAVING PREVIOUS PICTURE");
     return;
   }
+  if (!g->accum.Ensure(Device())) {
+    Toast("CAPTURE FAILED: NO GPU ACCUMULATION");
+    return;
+  }
   CaptureParams p;
   p.sample = {lens::kQualitySamples[g->qualityIdx], g->tiles, lens::ApertureRadiusM(Focal(), FStop()), FocusDistance(),
               g->cfg.antialias};
@@ -426,20 +437,38 @@ void StartCapture() {
     Toast(err);
     return;
   }
-  // Clean frame: FE off (HUD + our UI) via drawHud. Native DOF/MB are already off in photo mode.
-  Var<int>(addr::DrawHud) = 0;
+  // A 1x photo without shutter is exactly what the preview accumulates: continue from its samples
+  // (instant when it has converged). Anything else starts from an empty mean.
+  g->captureContinued = p.sample.tiles == 1 && p.shutterSec == 0 && CurrentKey() == g->accKey;
+  if (!g->captureContinued) g->accum.Reset();
+  g->captureFromSample = g->accum.Count();
+  QueryPerformanceCounter(&g->captureStart);
+  g->frame = {};
   g->captureCam = RigPose();
   g->captureCar = TargetCarPose();
   g->state = State::Capturing;
 }
 
+// Every way a capture ends (done, cancelled, failed, device reset) comes through here from Tick;
+// Exit restores the same things itself.
 void EndCapture() {
-  // The camera stays where the exposure ended instead of snapping back to where it started.
-  CamPose end = CurrentPose();
-  g->rig.SetPose(end.eye, end.fwd, end.up, g->anchor);
+  // After a shutter exposure the camera stays where it ended instead of snapping back.
+  if (g->capture.Params().shutterSec > 0) {
+    CamPose end = CurrentPose();
+    g->rig.SetPose(end.eye, end.fwd, end.up, g->anchor);
+  }
   g_freezeWorld = true;
   Var<float>(addr::GameSpeed) = g->saved.gameSpeed;
   Var<int>(addr::DrawHud) = g->saved.drawHud;
+  SetUncapped(false);
+  g->frame = {};
+  // Only a continued capture leaves a mean that still matches the preview's key.
+  if (!g->captureContinued) g->accum.Reset();
+  LARGE_INTEGER now;
+  QueryPerformanceCounter(&now);
+  U2LOG("capture end: %.0f ms (continued from sample %d: %s)",
+        1000.0 * (now.QuadPart - g->captureStart.QuadPart) / g->qpcFreq.QuadPart, g->captureFromSample,
+        g->captureContinued ? "yes" : "no");
   g->state = State::Active;
 }
 
@@ -578,9 +607,19 @@ HRESULT __stdcall EndSceneDetour(IDirect3DDevice9* dev) {
   if (g->frameArmed) {
     g->frameArmed = false;
     dev::OnEndScene(dev);
-    if (g->state == State::Capturing && dev == Device()) g->capture.OnEndScene(dev);
+    // Read back only a resolve frame whose mean was really drawn (Render3D ran this frame).
+    if (g->state == State::Capturing && dev == Device() && g->frame.shown) g->capture.OnEndScene(dev);
   }
   return oEndScene(dev);
+}
+
+// Tile captures render zoomed tiles: don't present them, the screen holds the last frame instead.
+// Safe to skip: the game only checks Present for DEVICELOST (0x5D2BC9) and calls
+// TestCooperativeLevel at the start of every frame (0x5D2AF5 -> reset handler 0x5D1C40).
+HRESULT __stdcall PresentDetour(IDirect3DDevice9* dev, const RECT* src, const RECT* dst, HWND wnd, const RGNDATA* dirty) {
+  if (g->state == State::Capturing && g->capture.Active() && g->capture.Params().sample.tiles > 1 && dev == Device())
+    return S_OK;  // == D3D_OK
+  return oPresent(dev, src, dst, wnd, dirty);
 }
 
 void LogPostExit(float dt) {
@@ -603,6 +642,8 @@ void Tick() {
     // One attempt only; failures are logged by hook::Create.
     d3d::HookDeviceMethod(d3d::vt::EndScene, reinterpret_cast<void*>(&EndSceneDetour), reinterpret_cast<void**>(&oEndScene),
                           "IDirect3DDevice9::EndScene");
+    d3d::HookDeviceMethod(d3d::vt::Present, reinterpret_cast<void*>(&PresentDetour), reinterpret_cast<void**>(&oPresent),
+                          "IDirect3DDevice9::Present");
     g->endSceneHooked = true;
   }
   g->frameArmed = true;
@@ -635,20 +676,25 @@ void Tick() {
   UpdateAnchor();
 
   if (g->state == State::Capturing) {
-    g->frame = {};
-    SetUncapped(false);
     if (g->input.KeyPressed(VK_ESCAPE) || g->input.KeyPressed(g->cfg.hotkey) || g->input.PadPressed(PadB)) {
       g->capture.Abort("CANCELLED");
       // Esc / pad B also reach the FE as Back, possibly a frame later: don't let them exit too.
       g->backGuard = kBackGuardSec;
     }
     if (g->capture.Active()) {
-      float speed = 0;
-      g->capture.BeginFrame(g->lastDt, &speed);
+      CaptureFrame cf = g->capture.BeginFrame(g->accum.Count(), g->lastDt);
+      g->frame.shown = false;
+      if (cf.newTile) g->accum.Reset();
+      g->frame.sample = cf.sample;
+      g->frame.show = true;  // the screen shows the developing mean, never the jittered samples
+      g->frame.adj = cf.adj;
+      // Resolve frame: FE off (our menu) so the mean is read back clean at EndScene.
+      Var<int>(addr::DrawHud) = cf.resolve ? 0 : g->saved.drawHud;
+      SetUncapped(cf.sample && g->capture.Params().shutterSec == 0);
       // Shutter samples advance the world by a small, non-zero time step through the normal
       // (unpaused) loop path; otherwise the world stays on the game's own pause path.
-      g_freezeWorld = speed <= 0;
-      Var<float>(addr::GameSpeed) = speed > 0 ? speed : g->saved.gameSpeed;
+      g_freezeWorld = cf.nextGameSpeed <= 0;
+      Var<float>(addr::GameSpeed) = cf.nextGameSpeed > 0 ? cf.nextGameSpeed : g->saved.gameSpeed;
     } else {
       EndCapture();
     }
@@ -688,7 +734,10 @@ void __cdecl Render3DDetour() {
     g->accum.AddSample(dev);
     g->frame.sample = false;  // one sample per planned frame
   }
-  if (g->frame.show) g->accum.Show(dev);
+  if (g->frame.show && g->accum.Count() > 0) {
+    g->accum.Show(dev);
+    g->frame.shown = true;
+  }
 }
 
 // Any other mover that still targets the player camera gets our matrix instead.
@@ -707,7 +756,7 @@ void __fastcall CubicMoverUpdateDetour(void* mover, void* edx) {
 
 void __fastcall ProjDetour(void* plat, void* edx, eView* view, float a, float b, int c) {
   oProj(plat, edx, view, a, b, c);
-  const ProjAdjust* adj = g->state == State::Capturing ? g->capture.Adjust() : g->frame.sample ? &g->frame.adj : nullptr;
+  const ProjAdjust* adj = g->state != State::Off && g->frame.sample ? &g->frame.adj : nullptr;
   if (!adj || !view || view->Id != 1 || !plat) return;
   auto m = static_cast<Mat4*>(plat);  // [0] view, [1] proj, [2] viewproj
   m[0] = AdjustView(m[0], *adj);

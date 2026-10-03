@@ -3,7 +3,6 @@
 #include <d3d9.h>
 #include <windows.h>
 
-#include <cmath>
 #include <new>
 #include <thread>
 
@@ -12,29 +11,6 @@
 #include "u2sdk/log.h"
 
 namespace photomode {
-namespace {
-constexpr int kWarmupFrames = 3;  // let the game settle after hiding the HUD
-
-struct SrgbTables {
-  float toLinear[256];
-  uint8_t toSrgb[4097];
-  SrgbTables() {
-    for (int i = 0; i < 256; ++i) {
-      float c = i / 255.0f;
-      toLinear[i] = c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
-    }
-    for (int i = 0; i <= 4096; ++i) {
-      float l = i / 4096.0f;
-      float s = l <= 0.0031308f ? l * 12.92f : 1.055f * std::pow(l, 1 / 2.4f) - 0.055f;
-      toSrgb[i] = static_cast<uint8_t>(u2::Clamp(s * 255.0f + 0.5f, 0, 255));
-    }
-  }
-};
-const SrgbTables& Tables() {
-  static SrgbTables t;
-  return t;
-}
-}  // namespace
 
 bool Capture::Start(IDirect3DDevice9* dev, const CaptureParams& p, std::string* error) {
   Release();
@@ -60,48 +36,51 @@ bool Capture::Start(IDirect3DDevice9* dev, const CaptureParams& p, std::string* 
     return false;
   }
   try {
-    accum_.assign(static_cast<size_t>(width_) * height_ * 3, 0.0f);
     image_.assign(static_cast<size_t>(width_) * p_.sample.tiles * height_ * p_.sample.tiles * 3, 0);
   } catch (const std::bad_alloc&) {
     *error = "NOT ENOUGH MEMORY FOR THIS RESOLUTION";
     Release();
     return false;
   }
-  seq_ = 0;
-  total_ = p_.sample.samples * p_.sample.tiles * p_.sample.tiles;
-  warmup_ = kWarmupFrames;
-  armed_ = false;
+  tile_ = done_ = 0;
+  lastPlanned_ = -1;
+  resolveArmed_ = tileDone_ = false;
   active_ = true;
   U2LOG("capture start: %dx%d tiles=%d samples=%d lens=%.4fm focus=%.2fm shutter=%.4fs -> %s", width_, height_,
         p_.sample.tiles, p_.sample.samples, p_.sample.lensRadius, p_.sample.focusDist, p_.shutterSec, p_.outPath.c_str());
   return true;
 }
 
-void Capture::BeginFrame(float lastFrameDt, float* nextGameSpeed) {
-  *nextGameSpeed = 0;
-  if (!active_) return;
-  int s = seq_ % p_.sample.samples;
-  int tile = seq_ / p_.sample.samples;
-
-  adjust_ = SampleAdjust(p_.sample, s, tile, width_, height_);
-
-  if (warmup_ > 0) {
-    --warmup_;
-    armed_ = false;
-    return;
+CaptureFrame Capture::BeginFrame(int accumCount, float lastFrameDt) {
+  CaptureFrame f;
+  if (!active_) return f;
+  if (tileDone_) {  // the previous tile was read back: start the next one from an empty mean
+    tileDone_ = false;
+    ++tile_;
+    f.newTile = true;
+    accumCount = 0;
+    lastPlanned_ = -1;
   }
-  // Last frame's sample was not read back (e.g. device lost): keep the world still until it is.
-  if (armed_) return;
-  armed_ = true;
-  // Shutter: advance the simulation by shutter/samples between consecutive samples
-  // (only for 1x captures; the world can't be rewound for the next tile).
-  if (p_.shutterSec > 0 && p_.sample.tiles == 1 && s + 1 < p_.sample.samples && lastFrameDt > 1e-4f)
-    *nextGameSpeed = (p_.shutterSec / p_.sample.samples) / lastFrameDt;
+  const int n = p_.sample.samples;
+  done_ = accumCount < n ? accumCount : n;
+  if (resolveArmed_ || accumCount >= n) {  // also repeats a resolve whose image was not drawn
+    f.resolve = resolveArmed_ = true;
+    return f;
+  }
+  f.sample = true;
+  f.adj = SampleAdjust(p_.sample, accumCount, tile_, width_, height_);
+  // Shutter: advance the simulation by shutter/samples between consecutive samples (1x only; the
+  // world can't be rewound for the next tile). If last frame's sample did not land (no 3D that
+  // frame), keep the world still until it does.
+  bool landed = lastPlanned_ < 0 || accumCount > lastPlanned_;
+  if (p_.shutterSec > 0 && p_.sample.tiles == 1 && landed && accumCount + 1 < n && lastFrameDt > 1e-4f)
+    f.nextGameSpeed = (p_.shutterSec / n) / lastFrameDt;
+  lastPlanned_ = accumCount;
+  return f;
 }
 
 void Capture::OnEndScene(IDirect3DDevice9* dev) {
-  if (!active_ || !armed_) return;
-  armed_ = false;
+  if (!active_ || !resolveArmed_) return;
   IDirect3DSurface9* bb = nullptr;
   if (FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb))) return;
   HRESULT hr = dev->StretchRect(bb, nullptr, rt_, nullptr, D3DTEXF_NONE);
@@ -115,38 +94,22 @@ void Capture::OnEndScene(IDirect3DDevice9* dev) {
     Abort("FRAME LOCK FAILED");
     return;
   }
-  const float* lin = Tables().toLinear;
-  float* acc = accum_.data();
+  // The backbuffer already holds the gamma-corrected mean: copy X8R8G8B8 (B,G,R,X) into the tile as RGB.
+  const int tiles = p_.sample.tiles, tx = tile_ % tiles, ty = tile_ / tiles;
+  const size_t stride = static_cast<size_t>(width_) * tiles * 3;
   for (int y = 0; y < height_; ++y) {
     auto row = static_cast<const uint8_t*>(lr.pBits) + static_cast<size_t>(y) * lr.Pitch;
-    float* a = acc + static_cast<size_t>(y) * width_ * 3;
-    for (int x = 0; x < width_; ++x, row += 4, a += 3) {  // X8R8G8B8 = B,G,R,X in memory
-      a[0] += lin[row[2]];
-      a[1] += lin[row[1]];
-      a[2] += lin[row[0]];
+    uint8_t* dst = image_.data() + (static_cast<size_t>(ty) * height_ + y) * stride + static_cast<size_t>(tx) * width_ * 3;
+    for (int x = 0; x < width_; ++x, row += 4, dst += 3) {
+      dst[0] = row[2];
+      dst[1] = row[1];
+      dst[2] = row[0];
     }
   }
   sys_->UnlockRect();
-  ++seq_;
-  if (seq_ % p_.sample.samples == 0) ResolveTile();
-  if (seq_ >= total_) Finish();
-}
-
-void Capture::ResolveTile() {
-  int tile = seq_ / p_.sample.samples - 1;
-  int tx = tile % p_.sample.tiles, ty = tile / p_.sample.tiles;
-  float inv = 1.0f / p_.sample.samples;
-  const uint8_t* enc = Tables().toSrgb;
-  size_t stride = static_cast<size_t>(width_) * p_.sample.tiles * 3;
-  for (int y = 0; y < height_; ++y) {
-    const float* a = accum_.data() + static_cast<size_t>(y) * width_ * 3;
-    uint8_t* dst = image_.data() + (static_cast<size_t>(ty) * height_ + y) * stride + static_cast<size_t>(tx) * width_ * 3;
-    for (int i = 0; i < width_ * 3; ++i) {
-      int q = static_cast<int>(u2::Clamp(a[i] * inv, 0, 1) * 4096.0f + 0.5f);
-      dst[i] = enc[q];
-    }
-  }
-  std::fill(accum_.begin(), accum_.end(), 0.0f);
+  resolveArmed_ = false;
+  if (tile_ + 1 >= tiles * tiles) Finish();
+  else tileDone_ = true;
 }
 
 void Capture::Finish() {
@@ -174,14 +137,16 @@ void Capture::Abort(const char* reason) {
   Notify(std::string("CAPTURE FAILED: ") + reason);
 }
 
-float Capture::Progress() const { return total_ ? static_cast<float>(seq_) / total_ : 0; }
+float Capture::Progress() const {
+  const int n = p_.sample.samples, tiles = p_.sample.tiles * p_.sample.tiles;
+  return static_cast<float>(tile_ * n + done_) / static_cast<float>(n * tiles);
+}
 
 bool Capture::Saving() const { return saving_ > 0; }
 
 void Capture::Release() {
   if (rt_) { rt_->Release(); rt_ = nullptr; }
   if (sys_) { sys_->Release(); sys_ = nullptr; }
-  std::vector<float>().swap(accum_);
   std::vector<uint8_t>().swap(image_);
 }
 
