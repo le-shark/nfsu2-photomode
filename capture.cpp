@@ -42,7 +42,7 @@ bool Capture::Start(IDirect3DDevice9* dev, const CaptureParams& p, std::string* 
     Release();
     return false;
   }
-  tile_ = done_ = 0;
+  tile_ = done_ = warm_ = 0;
   lastPlanned_ = -1;
   resolveArmed_ = tileDone_ = false;
   active_ = true;
@@ -62,6 +62,11 @@ CaptureFrame Capture::BeginFrame(int accumCount, float lastFrameDt) {
       f.newTile = true;
       accumCount = 0;
     }
+  }
+  if (p_.supersample && warm_ < kGlowWarmupFrames) {  // world still frozen; no shutter step
+    ++warm_;
+    f.warm = true;
+    return f;
   }
   const int n = p_.sample.samples;
   done_ = accumCount < n ? accumCount : n;

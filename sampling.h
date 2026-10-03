@@ -62,6 +62,12 @@ inline u2::ProjAdjust SampleAdjust(const SampleParams& p, int s, int tile, int w
 // world-anchored (9 headlight projector, 0x10..0x15 env-map faces) or the mirror (3) are not.
 inline bool IsSampledView(int id) { return id == 1 || id == 4; }
 
+// Frames rendered into a fresh 2x streak buffer before a 2x capture samples: the game fades it by
+// BLENDFACTOR 0xFF785AAA per frame (0x5CBB57) and adds the lights again, so glows build up to their
+// steady brightness. Blue, the slowest channel (170/255 per frame), needs 18 frames to reach 99.9 %;
+// 20 leaves a margin.
+inline constexpr int kGlowWarmupFrames = 20;
+
 // A rectangle in texture coordinates (0..1).
 struct UvRect {
   float u0, v0, u1, v1;

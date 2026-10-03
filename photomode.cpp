@@ -77,6 +77,7 @@ struct FramePlan {
   bool hold = false;    // tile capture start: keep the frame on screen, then empty the mean
   bool showHold = false;// tile capture: draw the held frame over the zoomed tile sample
   bool resolve = false; // capture resolve frame: read back at EndScene, never presented
+  bool warm = false;    // 2x capture warm-up: render into the 2x targets, don't sample
   int region = -1;      // supersample resolve: quarter of the 2x mean to show
   ProjAdjust adj;
 };
@@ -402,16 +403,17 @@ void Enter() {
 }
 
 // Screen-space effects that break at 2x (verified-in-binary.md "What changes on paused frames"):
-// the glow/streak buffer pass 0x5CBB00 and overbright need [0x870CE0] (glow flares [0x870CE4] stay
-// on), horizon fog sizes its grid from the screen. Tiles also lose the rain splatter (clip-space
-// drops repeat per tile). Only ever turned off; restored by RestoreCaptureEffects.
+// horizon fog sizes its grid from the screen. Supersampled 2x keeps light streaks/overbright (their
+// buffers are swapped to 2x, supersample.cpp). Tiles also lose the streak/overbright pass (feedback
+// ghosts between tiles) and the rain splatter (clip-space drops repeat per tile). Only ever turned
+// off; restored by RestoreCaptureEffects.
 void SetCaptureEffects(bool tiles) {
-  g->savedStreaks = Var<int>(addr::LightStreaksEnable);
   g->savedFog = Var<int>(addr::HorizonFogEnable);
-  Var<int>(addr::LightStreaksEnable) = 0;
   Var<int>(addr::HorizonFogEnable) = 0;
   if (tiles) {
+    g->savedStreaks = Var<int>(addr::LightStreaksEnable);
     g->savedRain = Var<int>(addr::RainEnable);
+    Var<int>(addr::LightStreaksEnable) = 0;
     Var<int>(addr::RainEnable) = 0;
   }
 }
@@ -764,13 +766,14 @@ void Tick() {
       g->frame.adj = cf.adj;
       g->frame.resolve = cf.resolve;
       g->frame.region = cf.region;
+      g->frame.warm = cf.warm;
       // The screen shows the developing mean (1x) or the held frame (tiles), never the jittered
       // or zoomed samples; the menu with its progress stays live on top.
       g->frame.show = !tiles || cf.resolve;
       g->frame.showHold = tiles && !cf.resolve;
       // Resolve frame: FE off (our menu) so the mean is read back clean at EndScene.
       Var<int>(addr::DrawHud) = cf.resolve ? 0 : g->saved.drawHud;
-      SetUncapped(cf.sample && g->capture.Params().shutterSec == 0);
+      SetUncapped((cf.sample || cf.warm) && g->capture.Params().shutterSec == 0);
       // Shutter samples advance the world by a small, non-zero time step through the normal
       // (unpaused) loop path; otherwise the world stays on the game's own pause path.
       g_freezeWorld = cf.nextGameSpeed <= 0;
@@ -810,11 +813,11 @@ void __cdecl Render3DDetour() {
   // inside this call), and the sample is folded in while that target is still bound.
   const bool super = g->state == State::Capturing && g->capture.Params().supersample && g->super.Ready();
   IDirect3DDevice9* dev = Device();
-  if (super && g->frame.sample) {
+  if (super && (g->frame.sample || g->frame.warm)) {
     g->super.Begin(dev);
     oRender3D();
-    g->bigAccum.AddSample(dev);
-    g->frame.sample = false;
+    if (g->frame.sample) g->bigAccum.AddSample(dev);
+    g->frame.sample = g->frame.warm = false;
     g->super.End(dev);
   } else {
     oRender3D();

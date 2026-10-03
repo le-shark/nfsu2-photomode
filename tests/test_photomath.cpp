@@ -327,6 +327,12 @@ TEST(SupersampleJitterIsHalf) {
 
 TEST(MaxTilesIsTwo) { CHECK(lens::kMaxTiles == 2); }
 
+TEST(GlowWarmupReachesSteadyState) {
+  // The streak buffer is faded by BLENDFACTOR 0xFF785AAA every frame (0x5CBB57): R 120, G 90, B 170
+  // /255. Starting from black, the warm-up must leave less than 0.1 % of the steady state missing.
+  for (int c : {120, 90, 170}) CHECK(std::pow(c / 255.0, kGlowWarmupFrames) < 0.001);
+}
+
 TEST(SrgbRoundTrip) {
   for (float v : {0.0f, 0.04f, 0.5f, 1.0f}) CHECK_NEAR(LinearToSrgb(SrgbToLinear(v)), v, 1e-5);
   CHECK_NEAR(SrgbToLinear(0.5f), 0.21404, 1e-4);

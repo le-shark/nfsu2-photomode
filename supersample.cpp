@@ -35,11 +35,40 @@ bool Supersample::Create(IDirect3DDevice9* dev, int w, int h) {
   }
   w_ = w;
   h_ = h;
-  U2LOG("supersample: %dx%d ok", w, h);
+  int extra = 0;
+  for (Swap& s : swaps_) {
+    if (!Var<void*>(s.texAddr)) continue;  // the game didn't create it (effect off): nothing to swap
+    if (!CreateSwap(dev, s)) {
+      Free();
+      return false;
+    }
+    ++extra;
+  }
+  U2LOG("supersample: %dx%d ok (+%d effect buffers)", w, h, extra);
   return true;
 }
 
+// Same format as the game's texture, 2x its size, 1 level, render target; starts black (the game
+// clears its streak buffer only at creation, 0x5BBA6E).
+bool Supersample::CreateSwap(IDirect3DDevice9* dev, Swap& s) {
+  auto game = static_cast<IDirect3DTexture9*>(Var<void*>(s.texAddr));
+  D3DSURFACE_DESC d;
+  HRESULT hr = game->GetLevelDesc(0, &d);
+  if (SUCCEEDED(hr))
+    hr = dev->CreateTexture(w_, h_, 1, D3DUSAGE_RENDERTARGET, d.Format, D3DPOOL_DEFAULT, &s.tex, nullptr);
+  if (SUCCEEDED(hr)) hr = s.tex->GetSurfaceLevel(0, &s.surf);
+  if (SUCCEEDED(hr)) hr = dev->ColorFill(s.surf, nullptr, 0);
+  if (FAILED(hr)) U2LOG("supersample: effect buffer %08X failed (hr=0x%08lX)", static_cast<unsigned>(s.texAddr), hr);
+  return SUCCEEDED(hr);
+}
+
 void Supersample::Free() {
+  for (Swap& s : swaps_) {
+    if (s.surf) s.surf->Release();
+    if (s.tex) s.tex->Release();
+    s.surf = nullptr;
+    s.tex = nullptr;
+  }
   if (rt_) {
     rt_->Release();
     rt_ = nullptr;
@@ -72,6 +101,20 @@ void Supersample::Begin(IDirect3DDevice9* dev) {
   Var<int>(addr::RT0Height) = h_;
   Var<void*>(addr::BackBufferSurface) = rt_;
   Var<void*>(addr::AutoDepthSurface) = ds_;
+  // The light streak/overbright chain at 2x: its feedback buffer must match our depth (the lights
+  // are depth-tested against [0x870854], 0x5CBBD6), and bleach/overbright copy the full-size pair
+  // back over the target (0x5C6AA4, 0x5CCBFA). The half-size bloom buffers stay 1x on purpose: their
+  // kernels are in source texels, so the halo keeps its size relative to the image.
+  for (Swap& s : swaps_) {
+    if (!s.tex) continue;
+    s.savedTex = Var<void*>(s.texAddr);
+    s.savedSurf = Var<void*>(s.surfAddr);
+    Var<void*>(s.texAddr) = s.tex;
+    Var<void*>(s.surfAddr) = s.surf;
+  }
+  // FSAA would pair the 1x MSAA RT 0x86F2E0 with our non-MSAA depth; supersampling replaces it.
+  savedFsaa_ = Var<int>(addr::FsaaLevel);
+  Var<int>(addr::FsaaLevel) = 0;
   swapped_ = true;
   dev->SetRenderTarget(0, rt_);
   dev->SetDepthStencilSurface(ds_);
@@ -86,6 +129,12 @@ void Supersample::End(IDirect3DDevice9* dev) {
   Var<int>(addr::RT0Height) = savedHeight_;
   Var<void*>(addr::BackBufferSurface) = savedBackBuffer_;
   Var<void*>(addr::AutoDepthSurface) = savedAutoDepth_;
+  for (Swap& s : swaps_) {
+    if (!s.tex) continue;
+    Var<void*>(s.texAddr) = s.savedTex;
+    Var<void*>(s.surfAddr) = s.savedSurf;
+  }
+  Var<int>(addr::FsaaLevel) = savedFsaa_;
   swapped_ = false;
   // The 2D pass rebinds RT[0] itself (0x5CBF59..), but our own drawing comes first.
   dev->SetRenderTarget(0, static_cast<IDirect3DSurface9*>(savedBackBuffer_));

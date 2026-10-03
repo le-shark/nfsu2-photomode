@@ -29,6 +29,7 @@ struct CaptureFrame {
   bool sample = false;      // render sample `adj` and fold it in
   bool resolve = false;     // hide the FE, show the mean, read it back at EndScene
   bool newTile = false;     // reset the accumulator first (a new tile starts)
+  bool warm = false;        // supersample: render at 2x without sampling (glow buffer warm-up)
   int region = -1;          // supersample resolve: quarter of the 2x mean to show (QuarterUv)
   u2::ProjAdjust adj;
   float nextGameSpeed = 0;  // shutter: game speed for the next simulation step (0 = frozen)
@@ -64,6 +65,7 @@ class Capture {
   int width_ = 0, height_ = 0;
   int tile_ = 0, done_ = 0;       // current tile; samples done in it (for Progress)
   int lastPlanned_ = -1;          // sample index planned last frame (-1 none)
+  int warm_ = 0;                   // supersample warm-up frames planned
   bool resolveArmed_ = false;     // a resolve frame is pending its EndScene readback
   bool tileDone_ = false;         // the tile was read back; the next frame starts the next one
   IDirect3DSurface9* rt_ = nullptr;
