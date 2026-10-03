@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "sampling.h"
 #include "u2sdk/u2math.h"
 
 struct IDirect3DDevice9;
@@ -16,12 +17,8 @@ struct IDirect3DSurface9;
 namespace photomode {
 
 struct CaptureParams {
-  int samples = 128;
-  int tiles = 1;            // 1..lens::kMaxTiles (image is tiles x tiles screens)
-  float lensRadius = 0;     // metres, 0 = pinhole
-  float focusDist = 10;     // metres
+  SampleParams sample;      // tiles 1..lens::kMaxTiles
   float shutterSec = 0;     // 0 = no motion blur
-  bool antialias = true;
   std::string outPath;      // full path of the .png
 };
 

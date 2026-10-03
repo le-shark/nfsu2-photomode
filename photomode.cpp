@@ -335,12 +335,9 @@ void StartCapture() {
     return;
   }
   CaptureParams p;
-  p.samples = lens::kQualitySamples[g->qualityIdx];
-  p.tiles = g->tiles;
-  p.lensRadius = lens::ApertureRadiusM(Focal(), FStop());
-  p.focusDist = FocusDistance();
+  p.sample = {lens::kQualitySamples[g->qualityIdx], g->tiles, lens::ApertureRadiusM(Focal(), FStop()), FocusDistance(),
+              g->cfg.antialias};
   p.shutterSec = lens::kShutters[g->shutterIdx];
-  p.antialias = g->cfg.antialias;
   p.outPath = NewPicturePath();
   std::string err;
   if (!g->capture.Start(Device(), p, &err)) {

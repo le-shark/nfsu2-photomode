@@ -39,8 +39,8 @@ const SrgbTables& Tables() {
 bool Capture::Start(IDirect3DDevice9* dev, const CaptureParams& p, std::string* error) {
   Release();
   p_ = p;
-  p_.tiles = u2::ClampInt(p.tiles, 1, lens::kMaxTiles);
-  if (p_.samples < 1) p_.samples = 1;
+  p_.sample.tiles = u2::ClampInt(p.sample.tiles, 1, lens::kMaxTiles);
+  if (p_.sample.samples < 1) p_.sample.samples = 1;
 
   IDirect3DSurface9* bb = nullptr;
   if (!dev || FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb))) {
@@ -61,45 +61,29 @@ bool Capture::Start(IDirect3DDevice9* dev, const CaptureParams& p, std::string* 
   }
   try {
     accum_.assign(static_cast<size_t>(width_) * height_ * 3, 0.0f);
-    image_.assign(static_cast<size_t>(width_) * p_.tiles * height_ * p_.tiles * 3, 0);
+    image_.assign(static_cast<size_t>(width_) * p_.sample.tiles * height_ * p_.sample.tiles * 3, 0);
   } catch (const std::bad_alloc&) {
     *error = "NOT ENOUGH MEMORY FOR THIS RESOLUTION";
     Release();
     return false;
   }
   seq_ = 0;
-  total_ = p_.samples * p_.tiles * p_.tiles;
+  total_ = p_.sample.samples * p_.sample.tiles * p_.sample.tiles;
   warmup_ = kWarmupFrames;
   armed_ = false;
   active_ = true;
   U2LOG("capture start: %dx%d tiles=%d samples=%d lens=%.4fm focus=%.2fm shutter=%.4fs -> %s", width_, height_,
-        p_.tiles, p_.samples, p_.lensRadius, p_.focusDist, p_.shutterSec, p_.outPath.c_str());
+        p_.sample.tiles, p_.sample.samples, p_.sample.lensRadius, p_.sample.focusDist, p_.shutterSec, p_.outPath.c_str());
   return true;
 }
 
 void Capture::BeginFrame(float lastFrameDt, float* nextGameSpeed) {
   *nextGameSpeed = 0;
   if (!active_) return;
-  int s = seq_ % p_.samples;
-  int tile = seq_ / p_.samples;
+  int s = seq_ % p_.sample.samples;
+  int tile = seq_ / p_.sample.samples;
 
-  adjust_ = u2::ProjAdjust{};
-  adjust_.focusDist = p_.focusDist > 0.05f ? p_.focusDist : 0.05f;
-  if (p_.lensRadius > 0) {
-    float x, y;
-    u2::GoldenDisc(static_cast<uint32_t>(s), static_cast<uint32_t>(p_.samples), &x, &y);
-    adjust_.lensX = x * p_.lensRadius;
-    adjust_.lensY = y * p_.lensRadius;
-  }
-  if (p_.antialias && p_.samples > 1) {
-    float jx = u2::Halton(static_cast<uint32_t>(s) + 1, 2) - 0.5f;
-    float jy = u2::Halton(static_cast<uint32_t>(s) + 1, 3) - 0.5f;
-    adjust_.jitterX = jx * 2.0f / (width_ * p_.tiles);
-    adjust_.jitterY = jy * 2.0f / (height_ * p_.tiles);
-  }
-  adjust_.tiles = p_.tiles;
-  adjust_.tx = tile % p_.tiles;
-  adjust_.ty = tile / p_.tiles;
+  adjust_ = SampleAdjust(p_.sample, s, tile, width_, height_);
 
   if (warmup_ > 0) {
     --warmup_;
@@ -111,8 +95,8 @@ void Capture::BeginFrame(float lastFrameDt, float* nextGameSpeed) {
   armed_ = true;
   // Shutter: advance the simulation by shutter/samples between consecutive samples
   // (only for 1x captures; the world can't be rewound for the next tile).
-  if (p_.shutterSec > 0 && p_.tiles == 1 && s + 1 < p_.samples && lastFrameDt > 1e-4f)
-    *nextGameSpeed = (p_.shutterSec / p_.samples) / lastFrameDt;
+  if (p_.shutterSec > 0 && p_.sample.tiles == 1 && s + 1 < p_.sample.samples && lastFrameDt > 1e-4f)
+    *nextGameSpeed = (p_.shutterSec / p_.sample.samples) / lastFrameDt;
 }
 
 void Capture::OnEndScene(IDirect3DDevice9* dev) {
@@ -144,16 +128,16 @@ void Capture::OnEndScene(IDirect3DDevice9* dev) {
   }
   sys_->UnlockRect();
   ++seq_;
-  if (seq_ % p_.samples == 0) ResolveTile();
+  if (seq_ % p_.sample.samples == 0) ResolveTile();
   if (seq_ >= total_) Finish();
 }
 
 void Capture::ResolveTile() {
-  int tile = seq_ / p_.samples - 1;
-  int tx = tile % p_.tiles, ty = tile / p_.tiles;
-  float inv = 1.0f / p_.samples;
+  int tile = seq_ / p_.sample.samples - 1;
+  int tx = tile % p_.sample.tiles, ty = tile / p_.sample.tiles;
+  float inv = 1.0f / p_.sample.samples;
   const uint8_t* enc = Tables().toSrgb;
-  size_t stride = static_cast<size_t>(width_) * p_.tiles * 3;
+  size_t stride = static_cast<size_t>(width_) * p_.sample.tiles * 3;
   for (int y = 0; y < height_; ++y) {
     const float* a = accum_.data() + static_cast<size_t>(y) * width_ * 3;
     uint8_t* dst = image_.data() + (static_cast<size_t>(ty) * height_ + y) * stride + static_cast<size_t>(tx) * width_ * 3;
@@ -167,7 +151,7 @@ void Capture::ResolveTile() {
 
 void Capture::Finish() {
   active_ = false;
-  int w = width_ * p_.tiles, h = height_ * p_.tiles;
+  int w = width_ * p_.sample.tiles, h = height_ * p_.sample.tiles;
   std::string path = p_.outPath;
   auto img = std::make_shared<std::vector<uint8_t>>(std::move(image_));
   Release();

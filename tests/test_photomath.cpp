@@ -3,6 +3,7 @@
 #include "follow.h"
 #include "lens.h"
 #include "rig.h"
+#include "sampling.h"
 #include "test.h"
 
 using namespace photomode;
@@ -248,6 +249,55 @@ TEST(RayCarBoxHit) {
   CHECK(RayCarBoxHit({0, 10, 0.5f}, {0, 1, 0}, car, 500) < 0);
   CHECK(RayCarBoxHit({0, 10, 0.5f}, {0, -1, 0}, car, 5) < 0);
   CHECK(RayCarBoxHit({0, 0, 0.5f}, {0, -1, 0}, car, 500) < 0);
+}
+
+TEST(SampleAdjustMatchesCaptureMath) {
+  SampleParams p{128, 1, 0.01f, 5, true};
+  u2::ProjAdjust a = SampleAdjust(p, 7, 0, 1920, 1080);
+  float x, y;
+  u2::GoldenDisc(7, 128, &x, &y);
+  CHECK_NEAR(a.lensX, x * 0.01f, 1e-7);
+  CHECK_NEAR(a.lensY, y * 0.01f, 1e-7);
+  CHECK_NEAR(a.jitterX, (u2::Halton(8, 2) - 0.5f) * 2 / 1920, 1e-9);
+  CHECK_NEAR(a.jitterY, (u2::Halton(8, 3) - 0.5f) * 2 / 1080, 1e-9);
+  CHECK_NEAR(a.focusDist, 5, 1e-6);
+  CHECK(a.tiles == 1);
+  p.tiles = 2;
+  a = SampleAdjust(p, 7, 3, 1920, 1080);
+  CHECK(a.tiles == 2 && a.tx == 1 && a.ty == 1);
+  CHECK_NEAR(a.jitterX, (u2::Halton(8, 2) - 0.5f) * 2 / (1920 * 2), 1e-9);
+  SampleParams pin{128, 1, 0, 5, false};
+  a = SampleAdjust(pin, 7, 0, 1920, 1080);
+  CHECK(a.lensX == 0 && a.lensY == 0 && a.jitterX == 0 && a.jitterY == 0);
+}
+
+TEST(SampleAdjustClampsFocus) {
+  SampleParams p{32, 1, 0.01f, 0.01f, true};
+  CHECK_NEAR(SampleAdjust(p, 0, 0, 640, 480).focusDist, 0.05f, 1e-7);
+}
+
+TEST(SampleKeyEquality) {
+  SampleKey a{{1, 2, 3}, {0, 1, 0}, {0, 0, 1}, 9000, {128, 1, 0.01f, 5, true}, 0};
+  SampleKey b = a;
+  CHECK(a == b);
+  b = a; b.eye.x += 0.001f; CHECK(!(a == b));
+  b = a; b.fov += 1; CHECK(!(a == b));
+  b = a; b.p.focusDist = 6; CHECK(!(a == b));
+  b = a; b.p.samples = 32; CHECK(!(a == b));
+  b = a; b.p.tiles = 2; CHECK(!(a == b));
+  b = a; b.shutterSec = 0.03f; CHECK(!(a == b));
+}
+
+TEST(RunningMeanIsExactMean) {
+  const float xs[] = {0.1f, 0.5f, 0.9f, 0.3f};
+  float m = 0;
+  for (int k = 1; k <= 4; ++k) m = RunningMean(m, xs[k - 1], k);
+  CHECK_NEAR(m, 0.45, 1e-6);
+}
+
+TEST(SrgbRoundTrip) {
+  for (float v : {0.0f, 0.04f, 0.5f, 1.0f}) CHECK_NEAR(LinearToSrgb(SrgbToLinear(v)), v, 1e-5);
+  CHECK_NEAR(SrgbToLinear(0.5f), 0.21404, 1e-4);
 }
 
 TEST(MenuTablesConsistent) {
