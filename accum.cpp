@@ -100,6 +100,18 @@ bool Accum::Create(IDirect3DDevice9* dev, int w, int h) {
     Fail("CreateTexture", hr);
     return false;
   }
+  // DEFAULT-pool memory is undefined (possibly NaN/Inf as fp32): start from black.
+  for (IDirect3DTexture9* t : acc_) {
+    IDirect3DSurface9* s = nullptr;
+    if (SUCCEEDED(hr = t->GetSurfaceLevel(0, &s))) {
+      hr = dev->ColorFill(s, nullptr, 0);
+      s->Release();
+    }
+    if (FAILED(hr)) {
+      Fail("ColorFill", hr);
+      return false;
+    }
+  }
   if (FAILED(hr = dev->CreatePixelShader(reinterpret_cast<const DWORD*>(g_ps_accum), &psAccum_)) ||
       FAILED(hr = dev->CreatePixelShader(reinterpret_cast<const DWORD*>(g_ps_show), &psShow_))) {
     Fail("CreatePixelShader", hr);
@@ -127,15 +139,19 @@ void Accum::Draw(IDirect3DDevice9* dev, IDirect3DSurface9* target, IDirect3DPixe
   // postfxcore.ixx SaveVertexState does (DrawPrimitiveUP resets stream 0).
   IDirect3DVertexBuffer9* vb = nullptr;
   UINT offset = 0, stride = 0;
-  IDirect3DSurface9* rt = nullptr;
+  IDirect3DSurface9 *rt = nullptr, *ds = nullptr;
   dev->GetStreamSource(0, &vb, &offset, &stride);
   dev->GetRenderTarget(0, &rt);
+  dev->GetDepthStencilSurface(&ds);
   HRESULT hr = state_->Capture();
   if (FAILED(hr)) {
     Fail("StateBlock::Capture", hr);
   } else {
     SetOurStates(dev);
     dev->SetRenderTarget(0, target);
+    // With in-game FSAA the auto depth-stencil is multisampled and must not stay bound with our
+    // non-MSAA targets; Z is off anyway. The 2D pass rebinds it next (0x5CBF40).
+    dev->SetDepthStencilSurface(nullptr);
     D3DVIEWPORT9 vp{0, 0, static_cast<DWORD>(width_), static_cast<DWORD>(height_), 0, 1};
     dev->SetViewport(&vp);
     dev->SetPixelShader(ps);
@@ -148,11 +164,13 @@ void Accum::Draw(IDirect3DDevice9* dev, IDirect3DSurface9* target, IDirect3DPixe
     const V q[4] = {{-0.5f, -0.5f, 0, 1, 0, 0}, {x1, -0.5f, 0, 1, 1, 0}, {-0.5f, y1, 0, 1, 0, 1}, {x1, y1, 0, 1, 1, 1}};
     dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, q, sizeof(V));
     dev->SetRenderTarget(0, rt);  // resets the viewport; Apply() below restores the game's
+    dev->SetDepthStencilSurface(ds);
     state_->Apply();
   }
   dev->SetStreamSource(0, vb, offset, stride);
   SafeRelease(vb);
   SafeRelease(rt);
+  SafeRelease(ds);
 }
 
 void Accum::AddSample(IDirect3DDevice9* dev) {

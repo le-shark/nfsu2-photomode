@@ -57,7 +57,8 @@ inline u2::ProjAdjust SampleAdjust(const SampleParams& p, int s, int tile, int w
 // sRGB transfer functions (IEC 61966-2-1); the shaders use the same constants.
 inline float SrgbToLinear(float c) { return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f); }
 inline float LinearToSrgb(float l) { return l <= 0.0031308f ? l * 12.92f : 1.055f * std::pow(l, 1 / 2.4f) - 0.055f; }
-// Mean of k samples from the mean of the first k - 1 and sample k (k is 1-based).
-inline float RunningMean(float prev, float x, int k) { return prev + (x - prev) / static_cast<float>(k); }
+// Mean of k samples from the mean of the first k - 1 and sample k (k is 1-based). Sample 1 never
+// reads prev: a fresh render target holds undefined data (NaN/Inf as fp32) that would stick.
+inline float RunningMean(float prev, float x, int k) { return k <= 1 ? x : prev + (x - prev) / static_cast<float>(k); }
 
 }  // namespace photomode

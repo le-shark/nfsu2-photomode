@@ -13,5 +13,6 @@ float3 SrgbToLinear(float3 c) {
 float4 main(float2 uv : TEXCOORD0) : COLOR {
   float3 prev = tex2D(prevTex, uv).rgb;
   float3 s = SrgbToLinear(tex2D(sceneTex, uv).rgb);
-  return float4(prev + (s - prev) * k.x, 1);
+  // Sample 1 (k.x == 1) is a pure select: never let undefined/NaN contents of prev through.
+  return float4(k.x >= 1 ? s : prev + (s - prev) * k.x, 1);
 }

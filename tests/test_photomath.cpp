@@ -295,6 +295,12 @@ TEST(RunningMeanIsExactMean) {
   CHECK_NEAR(m, 0.45, 1e-6);
 }
 
+TEST(RunningMeanFirstSampleIgnoresPrev) {
+  // DEFAULT-pool render targets start undefined (possibly NaN/Inf as fp32): sample 1 must not read prev.
+  CHECK(std::fabs(RunningMean(std::nanf(""), 0.3f, 1) - 0.3f) < 1e-7f);  // CHECK_NEAR passes NaN
+  CHECK_NEAR(RunningMean(1e38f, 0.3f, 1), 0.3, 1e-7);
+}
+
 TEST(SrgbRoundTrip) {
   for (float v : {0.0f, 0.04f, 0.5f, 1.0f}) CHECK_NEAR(LinearToSrgb(SrgbToLinear(v)), v, 1e-5);
   CHECK_NEAR(SrgbToLinear(0.5f), 0.21404, 1e-4);

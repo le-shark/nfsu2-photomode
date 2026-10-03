@@ -443,7 +443,10 @@ void StartCapture() {
   if (!g->captureContinued) g->accum.Reset();
   g->captureFromSample = g->accum.Count();
   QueryPerformanceCounter(&g->captureStart);
+  // Started from the controls (Space / pad X), nothing else plans this frame: keep showing the mean
+  // so a converged preview doesn't flash the sharp scene for a frame.
   g->frame = {};
+  g->frame.show = true;
   g->captureCam = RigPose();
   g->captureCar = TargetCarPose();
   g->state = State::Capturing;
@@ -617,7 +620,9 @@ HRESULT __stdcall EndSceneDetour(IDirect3DDevice9* dev) {
 // Safe to skip: the game only checks Present for DEVICELOST (0x5D2BC9) and calls
 // TestCooperativeLevel at the start of every frame (0x5D2AF5 -> reset handler 0x5D1C40).
 HRESULT __stdcall PresentDetour(IDirect3DDevice9* dev, const RECT* src, const RECT* dst, HWND wnd, const RGNDATA* dirty) {
-  if (g->state == State::Capturing && g->capture.Active() && g->capture.Params().sample.tiles > 1 && dev == Device())
+  // Gated on our state, not capture.Active(): the last tile's EndScene finishes the capture before
+  // this frame's Present, and that zoomed frame must not be shown either.
+  if (g->state == State::Capturing && g->capture.Params().sample.tiles > 1 && dev == Device())
     return S_OK;  // == D3D_OK
   return oPresent(dev, src, dst, wnd, dirty);
 }
@@ -676,6 +681,8 @@ void Tick() {
   UpdateAnchor();
 
   if (g->state == State::Capturing) {
+    // An accumulator error mid-capture would otherwise plan the same sample forever.
+    if (g->accum.Failed()) g->capture.Abort("NO GPU ACCUMULATION");
     if (g->input.KeyPressed(VK_ESCAPE) || g->input.KeyPressed(g->cfg.hotkey) || g->input.PadPressed(PadB)) {
       g->capture.Abort("CANCELLED");
       // Esc / pad B also reach the FE as Back, possibly a frame later: don't let them exit too.
