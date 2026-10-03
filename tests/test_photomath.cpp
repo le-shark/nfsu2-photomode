@@ -301,6 +301,14 @@ TEST(RunningMeanFirstSampleIgnoresPrev) {
   CHECK_NEAR(RunningMean(1e38f, 0.3f, 1), 0.3, 1e-7);
 }
 
+TEST(SampleAdjustAppliesToMainAndRoadReflectionViews) {
+  // View 1 = main view; view 4 = road reflection, looked up by the road's own screen position, so it
+  // must get the same tile zoom / jitter / lens shift. World-anchored views must not.
+  CHECK(IsSampledView(1));
+  CHECK(IsSampledView(4));
+  for (int id : {0, 2, 3, 5, 9, 16, 21}) CHECK(!IsSampledView(id));
+}
+
 TEST(SrgbRoundTrip) {
   for (float v : {0.0f, 0.04f, 0.5f, 1.0f}) CHECK_NEAR(LinearToSrgb(SrgbToLinear(v)), v, 1e-5);
   CHECK_NEAR(SrgbToLinear(0.5f), 0.21404, 1e-4);

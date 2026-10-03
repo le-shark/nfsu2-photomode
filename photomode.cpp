@@ -783,7 +783,9 @@ void __fastcall CubicMoverUpdateDetour(void* mover, void* edx) {
 void __fastcall ProjDetour(void* plat, void* edx, eView* view, float a, float b, int c) {
   oProj(plat, edx, view, a, b, c);
   const ProjAdjust* adj = g->state != State::Off && g->frame.sample ? &g->frame.adj : nullptr;
-  if (!adj || !view || view->Id != 1 || !plat) return;
+  if (!adj || !view || !IsSampledView(view->Id) || !plat) return;
+  // The frustum planes (plat+0xC0, computed at 0x5C80C9 from the unadjusted ViewProj) stay the
+  // full view's: a tile's frustum is inside it, so culling only keeps a little extra.
   auto m = static_cast<Mat4*>(plat);  // [0] view, [1] proj, [2] viewproj
   m[0] = AdjustView(m[0], *adj);
   m[1] = AdjustProj(m[1], *adj);

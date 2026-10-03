@@ -54,6 +54,14 @@ inline u2::ProjAdjust SampleAdjust(const SampleParams& p, int s, int tile, int w
   return a;
 }
 
+// Views that get the per-sample adjustment in the 0x5C7EC0 post-hook. 1 = main view. 4 = road
+// reflection (RT[1] 0x86E784, 320x240, camera 0x8760E0 shared with view 1, rendered in Render3D at
+// 0x5CAB21): the road looks it up by its own clip position under view 1 (reflect vertex shaders
+// in the exe, e.g. 0x432870: oT1 = 0.5 * (clip.xy / w) + 0.5), so it must be zoomed / jittered /
+// lens-shifted exactly like view 1, or every tile shows the whole reflection. Views that are
+// world-anchored (9 headlight projector, 0x10..0x15 env-map faces) or the mirror (3) are not.
+inline bool IsSampledView(int id) { return id == 1 || id == 4; }
+
 // sRGB transfer functions (IEC 61966-2-1); the shaders use the same constants.
 inline float SrgbToLinear(float c) { return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f); }
 inline float LinearToSrgb(float l) { return l <= 0.0031308f ? l * 12.92f : 1.055f * std::pow(l, 1 / 2.4f) - 0.055f; }
