@@ -201,7 +201,7 @@ void Accum::Show(IDirect3DDevice9* dev) {
   rt->Release();
 }
 
-void Accum::OnDeviceReset() {
+void Accum::Free() {
   Release();
   count_ = 0;
   failed_ = false;

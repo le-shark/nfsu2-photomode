@@ -14,7 +14,7 @@ namespace photomode {
 class Accum {
  public:
   // Creates the resources at the backbuffer size (recreated, count 0, if that size changed).
-  // After a failure it returns false (logged once) until OnDeviceReset.
+  // After a failure it returns false (logged once) until Free.
   bool Ensure(IDirect3DDevice9* dev);
   bool Failed() const { return failed_; }
   void Reset() { count_ = 0; }
@@ -25,7 +25,10 @@ class Accum {
   void AddSample(IDirect3DDevice9* dev);
   // Draws the mean into the current render target; nothing while the count is 0.
   void Show(IDirect3DDevice9* dev);
-  void OnDeviceReset();  // DEFAULT-pool resources must go before the game's Reset
+  // Releases everything (count 0, failure cleared); the next Ensure recreates it. Called on exit
+  // (about 74 MB at 1080p are not kept outside photo mode) and before the game's device Reset
+  // (DEFAULT-pool resources must go first).
+  void Free();
 
  private:
   bool Create(IDirect3DDevice9* dev, int w, int h);

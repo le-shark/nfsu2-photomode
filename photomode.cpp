@@ -395,7 +395,7 @@ void Exit(const char* why) {
   if (g->state == State::Off) return;
   g->capture.Abort("PHOTO MODE CLOSED");
   g->frame = {};
-  g->accum.Reset();
+  g->accum.Free();  // the targets are recreated on the next enter
   SetUncapped(false);
   Var<int>(addr::MirrorOverride) = g->savedMirror;
   g_freezeWorld = false;
@@ -792,7 +792,7 @@ void __fastcall FeRenderDetour(void* feng, void* edx) {
 
 void OnDeviceReset() {
   g->capture.Abort("DEVICE RESET");
-  g->accum.OnDeviceReset();  // DEFAULT-pool targets must be released before the game's Reset
+  g->accum.Free();  // DEFAULT-pool targets must be released before the game's Reset
   g->frame = {};
   SetUncapped(false);
 }
