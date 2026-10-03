@@ -36,8 +36,13 @@ bool Supersample::Create(IDirect3DDevice9* dev, int w, int h) {
   w_ = w;
   h_ = h;
   int extra = 0;
+  // The full-size pair is only read back over the target by bleach (0x5C6AA4) and, through
+  // [0x8708F4] != -1, when bleach, DOF or rain is active (0x5CC8B0); photo mode keeps DOF off. With
+  // neither bleach nor rain on, skip it (+66 MB at 3840x2160 that nothing would read).
+  const bool needPair = Var<int>(addr::BleachEnable) || Var<int>(addr::RainEnable);
   for (Swap& s : swaps_) {
     if (!Var<void*>(s.texAddr)) continue;  // the game didn't create it (effect off): nothing to swap
+    if (s.texAddr != addr::StreakTexture && !needPair) continue;
     if (!CreateSwap(dev, s)) {
       Free();
       return false;
@@ -119,6 +124,16 @@ void Supersample::Begin(IDirect3DDevice9* dev) {
   dev->SetRenderTarget(0, rt_);
   dev->SetDepthStencilSurface(ds_);
   dev->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL, 0, 1.0f, 0);
+}
+
+void Supersample::Blit(IDirect3DDevice9* dev) {
+  IDirect3DSurface9* target = nullptr;
+  if (!rt_ || FAILED(dev->GetRenderTarget(0, &target)) || !target) return;
+  // Non-multisampled source; StretchRect can't write a multisampled target (FSAA), so skip then.
+  D3DSURFACE_DESC d;
+  target->GetDesc(&d);
+  if (d.MultiSampleType == D3DMULTISAMPLE_NONE) dev->StretchRect(rt_, nullptr, target, nullptr, D3DTEXF_LINEAR);
+  target->Release();
 }
 
 void Supersample::End(IDirect3DDevice9* dev) {

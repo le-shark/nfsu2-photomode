@@ -26,6 +26,9 @@ class Supersample {
   void Begin(IDirect3DDevice9* dev);
   void End(IDirect3DDevice9* dev);
   bool Swapped() const { return swapped_; }
+  // Draws the last 2x frame scaled down over the current render target (warm-up frames, before the
+  // first sample).
+  void Blit(IDirect3DDevice9* dev);
 
  private:
   // A 2x stand-in for one of the game's render-target textures (and its level-0 surface).

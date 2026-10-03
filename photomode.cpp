@@ -817,8 +817,12 @@ void __cdecl Render3DDetour() {
     g->super.Begin(dev);
     oRender3D();
     if (g->frame.sample) g->bigAccum.AddSample(dev);
+    const bool warm = g->frame.warm;
     g->frame.sample = g->frame.warm = false;
     g->super.End(dev);
+    // Warm-up with no preview mean to show: put the 2x frame on screen (scaled down), or the
+    // backbuffer would show its post-Present clear (0x5D2C39) under the menu.
+    if (warm && g->accum.Count() == 0) g->super.Blit(dev);
   } else {
     oRender3D();
   }
