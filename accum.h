@@ -25,8 +25,12 @@ class Accum {
   void AddSample(IDirect3DDevice9* dev);
   // Draws the mean into the current render target; nothing while the count is 0.
   void Show(IDirect3DDevice9* dev);
+  // Keeps a copy of the current render target (the frame on screen), and draws it back later:
+  // tile captures show this still frame under the live menu instead of the zoomed tiles.
+  void Hold(IDirect3DDevice9* dev);
+  void ShowHold(IDirect3DDevice9* dev);
   // Releases everything (count 0, failure cleared); the next Ensure recreates it. Called on exit
-  // (about 74 MB at 1080p are not kept outside photo mode) and before the game's device Reset
+  // (about 82 MB at 1080p are not kept outside photo mode) and before the game's device Reset
   // (DEFAULT-pool resources must go first).
   void Free();
 
@@ -40,9 +44,11 @@ class Accum {
   bool failed_ = false;
   int count_ = 0, width_ = 0, height_ = 0, cur_ = 0;
   IDirect3DTexture9* scene_ = nullptr;
+  IDirect3DTexture9* hold_ = nullptr;
   IDirect3DTexture9* acc_[2] = {};
   IDirect3DPixelShader9* psAccum_ = nullptr;
   IDirect3DPixelShader9* psShow_ = nullptr;
+  IDirect3DPixelShader9* psCopy_ = nullptr;
   IDirect3DStateBlock9* state_ = nullptr;
 };
 

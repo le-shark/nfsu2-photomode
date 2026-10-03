@@ -73,6 +73,9 @@ struct FramePlan {
   bool sample = false;  // fold this frame into the accumulator (projection jittered by adj)
   bool show = false;    // draw the accumulated image over the scene
   bool shown = false;   // set by the Render3D hook when it drew the mean this frame
+  bool hold = false;    // tile capture start: keep the frame on screen, then empty the mean
+  bool showHold = false;// tile capture: draw the held frame over the zoomed tile sample
+  bool resolve = false; // capture resolve frame: read back at EndScene, never presented
   ProjAdjust adj;
 };
 
@@ -440,13 +443,15 @@ void StartCapture() {
   // A 1x photo without shutter is exactly what the preview accumulates: continue from its samples
   // (instant when it has converged). Anything else starts from an empty mean.
   g->captureContinued = p.sample.tiles == 1 && p.shutterSec == 0 && CurrentKey() == g->accKey;
-  if (!g->captureContinued) g->accum.Reset();
-  g->captureFromSample = g->accum.Count();
+  // Tiles empty the mean in the Render3D hook, after holding the frame on screen (see FramePlan).
+  if (!g->captureContinued && p.sample.tiles == 1) g->accum.Reset();
+  g->captureFromSample = g->captureContinued ? g->accum.Count() : 0;
   QueryPerformanceCounter(&g->captureStart);
   // Started from the controls (Space / pad X), nothing else plans this frame: keep showing the mean
   // so a converged preview doesn't flash the sharp scene for a frame.
   g->frame = {};
   g->frame.show = true;
+  g->frame.hold = p.sample.tiles > 1;
   g->captureCam = RigPose();
   g->captureCar = TargetCarPose();
   g->state = State::Capturing;
@@ -616,13 +621,14 @@ HRESULT __stdcall EndSceneDetour(IDirect3DDevice9* dev) {
   return oEndScene(dev);
 }
 
-// Tile captures render zoomed tiles: don't present them, the screen holds the last frame instead.
-// Safe to skip: the game only checks Present for DEVICELOST (0x5D2BC9) and calls
-// TestCooperativeLevel at the start of every frame (0x5D2AF5 -> reset handler 0x5D1C40).
+// A capture's resolve frame (the mean of a tile, FE hidden for the readback) is not presented: the
+// screen keeps the previous frame with the menu. Safe to skip: the game only checks Present for
+// DEVICELOST (0x5D2BC9) and calls TestCooperativeLevel at the start of every frame (0x5D2AF5 ->
+// reset handler 0x5D1C40).
 HRESULT __stdcall PresentDetour(IDirect3DDevice9* dev, const RECT* src, const RECT* dst, HWND wnd, const RGNDATA* dirty) {
-  // Gated on our state, not capture.Active(): the last tile's EndScene finishes the capture before
-  // this frame's Present, and that zoomed frame must not be shown either.
-  if (g->state == State::Capturing && g->capture.Params().sample.tiles > 1 && dev == Device())
+  // Gated on the frame plan, not capture.Active(): the last resolve's EndScene finishes the capture
+  // before this frame's Present.
+  if (g->state == State::Capturing && g->frame.resolve && dev == Device())
     return S_OK;  // == D3D_OK
   return oPresent(dev, src, dst, wnd, dirty);
 }
@@ -688,13 +694,20 @@ void Tick() {
       // Esc / pad B also reach the FE as Back, possibly a frame later: don't let them exit too.
       g->backGuard = kBackGuardSec;
     }
-    if (g->capture.Active()) {
+    if (g->capture.Active() && g->frame.hold) {
+      // The tile capture's first frame has not rendered yet (no 3D last frame): wait for it.
+    } else if (g->capture.Active()) {
       CaptureFrame cf = g->capture.BeginFrame(g->accum.Count(), g->lastDt);
+      const bool tiles = g->capture.Params().sample.tiles > 1;
       g->frame.shown = false;
       if (cf.newTile) g->accum.Reset();
       g->frame.sample = cf.sample;
-      g->frame.show = true;  // the screen shows the developing mean, never the jittered samples
       g->frame.adj = cf.adj;
+      g->frame.resolve = cf.resolve;
+      // The screen shows the developing mean (1x) or the held frame (tiles), never the jittered
+      // or zoomed samples; the menu with its progress stays live on top.
+      g->frame.show = !tiles || cf.resolve;
+      g->frame.showHold = tiles && !cf.resolve;
       // Resolve frame: FE off (our menu) so the mean is read back clean at EndScene.
       Var<int>(addr::DrawHud) = cf.resolve ? 0 : g->saved.drawHud;
       SetUncapped(cf.sample && g->capture.Params().shutterSec == 0);
@@ -745,6 +758,12 @@ void __cdecl Render3DDetour() {
     g->accum.Show(dev);
     g->frame.shown = true;
   }
+  if (g->frame.hold) {  // keep this (preview or live) frame for the tile capture, then start empty
+    g->accum.Hold(dev);
+    g->accum.Reset();
+    g->frame.hold = false;
+  }
+  if (g->frame.showHold) g->accum.ShowHold(dev);
 }
 
 // Any other mover that still targets the player camera gets our matrix instead.
