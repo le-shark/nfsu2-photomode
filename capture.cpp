@@ -54,26 +54,36 @@ bool Capture::Start(IDirect3DDevice9* dev, const CaptureParams& p, std::string* 
 CaptureFrame Capture::BeginFrame(int accumCount, float lastFrameDt) {
   CaptureFrame f;
   if (!active_) return f;
-  if (tileDone_) {  // the previous tile was read back: start the next one from an empty mean
+  if (tileDone_) {  // the previous tile (or quarter) was read back
     tileDone_ = false;
     ++tile_;
-    f.newTile = true;
-    accumCount = 0;
     lastPlanned_ = -1;
+    if (!p_.supersample) {  // tiles: the next one starts from an empty mean
+      f.newTile = true;
+      accumCount = 0;
+    }
   }
   const int n = p_.sample.samples;
   done_ = accumCount < n ? accumCount : n;
   if (resolveArmed_ || accumCount >= n) {  // also repeats a resolve whose image was not drawn
     f.resolve = resolveArmed_ = true;
+    if (p_.supersample) f.region = tile_;  // quarter q goes into tile slot q
     return f;
   }
   f.sample = true;
-  f.adj = SampleAdjust(p_.sample, accumCount, tile_, width_, height_);
-  // Shutter: advance the simulation by shutter/samples between consecutive samples (1x only; the
-  // world can't be rewound for the next tile). If last frame's sample did not land (no 3D that
-  // frame), keep the world still until it does.
+  if (p_.supersample) {  // one full view, jittered in pixels of the 2W x 2H target
+    SampleParams one = p_.sample;
+    one.tiles = 1;
+    f.adj = SampleAdjust(one, accumCount, 0, width_ * 2, height_ * 2);
+  } else {
+    f.adj = SampleAdjust(p_.sample, accumCount, tile_, width_, height_);
+  }
+  // Shutter: advance the simulation by shutter/samples between consecutive samples (1x or
+  // supersampled 2x; the world can't be rewound for the next tile). If last frame's sample did not
+  // land (no 3D that frame), keep the world still until it does.
   bool landed = lastPlanned_ < 0 || accumCount > lastPlanned_;
-  if (p_.shutterSec > 0 && p_.sample.tiles == 1 && landed && accumCount + 1 < n && lastFrameDt > 1e-4f)
+  const bool onePass = p_.sample.tiles == 1 || p_.supersample;
+  if (p_.shutterSec > 0 && onePass && landed && accumCount + 1 < n && lastFrameDt > 1e-4f)
     f.nextGameSpeed = (p_.shutterSec / n) / lastFrameDt;
   lastPlanned_ = accumCount;
   return f;
@@ -138,6 +148,7 @@ void Capture::Abort(const char* reason) {
 }
 
 float Capture::Progress() const {
+  if (p_.supersample) return static_cast<float>(done_) / static_cast<float>(p_.sample.samples);
   const int n = p_.sample.samples, tiles = p_.sample.tiles * p_.sample.tiles;
   return static_cast<float>(tile_ * n + done_) / static_cast<float>(n * tiles);
 }

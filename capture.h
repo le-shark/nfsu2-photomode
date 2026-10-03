@@ -18,7 +18,8 @@ struct IDirect3DSurface9;
 namespace photomode {
 
 struct CaptureParams {
-  SampleParams sample;      // tiles 1..lens::kMaxTiles
+  SampleParams sample;      // tiles 1..lens::kMaxTiles (image is tiles x tiles screens)
+  bool supersample = false; // 2x: one pass into a 2W x 2H target (supersample.h), resolved in quarters
   float shutterSec = 0;     // 0 = no motion blur
   std::string outPath;      // full path of the .png
 };
@@ -28,6 +29,7 @@ struct CaptureFrame {
   bool sample = false;      // render sample `adj` and fold it in
   bool resolve = false;     // hide the FE, show the mean, read it back at EndScene
   bool newTile = false;     // reset the accumulator first (a new tile starts)
+  int region = -1;          // supersample resolve: quarter of the 2x mean to show (QuarterUv)
   u2::ProjAdjust adj;
   float nextGameSpeed = 0;  // shutter: game speed for the next simulation step (0 = frozen)
 };

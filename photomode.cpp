@@ -13,6 +13,7 @@
 #include "lens.h"
 #include "rig.h"
 #include "sampling.h"
+#include "supersample.h"
 #include "settings.h"
 #include "native_menu.h"
 #include "u2sdk/d3d.h"
@@ -76,6 +77,7 @@ struct FramePlan {
   bool hold = false;    // tile capture start: keep the frame on screen, then empty the mean
   bool showHold = false;// tile capture: draw the held frame over the zoomed tile sample
   bool resolve = false; // capture resolve frame: read back at EndScene, never presented
+  int region = -1;      // supersample resolve: quarter of the 2x mean to show
   ProjAdjust adj;
 };
 
@@ -120,6 +122,10 @@ struct PhotoMode {
 
   // GPU accumulation (live preview and capture)
   Accum accum{"accum"};
+  // 2x photos: the 3D pass renders into a 2W x 2H target; its own accumulator at that size.
+  Supersample super;
+  Accum bigAccum{"accum2x"};
+  int savedStreaks = -1, savedFog = -1, savedRain = -1;  // -1 = not changed
   SampleKey accKey{};          // what the accumulated image shows
   float stillTime = 0;         // seconds the key has not changed
   FramePlan frame;
@@ -394,11 +400,40 @@ void Enter() {
         cam->FieldOfView, focal, g->anchor.x, g->anchor.y, g->anchor.z, Var<int>(addr::CameraStopUpdating));
 }
 
+// Screen-space effects that break at 2x (verified-in-binary.md "What changes on paused frames"):
+// the glow/streak buffer pass 0x5CBB00 and overbright need [0x870CE0] (glow flares [0x870CE4] stay
+// on), horizon fog sizes its grid from the screen. Tiles also lose the rain splatter (clip-space
+// drops repeat per tile). Only ever turned off; restored by RestoreCaptureEffects.
+void SetCaptureEffects(bool tiles) {
+  g->savedStreaks = Var<int>(addr::LightStreaksEnable);
+  g->savedFog = Var<int>(addr::HorizonFogEnable);
+  Var<int>(addr::LightStreaksEnable) = 0;
+  Var<int>(addr::HorizonFogEnable) = 0;
+  if (tiles) {
+    g->savedRain = Var<int>(addr::RainEnable);
+    Var<int>(addr::RainEnable) = 0;
+  }
+}
+
+void RestoreCaptureEffects() {
+  if (g->savedStreaks >= 0) Var<int>(addr::LightStreaksEnable) = g->savedStreaks;
+  if (g->savedFog >= 0) Var<int>(addr::HorizonFogEnable) = g->savedFog;
+  if (g->savedRain >= 0) Var<int>(addr::RainEnable) = g->savedRain;
+  g->savedStreaks = g->savedFog = g->savedRain = -1;
+}
+
+void FreeSupersample() {
+  g->super.Free();
+  g->bigAccum.Free();
+}
+
 void Exit(const char* why) {
   if (g->state == State::Off) return;
   g->capture.Abort("PHOTO MODE CLOSED");
   g->frame = {};
   g->accum.Free();  // the targets are recreated on the next enter
+  RestoreCaptureEffects();
+  FreeSupersample();
   SetUncapped(false);
   Var<int>(addr::MirrorOverride) = g->savedMirror;
   g_freezeWorld = false;
@@ -418,10 +453,6 @@ void Exit(const char* why) {
 }
 
 void StartCapture() {
-  if (lens::kShutters[g->shutterIdx] > 0 && g->tiles > 1) {
-    Toast("SHUTTER BLUR NEEDS 1X RESOLUTION");
-    return;
-  }
   if (g->capture.Saving()) {
     Toast("STILL SAVING PREVIOUS PICTURE");
     return;
@@ -435,11 +466,27 @@ void StartCapture() {
               g->cfg.antialias};
   p.shutterSec = lens::kShutters[g->shutterIdx];
   p.outPath = NewPicturePath();
+  if (p.sample.tiles > 1) {
+    // 2x: supersampled in one pass (motion blur works); tiles only when the targets don't fit.
+    const int w = 2 * g->accum.Width(), h = 2 * g->accum.Height();
+    p.supersample = g->super.Create(Device(), w, h) && g->bigAccum.Ensure(Device(), w, h);
+    if (!p.supersample) {
+      FreeSupersample();
+      if (p.shutterSec > 0) {
+        Toast("CAPTURE FAILED: NOT ENOUGH VIDEO MEMORY FOR 2X MOTION BLUR");
+        return;
+      }
+      Toast("2X USING TILES (NO MEMORY FOR SUPERSAMPLING)");
+    }
+  }
   std::string err;
   if (!g->capture.Start(Device(), p, &err)) {
+    FreeSupersample();
     Toast(err);
     return;
   }
+  if (p.sample.tiles > 1) SetCaptureEffects(!p.supersample);
+  if (p.supersample) g->bigAccum.Reset();
   // A 1x photo without shutter is exactly what the preview accumulates: continue from its samples
   // (instant when it has converged). Anything else starts from an empty mean.
   g->captureContinued = p.sample.tiles == 1 && p.shutterSec == 0 && CurrentKey() == g->accKey;
@@ -451,7 +498,7 @@ void StartCapture() {
   // so a converged preview doesn't flash the sharp scene for a frame.
   g->frame = {};
   g->frame.show = true;
-  g->frame.hold = p.sample.tiles > 1;
+  g->frame.hold = p.sample.tiles > 1 && !p.supersample;
   g->captureCam = RigPose();
   g->captureCar = TargetCarPose();
   g->state = State::Capturing;
@@ -468,6 +515,8 @@ void EndCapture() {
   g_freezeWorld = true;
   Var<float>(addr::GameSpeed) = g->saved.gameSpeed;
   Var<int>(addr::DrawHud) = g->saved.drawHud;
+  RestoreCaptureEffects();
+  FreeSupersample();
   SetUncapped(false);
   g->frame = {};
   // Only a continued capture leaves a mean that still matches the preview's key.
@@ -697,13 +746,15 @@ void Tick() {
     if (g->capture.Active() && g->frame.hold) {
       // The tile capture's first frame has not rendered yet (no 3D last frame): wait for it.
     } else if (g->capture.Active()) {
-      CaptureFrame cf = g->capture.BeginFrame(g->accum.Count(), g->lastDt);
-      const bool tiles = g->capture.Params().sample.tiles > 1;
+      const bool super = g->capture.Params().supersample;
+      CaptureFrame cf = g->capture.BeginFrame((super ? g->bigAccum : g->accum).Count(), g->lastDt);
+      const bool tiles = g->capture.Params().sample.tiles > 1 && !super;
       g->frame.shown = false;
       if (cf.newTile) g->accum.Reset();
       g->frame.sample = cf.sample;
       g->frame.adj = cf.adj;
       g->frame.resolve = cf.resolve;
+      g->frame.region = cf.region;
       // The screen shows the developing mean (1x) or the held frame (tiles), never the jittered
       // or zoomed samples; the menu with its progress stays live on top.
       g->frame.show = !tiles || cf.resolve;
@@ -746,16 +797,29 @@ void __cdecl FrameDetour() {
 // Pre-FE point: the backbuffer holds the 3D scene + game post FX; the 2D pass 0x5CBF40(0) with the
 // mirror, letterbox and FE comes next (0x5D2B5A..0x5D2B60). Skipped by the game on frames without 3D.
 void __cdecl Render3DDetour() {
-  oRender3D();
-  if (g->state == State::Off) return;
+  // 2x sample frame: the whole 3D pass renders into the 2W x 2H target (Begin/End always pair up
+  // inside this call), and the sample is folded in while that target is still bound.
+  const bool super = g->state == State::Capturing && g->capture.Params().supersample && g->super.Ready();
   IDirect3DDevice9* dev = Device();
+  if (super && g->frame.sample) {
+    g->super.Begin(dev);
+    oRender3D();
+    g->bigAccum.AddSample(dev);
+    g->frame.sample = false;
+    g->super.End(dev);
+  } else {
+    oRender3D();
+  }
+  if (g->state == State::Off) return;
   if (!g->accum.Ensure(dev)) return;
+  Accum& acc = super ? g->bigAccum : g->accum;
   if (g->frame.sample) {
-    g->accum.AddSample(dev);
+    acc.AddSample(dev);
     g->frame.sample = false;  // one sample per planned frame
   }
-  if (g->frame.show && g->accum.Count() > 0) {
-    g->accum.Show(dev);
+  if (g->frame.show && acc.Count() > 0) {
+    if (g->frame.region >= 0) acc.ShowRegion(dev, QuarterUv(g->frame.region));  // 2x resolve, 1:1
+    else acc.Show(dev);  // a 2x mean is box-filtered down to the screen
     g->frame.shown = true;
   }
   if (g->frame.hold) {  // keep this (preview or live) frame for the tile capture, then start empty
@@ -814,6 +878,7 @@ void __fastcall FeRenderDetour(void* feng, void* edx) {
 void OnDeviceReset() {
   g->capture.Abort("DEVICE RESET");
   g->accum.Free();  // DEFAULT-pool targets must be released before the game's Reset
+  FreeSupersample();
   g->frame = {};
   SetUncapped(false);
 }
