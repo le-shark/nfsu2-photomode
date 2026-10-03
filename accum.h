@@ -9,13 +9,17 @@ struct IDirect3DSurface9;
 struct IDirect3DPixelShader9;
 struct IDirect3DStateBlock9;
 
+#include "sampling.h"
+
 namespace photomode {
 
 class Accum {
  public:
-  // Creates the resources at the backbuffer size (recreated, count 0, if that size changed).
-  // After a failure it returns false (logged once) until Free.
+  explicit Accum(const char* name) : name_(name) {}
+  // Creates the resources at the backbuffer size, or at w x h (recreated, count 0, if the size
+  // changed). After a failure it returns false (logged once) until Free.
   bool Ensure(IDirect3DDevice9* dev);
+  bool Ensure(IDirect3DDevice9* dev, int w, int h);
   bool Failed() const { return failed_; }
   void Reset() { count_ = 0; }
   int Count() const { return count_; }
@@ -23,8 +27,11 @@ class Accum {
   int Height() const { return height_; }
   // Folds the current render target (the backbuffer) into the mean.
   void AddSample(IDirect3DDevice9* dev);
-  // Draws the mean into the current render target; nothing while the count is 0.
+  // Draws the mean over the current render target, scaled to it (a mean twice the target's size
+  // is box-filtered 2x2 in linear light); nothing while the count is 0.
   void Show(IDirect3DDevice9* dev);
+  // Draws one region of the mean 1:1 onto the current render target (2x resolve, one quarter).
+  void ShowRegion(IDirect3DDevice9* dev, const UvRect& uv);
   // Keeps a copy of the current render target (the frame on screen), and draws it back later:
   // tile captures show this still frame under the live menu instead of the zoomed tiles.
   void Hold(IDirect3DDevice9* dev);
@@ -39,8 +46,9 @@ class Accum {
   void Release();
   void Fail(const char* what, long hr);
   void Draw(IDirect3DDevice9* dev, IDirect3DSurface9* target, IDirect3DPixelShader9* ps, IDirect3DTexture9* t0,
-            IDirect3DTexture9* t1, float c0);
+            IDirect3DTexture9* t1, const float c0[4], const UvRect& uv);
 
+  const char* name_;
   bool failed_ = false;
   int count_ = 0, width_ = 0, height_ = 0, cur_ = 0;
   IDirect3DTexture9* scene_ = nullptr;
@@ -48,6 +56,7 @@ class Accum {
   IDirect3DTexture9* acc_[2] = {};
   IDirect3DPixelShader9* psAccum_ = nullptr;
   IDirect3DPixelShader9* psShow_ = nullptr;
+  IDirect3DPixelShader9* psShow2x_ = nullptr;
   IDirect3DPixelShader9* psCopy_ = nullptr;
   IDirect3DStateBlock9* state_ = nullptr;
 };

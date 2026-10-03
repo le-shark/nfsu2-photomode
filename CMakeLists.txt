@@ -1,7 +1,7 @@
 # Pixel shaders for the GPU accumulator, compiled to embedded bytecode headers by the Windows SDK's fxc.
 find_program(FXC fxc HINTS "$ENV{WindowsSdkVerBinPath}x86" "$ENV{WindowsSdkVerBinPath}/x86" REQUIRED)
 set(SHADER_HEADERS)
-foreach(name accum show copy)
+foreach(name accum show show2x copy)
   set(src ${CMAKE_CURRENT_SOURCE_DIR}/shaders/${name}.hlsl)
   set(out ${CMAKE_CURRENT_BINARY_DIR}/${name}_ps.h)
   add_custom_command(OUTPUT ${out}

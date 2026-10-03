@@ -119,7 +119,7 @@ struct PhotoMode {
   POINT cursorAtEnter{};
 
   // GPU accumulation (live preview and capture)
-  Accum accum;
+  Accum accum{"accum"};
   SampleKey accKey{};          // what the accumulated image shows
   float stillTime = 0;         // seconds the key has not changed
   FramePlan frame;
