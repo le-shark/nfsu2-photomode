@@ -1,9 +1,10 @@
 #pragma once
 #include <string>
 
-#include "native_menu.h"
+#include "u2sdk/optmenu.h"
 
 namespace photomode {
+namespace menu = u2::optmenu;  // the native options screen (shared with the daylight tuner)
 
 struct Settings {
   // [PhotoMode]

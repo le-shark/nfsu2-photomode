@@ -15,10 +15,11 @@
 #include "sampling.h"
 #include "supersample.h"
 #include "settings.h"
-#include "native_menu.h"
+#include "u2sdk/optmenu.h"
 #include "u2sdk/d3d.h"
 #include "u2sdk/dev.h"
 #include "u2sdk/feng.h"
+#include "u2sdk/freeze.h"
 #include "u2sdk/game.h"
 #include "u2sdk/hook.h"
 #include "u2sdk/input.h"
@@ -30,30 +31,9 @@ namespace {
 using namespace u2;
 
 // ---- world freeze ---------------------------------------------------------------------------
-// GameLoop decides at 0x58132C whether the game is paused:
-//   0x58132C  movzx eax, al      ; al = paused (RaceCoordinator state 6 = pause menu)
-//   0x58132F  cmp eax, ebx       ; ebx = 0
-//   0x581331  je  0x581349       ; not paused -> sim block, World::DoTimestep 0x609CE0(scaledDt)
-//   paused:   0x601A60(dt=0), store sim dt, jmp 0x581465 (skips the whole simulation block)
-// We redirect those 5 bytes to a stub that reports "paused" while photo mode wants the world frozen,
-// so the game takes its own pause path. (Tweak_GameSpeed = 0 is NOT equivalent: it still runs
-// World::DoTimestep with dt = 0, which left the game permanently frozen after exiting.)
-volatile bool g_freezeWorld = false;
-constexpr uintptr_t kPauseDecision = 0x58132C, kPauseDecisionReturn = 0x581331;
-constexpr uint8_t kPauseDecisionBytes[5] = {0x0F, 0xB6, 0xC0, 0x3B, 0xC3};  // movzx eax,al; cmp eax,ebx
-
-__declspec(naked) void PauseDecisionStub() {
-  __asm {
-    movzx eax, al
-    cmp byte ptr [g_freezeWorld], 0
-    je done
-    mov eax, 1
-  done:
-    cmp eax, ebx
-    push kPauseDecisionReturn
-    ret
-  }
-}
+// Through the game's own pause branch at 0x58132C (u2sdk/freeze.h, shared with the daylight tuner).
+// (Tweak_GameSpeed = 0 is NOT equivalent: it still runs World::DoTimestep with dt = 0, which left the
+// game permanently frozen after exiting.)
 
 enum class State { Off, Active, Capturing };
 enum Row { RowCamera, RowTarget, RowFocal, RowRoll, RowFocus, RowAperture, RowShutter, RowFollow, RowQuality, RowResolution, RowTake, RowCount };
@@ -382,7 +362,7 @@ void Enter() {
   g->focalIdx = lens::Closest(lens::kFocals, focal);
   g->uiHidden = false;
   g->backGuard = 0;
-  g_freezeWorld = true;
+  freeze::Hold(true);
   Var<int>(addr::g_DepthOfFieldEnable) = 0;  // turning effects off is always safe
   Var<int>(addr::g_MotionBlurEnable) = 0;
   GetCursorPos(&g->cursorAtEnter);
@@ -439,7 +419,7 @@ void Exit(const char* why) {
   FreeSupersample();
   SetUncapped(false);
   Var<int>(addr::MirrorOverride) = g->savedMirror;
-  g_freezeWorld = false;
+  freeze::Hold(false);
   Var<float>(addr::GameSpeed) = g->saved.gameSpeed;
   Var<int>(addr::g_DepthOfFieldEnable) = g->saved.dofEnable;
   Var<int>(addr::g_MotionBlurEnable) = g->saved.mbEnable;
@@ -515,7 +495,7 @@ void EndCapture() {
     CamPose end = CurrentPose();
     g->rig.SetPose(end.eye, end.fwd, end.up, g->anchor);
   }
-  g_freezeWorld = true;
+  freeze::Hold(true);
   Var<float>(addr::GameSpeed) = g->saved.gameSpeed;
   Var<int>(addr::DrawHud) = g->saved.drawHud;
   RestoreCaptureEffects();
@@ -776,7 +756,7 @@ void Tick() {
       SetUncapped((cf.sample || cf.warm) && g->capture.Params().shutterSec == 0);
       // Shutter samples advance the world by a small, non-zero time step through the normal
       // (unpaused) loop path; otherwise the world stays on the game's own pause path.
-      g_freezeWorld = cf.nextGameSpeed <= 0;
+      freeze::Hold(cf.nextGameSpeed <= 0);
       Var<float>(addr::GameSpeed) = cf.nextGameSpeed > 0 ? cf.nextGameSpeed : g->saved.gameSpeed;
     } else {
       EndCapture();
@@ -922,10 +902,6 @@ bool Install() {
   // Park the cursor at the right edge, away from the menu bar on the left, so FE mouse hover can't
   // change the selected row while the mouse steers the camera.
   g->input.SetCapturePoint(0.94f, 0.5f);
-  if (std::memcmp(reinterpret_cast<void*>(kPauseDecision), kPauseDecisionBytes, 5) != 0) {
-    U2LOG("pause decision @ %08X has unexpected bytes (another mod?); photo mode disabled", static_cast<unsigned>(kPauseDecision));
-    return false;
-  }
   // Hooks first: a failure leaves the game untouched. Data patches only once all of them exist.
   if (!hook::Init()) return false;
   bool ok = true;
@@ -943,16 +919,19 @@ bool Install() {
   if (!menu::Install(menu::Callbacks{RowCount, &RowLabel, &RowValue, &Adjust, &Activate, &MenuBack, &IsActionRow},
                      g->cfg.menuLayout, g->cfg.verbose))
     return false;
-  mem::MakeJmp(kPauseDecision, reinterpret_cast<void*>(&PauseDecisionStub));
   if (!hook::EnableAll()) {
     hook::DisableAll();
-    mem::WriteBytes(kPauseDecision, kPauseDecisionBytes, sizeof kPauseDecisionBytes);
     menu::Uninstall();
     U2LOG("enabling hooks failed; photo mode disabled");
     return false;
   }
+  if (!freeze::Install()) {  // last: a failure leaves the game untouched
+    hook::DisableAll();
+    menu::Uninstall();
+    U2LOG("world freeze unavailable; photo mode disabled");
+    return false;
+  }
   d3d::AddResetListener(&OnDeviceReset);
-  U2LOG("pause decision @ %08X redirected", static_cast<unsigned>(kPauseDecision));
   return true;
 }
 }  // namespace photomode
