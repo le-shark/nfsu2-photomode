@@ -405,6 +405,32 @@ void RestoreCaptureEffects() {
   g->savedStreaks = g->savedFog = g->savedRain = -1;
 }
 
+// SaveRegistrySettings 0x5BEEA0, cdecl(): writes every option global to the registry. The game calls it on every quit
+// (the window procedure, 0x5CCE47, before PostQuitMessage), when leaving the options screen (0x49C89C) and from
+// 0x4A82C0 / 0x4C5424 (investigation 2026-10-11, verified-in-binary.md "Option saves"). While photo mode is open
+// DOF / motion blur (and during a capture fog, streaks, rain) are zeroed in memory, so a quit or a save then wrote
+// the zeros as the player's choice ([game] 2026-10-11: "something keeps disabling motion blur and dof in settings").
+// The save gets the player's values; ours go back right after. Entry 51 56 8B 35 08 30 78 00, or a leading JMP from
+// NFSU2Daylight's hook on the same entry (MinHook chains).
+constexpr uintptr_t kSaveRegistry = 0x5BEEA0;
+using SaveRegFn = void(__cdecl*)();
+SaveRegFn oSaveRegistry;
+void __cdecl SaveRegistryDetour() {
+  if (!g || g->state == State::Off) return oSaveRegistry();
+  int dof = Var<int>(addr::g_DepthOfFieldEnable), mb = Var<int>(addr::g_MotionBlurEnable);
+  int streaks = Var<int>(addr::LightStreaksEnable), fog = Var<int>(addr::HorizonFogEnable), rain = Var<int>(addr::RainEnable);
+  Var<int>(addr::g_DepthOfFieldEnable) = g->saved.dofEnable;
+  Var<int>(addr::g_MotionBlurEnable) = g->saved.mbEnable;
+  if (g->savedStreaks >= 0) Var<int>(addr::LightStreaksEnable) = g->savedStreaks;
+  if (g->savedFog >= 0) Var<int>(addr::HorizonFogEnable) = g->savedFog;
+  if (g->savedRain >= 0) Var<int>(addr::RainEnable) = g->savedRain;
+  oSaveRegistry();
+  Var<int>(addr::g_DepthOfFieldEnable) = dof, Var<int>(addr::g_MotionBlurEnable) = mb;
+  Var<int>(addr::LightStreaksEnable) = streaks, Var<int>(addr::HorizonFogEnable) = fog, Var<int>(addr::RainEnable) = rain;
+  U2LOG("registry save while photo mode is open: the player's DOF %d / motion blur %d were written", g->saved.dofEnable,
+        g->saved.mbEnable);
+}
+
 void FreeSupersample() {
   g->super.Free();
   g->bigAccum.Free();
@@ -912,6 +938,16 @@ bool Install() {
   ok &= hook::Create(addr::cFEng_Render, &FeRenderDetour, &oFeRender, "cFEng::Render");
   ok &= hook::Create(addr::Render3D, &Render3DDetour, &oRender3D, "Render3D");
   ok &= d3d::InstallResetHook();
+  // Optional: without it a quit with photo mode open can save DOF / motion blur as off (logged, not fatal).
+  {
+    const auto* e = reinterpret_cast<const uint8_t*>(kSaveRegistry);
+    if (std::memcmp(e, "\x51\x56\x8B\x35\x08\x30\x78\x00", 8) == 0 || e[0] == 0xE9) {
+      if (!hook::Create(kSaveRegistry, &SaveRegistryDetour, &oSaveRegistry, "SaveRegistrySettings"))
+        U2LOG("registry-save hook failed: quitting with photo mode open may save DOF / motion blur as off");
+    } else {
+      U2LOG("SaveRegistrySettings 0x5BEEA0: entry bytes differ (another mod?); not hooked");
+    }
+  }
   if (!ok) {
     U2LOG("some hooks failed; photo mode disabled");
     return false;  // created hooks are never enabled
