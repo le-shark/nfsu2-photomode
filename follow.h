@@ -22,9 +22,17 @@ inline const char* FollowName(Follow f) {
   return n[static_cast<int>(f)];
 }
 
+// The fallback car box for autofocus, 4.4 x 1.8 x 1.3 m, centred kCarCentreUp above the car origin along its up row;
+// used when the game has no model box for the car (u2::CarLocalBox).
+inline constexpr float kCarHalfLen = 2.2f, kCarHalfWid = 0.9f, kCarHalfHgt = 0.65f, kCarCentreUp = 0.5f;
+
 struct CarPose {
   Vec3 pos;
   Vec3 axis[3];  // the car's orientation rows (any consistent basis; orthonormalised here)
+  // The car's own box in its frame (x forward, y side, z up), from the game's model box when there is one
+  // (user 2026-10-19: Closest focused on the same box for every car).
+  Vec3 boxMin{-kCarHalfLen, -kCarHalfWid, kCarCentreUp - kCarHalfHgt};
+  Vec3 boxMax{kCarHalfLen, kCarHalfWid, kCarCentreUp + kCarHalfHgt};
 };
 
 struct CamPose {
@@ -79,27 +87,27 @@ inline CamPose FollowPose(Follow mode, const CamPose& start, const CarPose& car0
   return p;
 }
 
-// Autofocus uses an approximate car box, 4.4 x 1.8 x 1.3 m, centred kCarCentreUp above the
-// car origin along its up row.
-inline constexpr float kCarHalfLen = 2.2f, kCarHalfWid = 0.9f, kCarHalfHgt = 0.65f, kCarCentreUp = 0.5f;
+namespace detail {
+inline Vec3 BoxCentre(const CarPose& c) { return (c.boxMin + c.boxMax) * 0.5f; }
+inline Vec3 BoxHalf(const CarPose& c) { return (c.boxMax - c.boxMin) * 0.5f; }
+}  // namespace detail
 
-// Distance along the view direction to the car's centre (centre autofocus).
+// Distance along the view direction to the centre of the car's box (centre autofocus).
 inline float CarCentreDepth(const CamPose& cam, const CarPose& car) {
   Vec3 b[3];
   detail::Basis(car, b);
-  return u2::Dot(car.pos + b[2] * kCarCentreUp - cam.eye, u2::Normalize(cam.fwd));
+  return u2::Dot(car.pos + detail::ToWorld(b, detail::BoxCentre(car)) - cam.eye, u2::Normalize(cam.fwd));
 }
 
-// Distance along the view direction to the nearest corner of the car box (closest autofocus).
+// Distance along the view direction to the nearest corner of the car's box (closest autofocus).
 inline float NearestCarDepth(const CamPose& cam, const CarPose& car) {
   Vec3 b[3];
   detail::Basis(car, b);
-  Vec3 c = car.pos + b[2] * kCarCentreUp;
+  Vec3 c = car.pos + detail::ToWorld(b, detail::BoxCentre(car)), h = detail::BoxHalf(car);
   Vec3 f = u2::Normalize(cam.fwd);
   float best = 1e9f;
   for (int i = 0; i < 8; ++i) {
-    Vec3 k = c + b[0] * ((i & 1) ? kCarHalfLen : -kCarHalfLen) + b[1] * ((i & 2) ? kCarHalfWid : -kCarHalfWid) +
-             b[2] * ((i & 4) ? kCarHalfHgt : -kCarHalfHgt);
+    Vec3 k = c + b[0] * ((i & 1) ? h.x : -h.x) + b[1] * ((i & 2) ? h.y : -h.y) + b[2] * ((i & 4) ? h.z : -h.z);
     float d = u2::Dot(k - cam.eye, f);
     if (d < best) best = d;
   }
@@ -112,8 +120,9 @@ inline float NearestCarDepth(const CamPose& cam, const CarPose& car) {
 inline float RayCarBoxHit(const Vec3& eye, const Vec3& dir, const CarPose& car, float maxT) {
   Vec3 b[3];
   detail::Basis(car, b);
-  Vec3 o = detail::ToLocal(b, eye - (car.pos + b[2] * kCarCentreUp)), d = detail::ToLocal(b, dir);
-  const float half[3] = {kCarHalfLen, kCarHalfWid, kCarHalfHgt}, oo[3] = {o.x, o.y, o.z}, dd[3] = {d.x, d.y, d.z};
+  Vec3 o = detail::ToLocal(b, eye - (car.pos + detail::ToWorld(b, detail::BoxCentre(car)))), d = detail::ToLocal(b, dir);
+  Vec3 h = detail::BoxHalf(car);
+  const float half[3] = {h.x, h.y, h.z}, oo[3] = {o.x, o.y, o.z}, dd[3] = {d.x, d.y, d.z};
   float t0 = 0, t1 = maxT;
   bool inside = true;
   for (int i = 0; i < 3; ++i) {  // slab test

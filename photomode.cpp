@@ -40,7 +40,8 @@ enum class State { Off, Active, Capturing };
 // User 2026-10-19: Focus Mode got its own row (Enter on Focus cycling the modes was not discoverable); Focus is the
 // distance, editable only in Manual. Quality left the menu to free the row: [Capture] DefaultQuality still sets it
 // and its code stays (lens.h kQualitySamples).
-enum Row { RowCamera, RowTarget, RowFocal, RowRoll, RowFocusMode, RowFocus, RowAperture, RowShutter, RowFollow, RowResolution, RowTake, RowCount };
+// User 2026-10-19: Target is "Focus Target", above Focus Mode (it is also the orbit camera's car).
+enum Row { RowCamera, RowFocal, RowRoll, RowTarget, RowFocusMode, RowFocus, RowAperture, RowShutter, RowFollow, RowResolution, RowTake, RowCount };
 
 constexpr float kMinFocusM = 0.3f, kMaxFocusM = 500;
 constexpr float kBackGuardSec = 0.3f;
@@ -216,6 +217,7 @@ CarPose TargetCarPose() {
     c.pos = CarPosition(car);
     if (std::fabs(Length(axes[0]) - 1) < 0.1f && std::fabs(Length(axes[2]) - 1) < 0.1f)
       for (int r = 0; r < 3; ++r) c.axis[r] = axes[r];
+    CarLocalBox(car, &c.boxMin, &c.boxMax);  // the car's own body box; the fallback box stays without one
   }
   return c;
 }
@@ -247,7 +249,9 @@ void UpdateAim() {
   for (int i = 0, n = ActiveCars(cars, kMaxCars); i < n; ++i) {
     Vec3 axes[3];
     CarAxes(cars[i], axes);
-    float d = RayCarBoxHit(cam.eye, dir, {CarPosition(cars[i]), {axes[0], axes[1], axes[2]}}, best);
+    CarPose pose{CarPosition(cars[i]), {axes[0], axes[1], axes[2]}};
+    CarLocalBox(cars[i], &pose.boxMin, &pose.boxMax);
+    float d = RayCarBoxHit(cam.eye, dir, pose, best);
     if (d >= 0 && d < best) best = d, source = 1;
   }
   g->aimHit = source >= 0;
@@ -595,8 +599,8 @@ void Activate(int row) {
 
 // Row texts for the native menu (u2sdk optmenu draws them into UI_PauseOptions.fng).
 std::string RowLabel(int row) {
-  static const char* names[RowCount] = {"Camera",   "Target",         "Focal Length", "Roll",
-                                        "Focus Mode", "Focus",        "Aperture",     "Shutter",
+  static const char* names[RowCount] = {"Camera",     "Focal Length", "Roll",     "Focus Target",
+                                        "Focus Mode", "Focus",        "Aperture", "Shutter",
                                         "Shutter Follow", "Resolution", "Take Picture"};
   return row >= 0 && row < RowCount ? names[row] : "";
 }
