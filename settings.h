@@ -8,7 +8,7 @@ namespace menu = u2::optmenu;  // the native options screen (shared with the day
 
 struct Settings {
   // [PhotoMode]
-  int hotkey = 0x09;             // VK_TAB
+  int hotkey = 0x23;             // VK_END (user 2026-10-19: Tab may also be the game's message key in free roam)
   bool padCombo = true;          // L3 + R3 opens photo mode
   // [Camera]
   float moveSpeed = 6;           // m/s

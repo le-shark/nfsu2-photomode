@@ -18,7 +18,7 @@ std::string GameDir() {
 void Settings::Load() {
   u2::Ini ini;
   U2LOG("settings: %s", ini.Path().c_str());
-  if (int vk = u2::ParseVirtualKey(ini.GetString("PhotoMode", "Hotkey", "TAB"))) hotkey = vk;
+  if (int vk = u2::ParseVirtualKey(ini.GetString("PhotoMode", "Hotkey", "END"))) hotkey = vk;
   padCombo = ini.GetBool("PhotoMode", "GamepadCombo", padCombo);
 
   moveSpeed = ini.GetFloat("Camera", "MoveSpeed", moveSpeed);

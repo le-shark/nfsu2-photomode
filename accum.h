@@ -21,6 +21,7 @@ class Accum {
   bool Ensure(IDirect3DDevice9* dev);
   bool Ensure(IDirect3DDevice9* dev, int w, int h);
   bool Failed() const { return failed_; }
+  bool Created() const { return scene_ != nullptr; }
   void Reset() { count_ = 0; }
   int Count() const { return count_; }
   int Width() const { return width_; }
@@ -37,7 +38,7 @@ class Accum {
   void Hold(IDirect3DDevice9* dev);
   void ShowHold(IDirect3DDevice9* dev);
   // Releases everything (count 0, failure cleared); the next Ensure recreates it. Called on exit
-  // (about 82 MB at 1080p are not kept outside photo mode) and before the game's device Reset
+  // (about 74 MB at 1080p are not kept outside photo mode) and before the game's device Reset
   // (DEFAULT-pool resources must go first).
   void Free();
 

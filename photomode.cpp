@@ -292,7 +292,10 @@ void UpdatePreview(float dt) {
     g->accKey = key;
     g->stillTime = 0;
   }
-  bool ready = g->accum.Ensure(Device());
+  // The accumulator (about 74 MB at 1080p) only once something can use it: the preview with an aperture or AA, or
+  // a capture (StartCapture creates it). Opening photo mode allocates nothing more (2026-10-18 review).
+  bool want = g->cfg.previewEnable && (key.p.lensRadius > 0 || key.p.antialias);
+  bool ready = (want || g->accum.Created()) && g->accum.Ensure(Device());
   int n = g->accum.Count();
   bool sample = ready && g->cfg.previewEnable && g->stillTime >= g->cfg.previewDelay &&
                 (key.p.lensRadius > 0 || key.p.antialias) && n < key.p.samples;
@@ -736,7 +739,14 @@ void Tick() {
     }
   }
   menu::Tick();
-  g->input.Update();
+  if (g->state == State::Off) {
+    // Closed: only the keys that can open it (and the debug shot), the pad only for the L3 + R3 combo; the full
+    // update polls all 255 keys and the mouse every frame (2026-10-18 review).
+    const int keys[2] = {g->cfg.hotkey, g->cfg.tools ? VK_F12 : 0};
+    g->input.UpdateOnly(keys, 2, g->cfg.padCombo);
+  } else {
+    g->input.Update();
+  }
   if (g->toastTime > 0) g->toastTime -= dt;
   if (g->backGuard > 0) g->backGuard -= dt;
   if (std::string m = g->capture.TakeMessage(); !m.empty()) Toast(m, 4);
@@ -845,7 +855,7 @@ void __cdecl Render3DDetour() {
     oRender3D();
   }
   if (g->state == State::Off) return;
-  if (!g->accum.Ensure(dev)) return;
+  if (!g->accum.Created() || !g->accum.Ensure(dev)) return;  // created by the preview or StartCapture
   Accum& acc = super ? g->bigAccum : g->accum;
   if (g->frame.sample) {
     acc.AddSample(dev);

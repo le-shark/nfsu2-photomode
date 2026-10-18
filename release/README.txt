@@ -18,12 +18,12 @@ Copy the "scripts" folder into the game folder (next to SPEED2.EXE).
 
 Controls
 --------
-Open / close        Tab (pad: click both sticks, L3 + R3). Esc or pad B also closes it.
+Open / close        End (pad: click both sticks, L3 + R3). Esc or pad B also closes it.
 Menu                arrows, Enter, Esc (pad: D-pad, A, B). H (pad Y) hides the menu.
 Camera              WASD move, Q / E down / up, mouse look, Z / C roll, mouse wheel focal length,
                     Shift faster, Ctrl slower, [ / ] orbit another racer
 Pad camera          left stick move, right stick look, LT / RT down / up, LB / RB roll
-Take a picture      Space (pad X); Tab, Esc or pad B cancel a picture in progress
+Take a picture      Space (pad X); End, Esc or pad B cancel a picture in progress
 
 The menu sets the camera (orbit or free), focus (Center, Closest, Aim, Manual), aperture, shutter (motion blur, and
 whether the blur follows the car), quality and resolution (1x or 2x the screen). With the camera still, the screen
