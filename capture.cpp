@@ -20,7 +20,7 @@ bool Capture::Start(IDirect3DDevice9* dev, const CaptureParams& p, std::string* 
 
   IDirect3DSurface9* bb = nullptr;
   if (!dev || FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb))) {
-    *error = "NO BACKBUFFER";
+    *error = "Capture failed: no back buffer";
     return false;
   }
   D3DSURFACE_DESC d;
@@ -31,14 +31,14 @@ bool Capture::Start(IDirect3DDevice9* dev, const CaptureParams& p, std::string* 
 
   if (FAILED(dev->CreateRenderTarget(d.Width, d.Height, D3DFMT_X8R8G8B8, D3DMULTISAMPLE_NONE, 0, FALSE, &rt_, nullptr)) ||
       FAILED(dev->CreateOffscreenPlainSurface(d.Width, d.Height, D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM, &sys_, nullptr))) {
-    *error = "COULD NOT CREATE CAPTURE SURFACES";
+    *error = "Capture failed: could not create the capture surfaces";
     Release();
     return false;
   }
   try {
     image_.assign(static_cast<size_t>(width_) * p_.sample.tiles * height_ * p_.sample.tiles * 3, 0);
   } catch (const std::bad_alloc&) {
-    *error = "NOT ENOUGH MEMORY FOR THIS RESOLUTION";
+    *error = "Capture failed: not enough memory for this resolution";
     Release();
     return false;
   }
@@ -101,12 +101,12 @@ void Capture::OnEndScene(IDirect3DDevice9* dev) {
   HRESULT hr = dev->StretchRect(bb, nullptr, rt_, nullptr, D3DTEXF_NONE);
   bb->Release();
   if (FAILED(hr) || FAILED(dev->GetRenderTargetData(rt_, sys_))) {
-    Abort("FRAME READBACK FAILED");
+    Abort("frame readback failed");
     return;
   }
   D3DLOCKED_RECT lr;
   if (FAILED(sys_->LockRect(&lr, nullptr, D3DLOCK_READONLY))) {
-    Abort("FRAME LOCK FAILED");
+    Abort("frame lock failed");
     return;
   }
   // The backbuffer already holds the gamma-corrected mean: copy X8R8G8B8 (B,G,R,X) into the tile as RGB.
@@ -134,12 +134,12 @@ void Capture::Finish() {
   auto img = std::make_shared<std::vector<uint8_t>>(std::move(image_));
   Release();
   ++saving_;
-  Notify("SAVING...");
+  Notify("Saving...");
   std::thread([this, img, w, h, path] {
     bool ok = u2::dev::SavePng(path, w, h, img->data());
     U2LOG("png %s (%dx%d): %s", path.c_str(), w, h, ok ? "saved" : "FAILED");
     std::string name = path.substr(path.find_last_of("\\/") + 1);
-    Notify(ok ? "SAVED " + name : "SAVE FAILED");
+    Notify(ok ? "Saved " + name : "Save failed (see the log)");
     --saving_;
   }).detach();
 }
@@ -149,7 +149,7 @@ void Capture::Abort(const char* reason) {
   U2LOG("capture aborted: %s", reason);
   active_ = false;
   Release();
-  Notify(std::string("CAPTURE FAILED: ") + reason);
+  Notify(std::string("Capture failed: ") + reason);
 }
 
 float Capture::Progress() const {

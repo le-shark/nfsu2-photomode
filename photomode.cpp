@@ -1,5 +1,6 @@
 // NFSU2 Photo Mode: controller (state machine, hooks, menu, camera, capture glue).
 #include <windows.h>
+#include <shlobj.h>
 
 #include <cmath>
 #include <cstdio>
@@ -97,6 +98,7 @@ struct PhotoMode {
   alignas(16) bMatrix4 camMatrix{};  // world->view matrix applied in the SetCameraMatrix hook
   bool frameArmed = false;    // main-frame EndScene pending
   bool endSceneHooked = false;
+  bool captureHooks = false;  // EndScene and Present both hooked
   float postExitLog = 0;      // verbose: seconds left to log game state after exit
   int debugShot = 0;
   POINT cursorAtEnter{};
@@ -149,7 +151,8 @@ void Toast(const std::string& s, float seconds = 3) {
   U2LOG("toast: %s", s.c_str());
 }
 
-void EnsureOutputDir() { CreateDirectoryA(g->cfg.outputDir.c_str(), nullptr); }
+// The whole path (OutputDir may name nested folders); an existing folder is fine.
+void EnsureOutputDir() { SHCreateDirectoryExA(nullptr, g->cfg.outputDir.c_str(), nullptr); }
 
 // Target cars: the player and active AI racers (u2::RacerCars). Index into that list, or -1.
 int TargetIndex(const RacerCar* cars, int n) {
@@ -185,13 +188,13 @@ std::string TargetName() {
 // Orbit only: in free mode a new target would drag the camera through the distance clamp.
 void CycleTarget(int dir) {
   if (g->rig.mode != RigMode::Orbit) {
-    Toast("TARGET: ORBIT CAMERA ONLY");
+    Toast("Target: orbit camera only");
     return;
   }
   RacerCar cars[kMaxCars];
   int n = RacerCars(cars, kMaxCars);
   if (n < 2) {
-    Toast("NO OTHER RACERS");
+    Toast("No other racers");
     return;
   }
   int i = TargetIndex(cars, n);
@@ -345,7 +348,8 @@ void ApplyCamera(float dt) {
 
 // ---- state transitions ----------------------------------------------------------------------
 // The game never pauses in a network session (GameLoop 0x581306), so neither do we.
-bool CanEnter() { return IsInGame() && !IsGamePaused() && !IsNetworkSession() && Device(); }
+// Not while another ASI holds the freeze (the daylight tuner is open): its menu owns the options screen.
+bool CanEnter() { return IsInGame() && !IsGamePaused() && !IsNetworkSession() && Device() && !freeze::AnyHeld(); }
 
 void Enter() {
   CameraParams* cam = PlayerCamera();
@@ -438,7 +442,7 @@ void FreeSupersample() {
 
 void Exit(const char* why) {
   if (g->state == State::Off) return;
-  g->capture.Abort("PHOTO MODE CLOSED");
+  g->capture.Abort("photo mode closed");
   g->frame = {};
   g->accum.Free();  // the targets are recreated on the next enter
   RestoreCaptureEffects();
@@ -462,12 +466,16 @@ void Exit(const char* why) {
 }
 
 void StartCapture() {
+  if (!g->captureHooks) {
+    Toast("Capture unavailable (see the log)");
+    return;
+  }
   if (g->capture.Saving()) {
-    Toast("STILL SAVING PREVIOUS PICTURE");
+    Toast("Still saving the previous picture");
     return;
   }
   if (!g->accum.Ensure(Device())) {
-    Toast("CAPTURE FAILED: NO GPU ACCUMULATION");
+    Toast("Capture failed: no GPU accumulation");
     return;
   }
   CaptureParams p;
@@ -482,10 +490,10 @@ void StartCapture() {
     if (!p.supersample) {
       FreeSupersample();
       if (p.shutterSec > 0) {
-        Toast("CAPTURE FAILED: NOT ENOUGH VIDEO MEMORY FOR 2X MOTION BLUR");
+        Toast("Capture failed: not enough video memory for 2x motion blur");
         return;
       }
-      Toast("2X USING TILES (NO MEMORY FOR SUPERSAMPLING)");
+      Toast("2x in tiles (no video memory for supersampling)");
     }
   }
   std::string err;
@@ -629,7 +637,7 @@ std::string StatusText() {
 }
 
 void MenuBack() {
-  if (g->state == State::Capturing) g->capture.Abort("CANCELLED");
+  if (g->state == State::Capturing) g->capture.Abort("cancelled");
   else if (g->backGuard <= 0) Exit("menu back");
 }
 
@@ -709,10 +717,14 @@ void Tick() {
 
   if (!g->endSceneHooked && Device()) {
     // One attempt only; failures are logged by hook::Create.
-    d3d::HookDeviceMethod(d3d::vt::EndScene, reinterpret_cast<void*>(&EndSceneDetour), reinterpret_cast<void**>(&oEndScene),
-                          "IDirect3DDevice9::EndScene");
-    d3d::HookDeviceMethod(d3d::vt::Present, reinterpret_cast<void*>(&PresentDetour), reinterpret_cast<void**>(&oPresent),
-                          "IDirect3DDevice9::Present");
+    bool end = d3d::HookDeviceMethod(d3d::vt::EndScene, reinterpret_cast<void*>(&EndSceneDetour),
+                                     reinterpret_cast<void**>(&oEndScene), "IDirect3DDevice9::EndScene");
+    bool present = d3d::HookDeviceMethod(d3d::vt::Present, reinterpret_cast<void*>(&PresentDetour),
+                                         reinterpret_cast<void**>(&oPresent), "IDirect3DDevice9::Present");
+    // A capture needs both: without EndScene the resolve frames never read back, and the Present skip would hold
+    // the screen for good (2026-10-18 review).
+    g->captureHooks = end && present;
+    if (!g->captureHooks) U2LOG("capture unavailable: EndScene %s, Present %s", end ? "ok" : "FAILED", present ? "ok" : "FAILED");
     g->endSceneHooked = true;
   }
   g->frameArmed = true;
@@ -729,7 +741,7 @@ void Tick() {
   if (g->backGuard > 0) g->backGuard -= dt;
   if (std::string m = g->capture.TakeMessage(); !m.empty()) Toast(m, 4);
 
-  if (g->input.KeyPressed(VK_F12)) {  // debug: save the displayed frame incl. HUD/UI
+  if (g->cfg.tools && g->input.KeyPressed(VK_F12)) {  // debug: save the displayed frame incl. HUD/UI
     EnsureOutputDir();
     dev::RequestShot(g->cfg.outputDir + "\\debug_" + std::to_string(++g->debugShot) + ".png", 2);
   }
@@ -754,9 +766,9 @@ void Tick() {
   if (g->state == State::Capturing) {
     // An accumulator error mid-capture would otherwise plan the same sample forever.
     if (g->accum.Failed() || (g->capture.Params().supersample && g->bigAccum.Failed()))
-      g->capture.Abort("NO GPU ACCUMULATION");
+      g->capture.Abort("no GPU accumulation");
     if (g->input.KeyPressed(VK_ESCAPE) || g->input.KeyPressed(g->cfg.hotkey) || g->input.PadPressed(PadB)) {
-      g->capture.Abort("CANCELLED");
+      g->capture.Abort("cancelled");
       // Esc / pad B also reach the FE as Back, possibly a frame later: don't let them exit too.
       g->backGuard = kBackGuardSec;
     }
@@ -900,7 +912,7 @@ void __fastcall FeRenderDetour(void* feng, void* edx) {
 }
 
 void OnDeviceReset() {
-  g->capture.Abort("DEVICE RESET");
+  g->capture.Abort("device reset");
   g->accum.Free();  // DEFAULT-pool targets must be released before the game's Reset
   FreeSupersample();
   g->frame = {};

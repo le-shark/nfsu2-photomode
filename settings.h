@@ -29,6 +29,7 @@ struct Settings {
   menu::Layout menuLayout;
   // [Debug]
   bool verbose = false;          // extra diagnostics in the log (cars, menu input, state after exit)
+  bool tools = true;             // developer keys (F12 debug shot); 0 in the player release
 
   void Load();
 };
