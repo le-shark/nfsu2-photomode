@@ -599,7 +599,7 @@ void Activate(int row) {
 
 // Row texts for the native menu (u2sdk optmenu draws them into UI_PauseOptions.fng).
 std::string RowLabel(int row) {
-  static const char* names[RowCount] = {"Camera",     "Focal Length", "Roll",     "Focus Target",
+  static const char* names[RowCount] = {"Camera Mode", "Focal Length", "Roll",     "Focus Target",
                                         "Focus Mode", "Focus",        "Aperture", "Shutter",
                                         "Shutter Follow", "Resolution", "Take Picture"};
   return row >= 0 && row < RowCount ? names[row] : "";
