@@ -96,6 +96,9 @@ struct PhotoMode {
   float backGuard = 0;          // seconds left in which Back/close keys are ignored
 
   Vec3 anchor{};
+  // Free mode: the car the camera's MaxDistance range stays around (the target when Free mode began), so a new
+  // Focus Target only changes what Center / Closest focus on (user 2026-10-19).
+  uint8_t* rangeCar = nullptr;
   uint8_t* target = nullptr;  // orbit target car (World car array entry); null = player
   LARGE_INTEGER lastQpc{}, qpcFreq{};
   float lastDt = 1 / 60.f;
@@ -189,12 +192,10 @@ std::string TargetName() {
   return b;
 }
 
-// Orbit only: in free mode a new target would drag the camera through the distance clamp.
+// In Orbit mode the camera circles the new target; in Free mode it stays where it is (its range keeps the car it was
+// near, rangeCar) and the target is only what Center / Closest focus on.
 void CycleTarget(int dir) {
-  if (g->rig.mode != RigMode::Orbit) {
-    Toast("Target: orbit camera only");
-    return;
-  }
+  if (g->rig.mode == RigMode::Free && !g->rangeCar) g->rangeCar = TargetCar();
   RacerCar cars[kMaxCars];
   int n = RacerCars(cars, kMaxCars);
   if (n < 2) {
@@ -362,6 +363,7 @@ void ApplyCamera(float dt) {
 bool CanEnter() { return IsInGame() && !IsGamePaused() && !IsNetworkSession() && Device() && !freeze::AnyHeld(); }
 
 void Enter() {
+  g->rangeCar = nullptr;
   CameraParams* cam = PlayerCamera();
   g->saved = Saved{Var<float>(addr::GameSpeed), Var<int>(addr::g_DepthOfFieldEnable), Var<int>(addr::g_MotionBlurEnable),
                    Var<int>(addr::DrawHud), cam->FieldOfView, Var<uint8_t>(addr::FECursorVisible)};
@@ -564,6 +566,7 @@ void Adjust(int row, int dir) {
     case RowTarget: CycleTarget(dir); break;
     case RowCamera:
       g->rig.SetMode(g->rig.mode == RigMode::Orbit ? RigMode::Free : RigMode::Orbit, g->anchor);
+      g->rangeCar = nullptr;  // a new Free mode starts around the target; Orbit circles the target
       break;
     case RowFocal: g->focalIdx = ClampInt(g->focalIdx + dir, 0, lens::Count(lens::kFocals) - 1); break;
     case RowRoll: g->rig.roll = Clamp(std::round(g->rig.roll) + dir, -kMaxRoll, kMaxRoll); break;
@@ -675,7 +678,9 @@ void HandleControls(float dt) {
   ri.lookYawDeg = (-in.MouseDX() * g->cfg.mouseSensitivity - pad.rx * g->cfg.stickLookSpeed * dt) * zoomScale;
   ri.lookPitchDeg = (-in.MouseDY() * g->cfg.mouseSensitivity + pad.ry * g->cfg.stickLookSpeed * dt) * zoomScale * ySign;
   ri.rollDeg = (key('C') - key('Z') + button(PadRB) - button(PadLB)) * g->cfg.rollSpeed * dt;
-  g->rig.Update(ri, dt, g->anchor);
+  // Free mode keeps its range around rangeCar once the target changed (CycleTarget); else around the target.
+  Vec3 range = g->rig.mode == RigMode::Free && g->rangeCar ? CarPosition(g->rangeCar) : g->anchor;
+  g->rig.Update(ri, dt, range);
 }
 
 // Grab the finished frame (after WidescreenFix's own EndScene work, before Present).
