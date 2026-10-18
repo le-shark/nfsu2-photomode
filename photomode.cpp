@@ -37,7 +37,10 @@ using namespace u2;
 // game permanently frozen after exiting.)
 
 enum class State { Off, Active, Capturing };
-enum Row { RowCamera, RowTarget, RowFocal, RowRoll, RowFocus, RowAperture, RowShutter, RowFollow, RowQuality, RowResolution, RowTake, RowCount };
+// User 2026-10-19: Focus Mode got its own row (Enter on Focus cycling the modes was not discoverable); Focus is the
+// distance, editable only in Manual. Quality left the menu to free the row: [Capture] DefaultQuality still sets it
+// and its code stays (lens.h kQualitySamples).
+enum Row { RowCamera, RowTarget, RowFocal, RowRoll, RowFocusMode, RowFocus, RowAperture, RowShutter, RowFollow, RowResolution, RowTake, RowCount };
 
 constexpr float kMinFocusM = 0.3f, kMaxFocusM = 500;
 constexpr float kBackGuardSec = 0.3f;
@@ -560,48 +563,41 @@ void Adjust(int row, int dir) {
       break;
     case RowFocal: g->focalIdx = ClampInt(g->focalIdx + dir, 0, lens::Count(lens::kFocals) - 1); break;
     case RowRoll: g->rig.roll = Clamp(std::round(g->rig.roll) + dir, -kMaxRoll, kMaxRoll); break;
-    case RowFocus:
-      if (g->focusMode != FocusMode::Manual) {
-        g->focusDist = AutoFocusDistance(g->focusMode);
-        g->focusMode = FocusMode::Manual;
-      }
+    case RowFocusMode: {
+      FocusMode prev = g->focusMode;
+      g->focusMode = static_cast<FocusMode>(Wrap(static_cast<int>(g->focusMode) + dir, 4));
+      if (g->focusMode == FocusMode::Aim) UpdateAim();
+      // Manual starts at the distance the previous mode had, so the picture does not jump.
+      if (g->focusMode == FocusMode::Manual) g->focusDist = Clamp(AutoFocusDistance(prev), kMinFocusM, kMaxFocusM);
+      break;
+    }
+    case RowFocus:  // Manual only (IsRowEnabled)
+      if (g->focusMode != FocusMode::Manual) break;
       g->focusDist = Clamp(g->focusDist * (dir > 0 ? 1.08f : 1 / 1.08f), kMinFocusM, kMaxFocusM);
       break;
     case RowAperture: g->fstopIdx = ClampInt(g->fstopIdx + dir, 0, lens::Count(lens::kFStops) - 1); break;
     case RowShutter: g->shutterIdx = ClampInt(g->shutterIdx + dir, 0, lens::Count(lens::kShutters) - 1); break;
     case RowFollow: g->follow = static_cast<Follow>(Wrap(static_cast<int>(g->follow) + dir, static_cast<int>(Follow::Count))); break;
-    case RowQuality: g->qualityIdx = Wrap(g->qualityIdx + dir, lens::Count(lens::kQualitySamples)); break;
     case RowResolution: g->tiles = ClampInt(g->tiles + dir, 1, lens::kMaxTiles); break;
     default: break;
   }
 }
 
 bool IsActionRow(int row) { return row == RowTake; }
+// The focus distance is shown live in every mode but only editable in Manual (native disabled row: grey, skipped).
+bool IsRowEnabled(int row) { return row != RowFocus || g->focusMode == FocusMode::Manual; }
 
 void Activate(int row) {
   if (g->state != State::Active) return;
   if (row == RowTake) StartCapture();
-  else if (row == RowFocus) {  // Enter cycles Center -> Closest -> Aim -> Manual (at the current distance)
-    switch (g->focusMode) {
-      case FocusMode::Center: g->focusMode = FocusMode::Closest; break;
-      case FocusMode::Closest:
-        g->focusMode = FocusMode::Aim;
-        UpdateAim();
-        break;
-      case FocusMode::Aim:
-        g->focusDist = g->aimDist;
-        g->focusMode = FocusMode::Manual;
-        break;
-      case FocusMode::Manual: g->focusMode = FocusMode::Center; break;
-    }
-  }
   else Adjust(row, 1);
 }
 
-// Row texts for the native menu (native_menu.cpp draws them into UI_PauseOptions.fng).
+// Row texts for the native menu (u2sdk optmenu draws them into UI_PauseOptions.fng).
 std::string RowLabel(int row) {
-  static const char* names[RowCount] = {"Camera",  "Target", "Focal Length", "Roll",       "Focus",     "Aperture",
-                                        "Shutter", "Shutter Follow", "Quality",    "Resolution", "Take Picture"};
+  static const char* names[RowCount] = {"Camera",   "Target",         "Focal Length", "Roll",
+                                        "Focus Mode", "Focus",        "Aperture",     "Shutter",
+                                        "Shutter Follow", "Resolution", "Take Picture"};
   return row >= 0 && row < RowCount ? names[row] : "";
 }
 
@@ -612,18 +608,17 @@ std::string RowValue(int row) {
     case RowTarget: return TargetName();
     case RowFocal: std::snprintf(b, sizeof b, "%.0f mm", Focal()); break;
     case RowRoll: std::snprintf(b, sizeof b, "%+.0f", g->rig.roll); break;
-    case RowFocus:
-      if (g->focusMode == FocusMode::Manual) std::snprintf(b, sizeof b, "%.1f m", g->focusDist);
-      else if (g->focusMode == FocusMode::Aim)
-        std::snprintf(b, sizeof b, g->aimHit ? "Aim %.1f m" : "Aim -- (%.1f m)", g->aimDist);
-      else
-        std::snprintf(b, sizeof b, "%s %.1f m", g->focusMode == FocusMode::Center ? "Center" : "Closest",
-                      AutoFocusDistance(g->focusMode));
+    case RowFocusMode: {
+      static const char* modes[4] = {"Center", "Closest", "Aim", "Manual"};
+      return modes[static_cast<int>(g->focusMode)];
+    }
+    case RowFocus:  // the distance the photo uses, live; Aim with nothing at the centre keeps its last distance
+      if (g->focusMode == FocusMode::Aim && !g->aimHit) std::snprintf(b, sizeof b, "-- (%.1f m)", g->aimDist);
+      else std::snprintf(b, sizeof b, "%.1f m", FocusDistance());
       break;
     case RowAperture: lens::FormatFStop(b, sizeof b, FStop()); break;
     case RowShutter: return lens::kShutterNames[g->shutterIdx];
     case RowFollow: return FollowName(g->follow);
-    case RowQuality: return lens::kQualityNames[g->qualityIdx];
     case RowResolution: std::snprintf(b, sizeof b, "%dx", g->tiles); break;
     default: break;
   }
@@ -974,7 +969,7 @@ bool Install() {
     U2LOG("some hooks failed; photo mode disabled");
     return false;  // created hooks are never enabled
   }
-  if (!menu::Install(menu::Callbacks{RowCount, &RowLabel, &RowValue, &Adjust, &Activate, &MenuBack, &IsActionRow},
+  if (!menu::Install(menu::Callbacks{RowCount, &RowLabel, &RowValue, &Adjust, &Activate, &MenuBack, &IsActionRow, &IsRowEnabled},
                      g->cfg.menuLayout, g->cfg.verbose))
     return false;
   if (!hook::EnableAll()) {
