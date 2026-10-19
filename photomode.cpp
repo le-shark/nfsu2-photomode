@@ -17,7 +17,6 @@
 #include "supersample.h"
 #include "settings.h"
 #include "u2sdk/optmenu.h"
-#include "u2sdk/crash.h"
 #include "u2sdk/d3d.h"
 #include "u2sdk/dev.h"
 #include "u2sdk/feng.h"
@@ -716,106 +715,11 @@ void LogPostExit(float dt) {
         Var<int>(addr::DrawHud), Var<uint8_t>(addr::PCHelpBarUp), rc ? *rc : -1, Var<int>(addr::CameraStopUpdating));
 }
 
-// Verbose diagnostic (user 2026-10-19: photo mode and the game's pause menu open and close slowly in one install and
-// quickly in another, with none of our other ASIs): for 2 s after photo mode or the pause menu opens or closes, every
-// frame over 25 ms is logged, then a summary. A stall (one long frame) means the game blocks on work; smooth frames
-// mean the slowness is an animation or the input.
-void FrameProbe(float rawDt) {
-  static int lastState = -1;
-  static float left = 0, total = 0, worst = 0;
-  static int frames = 0, slow = 0;
-  static const char* what = "";
-  int state = (g->state != State::Off ? 1 : 0) | (IsGamePaused() ? 2 : 0);
-  if (lastState >= 0 && state != lastState) {
-    const bool pm = (state & 1) != (lastState & 1);
-    what = pm ? ((state & 1) ? "photo mode open" : "photo mode close") : ((state & 2) ? "pause open" : "pause close");
-    U2LOG("probe: %s", what);
-    left = 2, total = worst = 0, frames = slow = 0;
-  }
-  lastState = state;
-  if (left <= 0) return;
-  ++frames;
-  total += rawDt;
-  worst = (std::max)(worst, rawDt);
-  if (rawDt > 0.025f) {
-    ++slow;
-    U2LOG("probe: frame %d after %s took %.0f ms", frames, what, rawDt * 1000);
-  }
-  if ((left -= rawDt) <= 0)
-    U2LOG("probe: %s: %d frames in %.2f s, %d over 25 ms, longest %.0f ms", what, frames, total, slow, worst * 1000);
-}
-
-// Verbose diagnostic, with FrameProbe: when the game thread has not reached Tick for 250 ms, a watchdog thread
-// suspends it three times (at about 0.3, 0.6 and 0.9 s into the stall) and logs where it is: EIP and the code
-// addresses on its stack (likely return addresses), as module+offset. While the thread is suspended only raw memory
-// is copied (it may hold the loader or heap lock); the lookups and the log come after ResumeThread.
-HANDLE g_mainThread = nullptr;
-volatile LONGLONG g_lastTickQpc = 0;
-
-DWORD WINAPI HangSampler(void*) {
-  LARGE_INTEGER f;
-  QueryPerformanceFrequency(&f);
-  LONGLONG stallStart = 0;
-  int samples = 0;
-  for (;;) {
-    Sleep(50);
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-    LONGLONG last = g_lastTickQpc;
-    if (!last) continue;
-    double ms = (now.QuadPart - last) * 1000.0 / f.QuadPart;
-    if (ms < 250) {
-      stallStart = 0;
-      continue;
-    }
-    if (last != stallStart) stallStart = last, samples = 0;
-    if (samples >= 3 || ms < 300.0 * (samples + 1)) continue;
-    ++samples;
-    constexpr int kWords = 0x800;  // 8 KB of stack
-    static uintptr_t stack[kWords];
-    CONTEXT c{};
-    c.ContextFlags = CONTEXT_CONTROL;
-    int n = 0;
-    if (SuspendThread(g_mainThread) == static_cast<DWORD>(-1)) continue;
-    if (GetThreadContext(g_mainThread, &c)) {
-      MEMORY_BASIC_INFORMATION mbi;
-      if (VirtualQuery(reinterpret_cast<void*>(c.Esp), &mbi, sizeof mbi) && mbi.State == MEM_COMMIT) {
-        uintptr_t end = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
-        n = static_cast<int>((std::min)(static_cast<uintptr_t>(kWords), static_cast<uintptr_t>((end - c.Esp) / 4)));
-        std::memcpy(stack, reinterpret_cast<void*>(c.Esp), n * 4);
-      }
-    }
-    ResumeThread(g_mainThread);
-    char where[300];
-    crash::Describe(c.Eip, where, sizeof where);
-    U2LOG("hang: game thread stuck %.0f ms, sample %d: EIP %s", ms, samples, where);
-    int shown = 0;
-    for (int i = 0; i < n && shown < 16; ++i) {
-      MEMORY_BASIC_INFORMATION mbi;
-      if (!VirtualQuery(reinterpret_cast<void*>(stack[i]), &mbi, sizeof mbi) || mbi.Type != MEM_IMAGE ||
-          !(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
-        continue;
-      crash::Describe(stack[i], where, sizeof where);
-      U2LOG("hang:   [esp+%03X] %s", i * 4, where);
-      ++shown;
-    }
-  }
-}
-
 void Tick() {
   LARGE_INTEGER now;
   QueryPerformanceCounter(&now);
-  if (g->cfg.verbose) {
-    if (!g_mainThread) {
-      g_mainThread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE,
-                                GetCurrentThreadId());
-      if (g_mainThread) CloseHandle(CreateThread(nullptr, 0, HangSampler, nullptr, 0, nullptr));
-    }
-    g_lastTickQpc = now.QuadPart;
-  }
   float dt = g->lastQpc.QuadPart ? static_cast<float>(now.QuadPart - g->lastQpc.QuadPart) / g->qpcFreq.QuadPart : 1 / 60.f;
   g->lastQpc = now;
-  if (g->cfg.verbose) FrameProbe(dt);
   dt = Clamp(dt, 0.0f, 0.1f);
 
   if (!g->endSceneHooked && Device()) {
