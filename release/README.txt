@@ -21,13 +21,14 @@ Controls
 Open / close        End (pad: click both sticks, L3 + R3). Esc or pad B also closes it.
 Menu                arrows, Enter, Esc (pad: D-pad, A, B). H (pad Y) hides the menu.
 Camera              WASD move, Q / E down / up, mouse look, Z / C roll, mouse wheel focal length,
-                    Shift faster, Ctrl slower, [ / ] orbit another racer
+                    Shift faster, Ctrl slower, [ / ] switch the focus target to another racer
 Pad camera          left stick move, right stick look, LT / RT down / up, LB / RB roll
 Take a picture      Space (pad X); End, Esc or pad B cancel a picture in progress
 
-The menu sets the camera (orbit or free), focus (Center, Closest, Aim, Manual), aperture, shutter (motion blur, and
-whether the blur follows the car), quality and resolution (1x or 2x the screen). With the camera still, the screen
-shows the finished look before you take the picture.
+The menu sets the camera mode (orbit or free), the focus target car, the focus mode (Center, Closest, Aim, Manual),
+focal length, roll, aperture, shutter (motion blur, and whether the blur follows the car) and resolution (1x or 2x
+the screen). With the camera still, the screen shows the finished look before you take the picture. The sample
+count (quality) is set in the INI ([Capture] DefaultQuality).
 
 Pictures are saved as PNG in the game's "screenshots" folder ([Capture] OutputDir in the INI).
 
