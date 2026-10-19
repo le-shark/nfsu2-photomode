@@ -107,7 +107,6 @@ struct PhotoMode {
   bool endSceneHooked = false;
   bool captureHooks = false;  // EndScene and Present both hooked
   float postExitLog = 0;      // verbose: seconds left to log game state after exit
-  int debugShot = 0;
   POINT cursorAtEnter{};
 
   // GPU accumulation (live preview and capture)
@@ -505,7 +504,6 @@ void StartCapture() {
         Toast("Capture failed: not enough video memory for 2x motion blur");
         return;
       }
-      Toast("2x in tiles (no video memory for supersampling)");
     }
   }
   std::string err;
@@ -687,7 +685,6 @@ void HandleControls(float dt) {
 HRESULT __stdcall EndSceneDetour(IDirect3DDevice9* dev) {
   if (g->frameArmed) {
     g->frameArmed = false;
-    dev::OnEndScene(dev);
     // Read back only a resolve frame whose mean was really drawn (Render3D ran this frame).
     if (g->state == State::Capturing && dev == Device() && g->frame.shown) g->capture.OnEndScene(dev);
   }
@@ -744,10 +741,10 @@ void Tick() {
   }
   menu::Tick();
   if (g->state == State::Off) {
-    // Closed: only the keys that can open it (and the debug shot), the pad only for the L3 + R3 combo; the full
-    // update polls all 255 keys and the mouse every frame (2026-10-18 review).
-    const int keys[2] = {g->cfg.hotkey, g->cfg.tools ? VK_F12 : 0};
-    g->input.UpdateOnly(keys, 2, g->cfg.padCombo);
+    // Closed: only the key that can open it, the pad only for the L3 + R3 combo; the full update polls all 255 keys
+    // and the mouse every frame (2026-10-18 review).
+    const int keys[1] = {g->cfg.hotkey};
+    g->input.UpdateOnly(keys, 1, g->cfg.padCombo);
   } else {
     g->input.Update();
   }
@@ -755,10 +752,6 @@ void Tick() {
   if (g->backGuard > 0) g->backGuard -= dt;
   if (std::string m = g->capture.TakeMessage(); !m.empty()) Toast(m, 4);
 
-  if (g->cfg.tools && g->input.KeyPressed(VK_F12)) {  // debug: save the displayed frame incl. HUD/UI
-    EnsureOutputDir();
-    dev::RequestShot(g->cfg.outputDir + "\\debug_" + std::to_string(++g->debugShot) + ".png", 2);
-  }
   if (g->postExitLog > 0) LogPostExit(dt);
   if (g->state == State::Off) {
     // L3 + R3 (Start would also open the game's pause menu).

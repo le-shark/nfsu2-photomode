@@ -49,7 +49,6 @@ Save failed (see the log),,Menu status line: PNG could not be written
 No other racers,,Menu status line: [ / ] or Focus Target pressed with no AI racers (free roam)
 Still saving the previous picture,,Menu status line: picture key pressed while the last PNG is still being written
 Capture unavailable (see the log),,Menu status line: picture key pressed but the capture hooks failed
-2x in tiles (no video memory for supersampling),,Menu status line: 2x photo falls back to tiles
 Capture failed: %s,,Menu status line prefix; %s = one of the reasons below
 cancelled,,Capture failed reason: End / Esc / pad B during a capture
 device reset,,Capture failed reason: alt-tab or resolution change during a capture
@@ -80,4 +79,3 @@ gap between the bar and the screen edges,,INI comment: [Menu] Margin
 width of the value column between the < > arrows,,INI comment: [Menu] ValueWidth
 panel background opacity 0..255,,INI comment: [Menu] BackingAlpha
 "1 = extra diagnostics in the log (car list, menu input, state after exit)",,INI comment: [Debug] Verbose
-1 = developer keys (F12 saves a debug screenshot),,INI comment: [Debug] Tools
