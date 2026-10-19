@@ -978,7 +978,9 @@ bool Install() {
     U2LOG("some hooks failed; photo mode disabled");
     return false;  // created hooks are never enabled
   }
-  if (!menu::Install(menu::Callbacks{RowCount, &RowLabel, &RowValue, &Adjust, &Activate, &MenuBack, &IsActionRow, &IsRowEnabled},
+  // Footer: user 2026-10-19, "H - Hide/Show UI" at the bottom of the bar.
+  if (!menu::Install(menu::Callbacks{RowCount, &RowLabel, &RowValue, &Adjust, &Activate, &MenuBack, &IsActionRow, &IsRowEnabled,
+                                     "H - Hide/Show UI"},
                      g->cfg.menuLayout, g->cfg.verbose))
     return false;
   if (!hook::EnableAll()) {
