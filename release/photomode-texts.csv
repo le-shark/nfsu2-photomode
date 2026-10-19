@@ -1,0 +1,83 @@
+﻿Text,New text,Where
+Photo Mode,,Menu title (top of the sidebar)
+H - Hide/Show UI,,Menu footer tip (bottom of the sidebar)
+Camera Mode,,Menu row label
+Focal Length,,Menu row label
+Roll,,Menu row label
+Focus Target,,Menu row label
+Focus Mode,,Menu row label
+Focus,,Menu row label
+Aperture,,Menu row label
+Shutter Speed,,Menu row label
+Shutter Follow,,Menu row label
+Resolution,,Menu row label
+Take Picture,,Menu row label (button)
+Orbit,,Camera Mode value
+Free,,Camera Mode value
+You,,Focus Target value (your car)
+Racer %d,,Focus Target value (%d = racer number)
+%.0f mm,,Focal Length value (e.g. 50 mm)
+%+.0f,,"Roll value in degrees (e.g. +0, -15)"
+Center,,Focus Mode value
+Closest,,Focus Mode value (default)
+Aim,,Focus Mode value
+Manual,,Focus Mode value
+%.1f m,,Focus value: distance (e.g. 11.4 m)
+-- (%.1f m),,Focus value in Aim mode with nothing at the screen centre (last distance kept)
+Off,,Aperture value (no depth of field); also Shutter Speed value (no motion blur) and Shutter Follow value
+F/%.1f,,Aperture value below F/10 (e.g. F/2.8)
+F/%.0f,,Aperture value from F/10 (e.g. F/16)
+1/1000,,Shutter Speed value
+1/500,,Shutter Speed value
+1/250,,Shutter Speed value
+1/125,,Shutter Speed value
+1/60,,Shutter Speed value
+1/30,,Shutter Speed value
+1/15,,Shutter Speed value
+1/8,,Shutter Speed value
+1/4,,Shutter Speed value
+1/2,,Shutter Speed value
+1 s,,Shutter Speed value
+Pan,,Shutter Follow value
+Track,,Shutter Follow value
+Rig,,Shutter Follow value (default)
+%dx,,"Resolution value (1x, 2x)"
+Capturing %d%%,,Menu status line during a capture (%d = percent)
+Saving...,,Menu status line: writing the PNG
+Saved %s,,Menu status line: photo saved (%s = file name)
+Save failed (see the log),,Menu status line: PNG could not be written
+No other racers,,Menu status line: [ / ] or Focus Target pressed with no AI racers (free roam)
+Still saving the previous picture,,Menu status line: picture key pressed while the last PNG is still being written
+Capture unavailable (see the log),,Menu status line: picture key pressed but the capture hooks failed
+2x in tiles (no video memory for supersampling),,Menu status line: 2x photo falls back to tiles
+Capture failed: %s,,Menu status line prefix; %s = one of the reasons below
+cancelled,,Capture failed reason: End / Esc / pad B during a capture
+device reset,,Capture failed reason: alt-tab or resolution change during a capture
+no GPU accumulation,,Capture failed reason: the graphics card could not create the photo buffers
+frame readback failed,,Capture failed reason: reading the picture from the graphics card failed
+frame lock failed,,Capture failed reason: reading the picture from the graphics card failed
+not enough video memory for 2x motion blur,,Capture failed reason: 2x photo with motion blur without enough video memory
+no back buffer,,Capture failed reason: the game's screen surface was unavailable
+could not create the capture surfaces,,Capture failed reason: the graphics card could not create the readback surfaces
+not enough memory for this resolution,,Capture failed reason: the picture does not fit in memory
+"Key that opens/closes photo mode (END, HOME, P, 0x23, ...)",,INI comment: [PhotoMode] Hotkey
+L3 + R3 (click both sticks) on an XInput pad opens it; B closes it,,INI comment: [PhotoMode] GamepadCombo
+"metres per second (Shift x4, Ctrl x0.25)",,INI comment: [Camera] MoveSpeed
+degrees per mouse count,,INI comment: [Camera] MouseSensitivity
+degrees per second at full right-stick deflection,,INI comment: [Camera] StickLookSpeed
+degrees per second,,INI comment: [Camera] RollSpeed
+how far the camera may go from the car (metres),,INI comment: [Camera] MaxDistance
+0 = default. Multiplier between the game FOV value and vertical FOV,,INI comment: [Camera] FovCalibration
+empty = <game>\screenshots,,INI comment: [Capture] OutputDir
+sub-pixel jitter between samples,,INI comment: [Capture] AntiAliasing
+"0 Draft (32 samples), 1 High (128), 2 Ultra (256)",,INI comment: [Capture] DefaultQuality
+"when the camera and settings are still, the view converges to the photo (DOF, AA)",,INI comment: [Preview] Enable
+seconds of stillness before the preview starts,,INI comment: [Preview] Delay
+"The photo mode menu is the game's own options screen, reshaped into a full-height bar on the left.",,"INI comment: [Menu] section, line 1"
+Units are FE canvas pixels: the screen is 480 high (and 480 x aspect wide).,,"INI comment: [Menu] section, line 2"
+bar width,,INI comment: [Menu] Width
+gap between the bar and the screen edges,,INI comment: [Menu] Margin
+width of the value column between the < > arrows,,INI comment: [Menu] ValueWidth
+panel background opacity 0..255,,INI comment: [Menu] BackingAlpha
+"1 = extra diagnostics in the log (car list, menu input, state after exit)",,INI comment: [Debug] Verbose
+1 = developer keys (F12 saves a debug screenshot),,INI comment: [Debug] Tools

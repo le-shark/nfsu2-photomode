@@ -81,7 +81,7 @@ struct PhotoMode {
 
   // menu values
   int focalIdx = 10, fstopIdx = lens::kDefaultFStop, shutterIdx = 0, qualityIdx = 1, tiles = 1;
-  FocusMode focusMode = FocusMode::Center;
+  FocusMode focusMode = FocusMode::Closest;  // user 2026-10-19: default Closest
   float focusDist = 5;
   float aimDist = 10;           // last aim hit; kept while the ray hits nothing
   bool aimHit = false;          // the ray hit something this frame
@@ -603,7 +603,7 @@ void Activate(int row) {
 // Row texts for the native menu (u2sdk optmenu draws them into UI_PauseOptions.fng).
 std::string RowLabel(int row) {
   static const char* names[RowCount] = {"Camera Mode", "Focal Length", "Roll",     "Focus Target",
-                                        "Focus Mode", "Focus",        "Aperture", "Shutter",
+                                        "Focus Mode", "Focus",        "Aperture", "Shutter Speed",
                                         "Shutter Follow", "Resolution", "Take Picture"};
   return row >= 0 && row < RowCount ? names[row] : "";
 }
