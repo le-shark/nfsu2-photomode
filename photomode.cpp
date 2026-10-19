@@ -715,11 +715,41 @@ void LogPostExit(float dt) {
         Var<int>(addr::DrawHud), Var<uint8_t>(addr::PCHelpBarUp), rc ? *rc : -1, Var<int>(addr::CameraStopUpdating));
 }
 
+// Verbose diagnostic (user 2026-10-19: photo mode and the game's pause menu open and close slowly in one install and
+// quickly in another, with none of our other ASIs): for 2 s after photo mode or the pause menu opens or closes, every
+// frame over 25 ms is logged, then a summary. A stall (one long frame) means the game blocks on work; smooth frames
+// mean the slowness is an animation or the input.
+void FrameProbe(float rawDt) {
+  static int lastState = -1;
+  static float left = 0, total = 0, worst = 0;
+  static int frames = 0, slow = 0;
+  static const char* what = "";
+  int state = (g->state != State::Off ? 1 : 0) | (IsGamePaused() ? 2 : 0);
+  if (lastState >= 0 && state != lastState) {
+    const bool pm = (state & 1) != (lastState & 1);
+    what = pm ? ((state & 1) ? "photo mode open" : "photo mode close") : ((state & 2) ? "pause open" : "pause close");
+    U2LOG("probe: %s", what);
+    left = 2, total = worst = 0, frames = slow = 0;
+  }
+  lastState = state;
+  if (left <= 0) return;
+  ++frames;
+  total += rawDt;
+  worst = (std::max)(worst, rawDt);
+  if (rawDt > 0.025f) {
+    ++slow;
+    U2LOG("probe: frame %d after %s took %.0f ms", frames, what, rawDt * 1000);
+  }
+  if ((left -= rawDt) <= 0)
+    U2LOG("probe: %s: %d frames in %.2f s, %d over 25 ms, longest %.0f ms", what, frames, total, slow, worst * 1000);
+}
+
 void Tick() {
   LARGE_INTEGER now;
   QueryPerformanceCounter(&now);
   float dt = g->lastQpc.QuadPart ? static_cast<float>(now.QuadPart - g->lastQpc.QuadPart) / g->qpcFreq.QuadPart : 1 / 60.f;
   g->lastQpc = now;
+  if (g->cfg.verbose) FrameProbe(dt);
   dt = Clamp(dt, 0.0f, 0.1f);
 
   if (!g->endSceneHooked && Device()) {
