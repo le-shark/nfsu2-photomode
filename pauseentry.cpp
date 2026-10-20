@@ -12,6 +12,11 @@
 // - React: on select (0xC407210) we run the Resume Race option's own React 0x4C24C0 (option vtable 0x7954D0:
 //   RaceCoordinator [0x8900D8] post 0x5F4240(1), FEngSetLastButton, RemoveFNGFromUIObject), so the game unpauses
 //   exactly as Resume does, and ask photo mode to open once the game is no longer paused (TakeRequest).
+// - Back to the pause menu (user 2026-10-20: closing photo mode returns to where it was opened from): the game's own
+//   JOY_EVENT_PAUSE handler 0x602BD0, thiscall(player, port, 0xBD, 0) `ret 0xC` (case 0x602BF5: it checks the pause
+//   blocks 0x5004C0 / 0x5012C0, sets Career+0x7138 and posts event 7 with the port, 0x602C56..0x602C62). The port is
+//   the one that paused, RaceCoordinator+0x20 (written by the state-4 event 7 handler, native-screen.md 2.1); the
+//   player is the one of 0x8900AC / 0x8900B0 whose +8 equals it, as 0x4A7BF0 picks it.
 #include "pauseentry.h"
 
 #include <cstdint>
@@ -44,11 +49,16 @@ using ReactFn = void(__fastcall*)(void*, void*, const char*, uint32_t, void*, ui
 AddOptionFn oAddOption = nullptr;
 RefreshFn oRefresh = nullptr;
 bool g_request = false;
+int g_port = 0;  // the port that paused, read when the icon is selected
+
+constexpr uintptr_t kPlayers = 0x8900AC, kPauseJoyHandler = 0x602BD0, kPauseKeyBlock = 0x861E78;
+constexpr uint32_t kJoyPause = 0xBD;
 
 void __fastcall PhotoReact(void* opt, void* edx, const char* pkg, uint32_t msg, void* obj, uint32_t p1, uint32_t p2) {
   if (msg != kMsgSelect) return;
   U2LOG("pause menu: Photo Mode selected; resuming the race");
   g_request = true;
+  if (auto rc = Var<uint8_t*>(u2::addr::pRaceCoordinator)) g_port = *reinterpret_cast<int*>(rc + 0x20);
   Fn<ReactFn>(kResumeReact)(opt, edx, pkg, msg, obj, p1, p2);
 }
 void* g_vtbl[2] = {reinterpret_cast<void*>(0x4AEB70), reinterpret_cast<void*>(&PhotoReact)};
@@ -100,6 +110,19 @@ bool Install() {
       !u2::hook::Create(kRefreshHeader, &RefreshDetour, &oRefresh, "RefreshHeader 0x50DA50"))
     return false;
   return true;
+}
+
+bool ReopenPauseMenu() {
+  if (Var<uint8_t>(kPauseKeyBlock)) return false;  // 0x5004C0 would refuse; the photo menu's block is released later
+  for (int i = 0; i < 2; ++i) {
+    auto p = reinterpret_cast<uint8_t**>(kPlayers)[i];
+    if (!p || *reinterpret_cast<int*>(p + 8) != g_port) continue;
+    using JoyFn = void(__fastcall*)(void*, void*, int, uint32_t, uint32_t);
+    Fn<JoyFn>(kPauseJoyHandler)(p, nullptr, g_port, kJoyPause, 0);
+    U2LOG("pause menu: back to the pause menu (port %d)", g_port);
+    return true;
+  }
+  return false;
 }
 
 bool TakeRequest() {

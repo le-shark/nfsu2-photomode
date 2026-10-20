@@ -119,6 +119,9 @@ struct PhotoMode {
   bool captureHooks = false;  // EndScene and Present both hooked
   float postExitLog = 0;      // verbose: seconds left to log game state after exit
   float pauseRequest = 0;     // seconds left to open photo mode after its pause-menu icon resumed the race
+  bool fromPause = false;     // opened from the pause-menu icon: closing it goes back to the pause menu
+  float returnToPause = 0;    // seconds left to bring the pause menu back (the world stays frozen meanwhile)
+  bool pauseAsked = false;    // the game's pause handler was called for this return
   POINT cursorAtEnter{};
 
   // GPU accumulation (live preview and capture)
@@ -518,8 +521,11 @@ void FreeSupersample() {
   g->bigAccum.Free();
 }
 
-void Exit(const char* why) {
+// Closed by the player (not by the game pausing or leaving gameplay) after opening from the pause menu: back there.
+void Exit(const char* why, bool byPlayer = false) {
   if (g->state == State::Off) return;
+  const bool backToPause = byPlayer && g->fromPause && IsInGame();
+  g->fromPause = false;
   // Only in gameplay: after leaving it the cars may be gone (RestoreView then starts from the game camera).
   if (IsInGame()) SaveView();
   else g->view.valid = false;
@@ -530,7 +536,12 @@ void Exit(const char* why) {
   FreeSupersample();
   SetUncapped(false);
   Var<int>(addr::MirrorOverride) = g->savedMirror;
-  freeze::Hold(false);
+  // Going back to the pause menu: the world stays frozen until the game's own pause has taken over (Tick).
+  freeze::Hold(backToPause);
+  if (backToPause) {
+    g->returnToPause = 2;
+    g->pauseAsked = false;
+  }
   Var<float>(addr::GameSpeed) = g->saved.gameSpeed;
   Var<int>(addr::g_DepthOfFieldEnable) = g->saved.dofEnable;
   Var<int>(addr::g_MotionBlurEnable) = g->saved.mbEnable;
@@ -711,7 +722,7 @@ std::string StatusText() {
 
 void MenuBack() {
   if (g->state == State::Capturing) g->capture.Abort("cancelled");
-  else if (g->backGuard <= 0) Exit("menu back");
+  else if (g->backGuard <= 0) Exit("menu back", true);
 }
 
 // ---- per-frame ------------------------------------------------------------------------------
@@ -720,7 +731,7 @@ void HandleControls(float dt) {
   const PadState& pad = in.Pad();
 
   if (g->backGuard <= 0 && (in.KeyPressed(g->cfg.hotkey) || in.PadPressed(PadB))) {
-    Exit("user");
+    Exit("user", true);
     return;
   }
   if (in.KeyPressed('H') || in.PadPressed(PadY)) g->uiHidden = !g->uiHidden;
@@ -824,6 +835,20 @@ void Tick() {
 
   if (g->postExitLog > 0) LogPostExit(dt);
   if (g->state == State::Off) {
+    if (g->returnToPause > 0) {
+      g->returnToPause -= dt;
+      if (IsPauseMenuState()) {
+        g->returnToPause = 0;
+        freeze::Hold(false);
+      } else if (!g->pauseAsked) {
+        g->pauseAsked = IsInGame() && pause::ReopenPauseMenu();
+      }
+      if (g->returnToPause <= 0 && !IsPauseMenuState()) {
+        g->returnToPause = 0;
+        freeze::Hold(false);
+        U2LOG("pause menu: did not come back (asked %d, flow=%d)", g->pauseAsked, GameFlowState());
+      }
+    }
     // The pause-menu icon resumes the race as Resume Race does (pauseentry.cpp); open once the game has unpaused.
     if (pause::TakeRequest()) g->pauseRequest = 3;
     if (g->pauseRequest > 0) {
@@ -831,6 +856,7 @@ void Tick() {
       if (CanEnter()) {
         g->pauseRequest = 0;
         Enter();
+        g->fromPause = true;
         return;
       }
       if (g->pauseRequest <= 0)
