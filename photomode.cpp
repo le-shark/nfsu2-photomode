@@ -91,6 +91,7 @@ struct PhotoMode {
   CamPose captureCam{};         // camera and car when the shutter opened
   CarPose captureCar{};
   bool uiHidden = false;
+  bool openedBefore = false;    // Camera Mode, Focal Length and Roll are kept from the previous opening (Enter)
   std::string toast;
   float toastTime = 0;
   float backGuard = 0;          // seconds left in which Back/close keys are ignored
@@ -371,10 +372,18 @@ void Enter() {
   if (!UpdateAnchor()) g->anchor = ToVec3(cam->Position);
   g->rig.maxDist = g->cfg.maxDistance;
   g->rig.moveSpeed = g->cfg.moveSpeed;
+  // Beta feedback 2026-10-20 ("the camera settings reset everytime I deactivate it"): Camera Mode, Focal Length and
+  // Roll stay as they were left (the other rows always did); only the first opening takes the game camera's focal
+  // length. The camera itself still starts where the game's camera is.
+  const float roll = g->rig.roll;
   g->rig.InitFromCamera(ToVec3(cam->Position), ToVec3(cam->Direction), g->anchor);
-  g->rig.mode = RigMode::Orbit;
   float focal = GameFovToFocal(cam->FieldOfView, FovCal());
-  g->focalIdx = lens::Closest(lens::kFocals, focal);
+  if (g->openedBefore) {
+    g->rig.roll = roll;
+  } else {
+    g->focalIdx = lens::Closest(lens::kFocals, focal);
+    g->openedBefore = true;
+  }
   g->uiHidden = false;
   g->backGuard = 0;
   freeze::Hold(true);
@@ -901,9 +910,13 @@ void __fastcall ProjDetour(void* plat, void* edx, eView* view, float a, float b,
 
 // While photo mode is up only our menu is drawn (HUD, minimap, messages hidden); H hides it too.
 // A package is skipped by detaching its object list (pkg+0x4C) for the call.
+// A capture's resolve frame (the one read back into the PNG) hides our menu here too. drawHud = 0 alone is not
+// enough: the FE pass 0x5378C0 reads it through the pointer at 0x5378C1, which NFSU2_CameraToolkit repoints to its
+// own "Draw HUD" flag (camtk dllmain.cpp:220), so with that mod the menu was drawn into photos (beta feedback
+// 2026-10-20: "the photo mode ui visible in end screenshots").
 void __fastcall FeRenderDetour(void* feng, void* edx) {
   if (g->state == State::Off) return oFeRender(feng, edx);
-  bool hideMenu = menu::IsHidden();
+  bool hideMenu = menu::IsHidden() || (g->state == State::Capturing && g->frame.resolve);
   void* saved[64];
   feng::FEPackage* pkgs[64];
   int n = 0;
