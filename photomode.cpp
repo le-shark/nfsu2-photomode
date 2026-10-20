@@ -96,6 +96,9 @@ struct PhotoMode {
   bool uiHidden = false;
   bool driving = false;         // Drive: the world runs and the car takes the driving keys (StartDrive)
   uint8_t savedShowcaseKeys = 0;
+  CarPose driveCarPrev{};       // Free mode while driving: the car's pose last frame (FollowDrivenCar)
+  bool driveFollow = false;
+  int finishAtDrive = 0;        // the player's finish tick when driving started (PlayerFinishTick)
   bool openedBefore = false;    // Camera Mode, Focal Length and Roll are kept from the previous opening (Enter)
   // The camera when photo mode closed, relative to its car (SaveView / RestoreView).
   struct View {
@@ -228,9 +231,9 @@ void CycleTarget(int dir) {
 // Target car (orbit target, else the player) as a pose: Car+0x50 position, Car+0x90 orientation
 // rows (row 0 = forward; traffic spawner 0x42C8E7, NFSU2_CameraToolkit dllmain.cpp:151). Rows that
 // are not unit vectors (car not set up yet) fall back to the world axes.
-CarPose TargetCarPose() {
-  CarPose c{g->anchor, {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}}};
-  if (uint8_t* car = TargetCar()) {
+CarPose PoseOf(uint8_t* car, const Vec3& fallback) {
+  CarPose c{fallback, {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}}};
+  if (car) {
     Vec3 axes[3];
     CarAxes(car, axes);
     c.pos = CarPosition(car);
@@ -240,6 +243,7 @@ CarPose TargetCarPose() {
   }
   return c;
 }
+CarPose TargetCarPose() { return PoseOf(TargetCar(), g->anchor); }
 
 CamPose RigPose() {
   Vec3 eye, target, up;
@@ -532,9 +536,34 @@ void __cdecl SaveRegistryDetour() {
 // - The pause-key block 0x861E78 set by the menu stays, so pad Start does not pause either.
 constexpr uintptr_t kShowcaseKeys = 0x836352;
 
+// The player's finish: in-world player 0 ([0x8900AC], PlayersByNumber) +0x50 is the world-frame tick at which it
+// finished, 0 while racing (ctor 0x5F1670 clears it at 0x5F1808; 0x5EA530 sets it once from the race-end handlers,
+// 0x5EA542..0x5EA54A; verified-in-binary.md "Pause menu icons"). User 2026-10-20: a race that finishes while driving
+// in photo mode ends photo mode.
+int PlayerFinishTick() {
+  auto p = Var<uint8_t*>(0x8900AC);
+  return p ? *reinterpret_cast<int*>(p + 0x50) : 0;
+}
+
+// Free mode while driving (user 2026-10-20): the camera moves with the player's car as Shutter Follow "Rig" does
+// during an exposure (follow.h, rigidly attached), applied frame to frame so mouse look still turns it.
+void FollowDrivenCar() {
+  uint8_t* car = PlayerCar();
+  if (!car) return;
+  CarPose now = PoseOf(car, CarPosition(car));
+  if (g->driveFollow) {
+    CamPose p = FollowPose(Follow::Rig, RigPose(), g->driveCarPrev, now);
+    g->rig.SetPose(p.eye, p.fwd, p.up, g->anchor);
+  }
+  g->driveCarPrev = now;
+  g->driveFollow = true;
+}
+
 void StartDrive() {
   if (g->driving || g->state != State::Active || !g->cfg.drive) return;
   g->driving = true;
+  g->driveFollow = false;
+  g->finishAtDrive = PlayerFinishTick();
   g->savedShowcaseKeys = Var<uint8_t>(kShowcaseKeys);
   Var<uint8_t>(kShowcaseKeys) = 1;
   menu::SetHidden(true);
@@ -792,7 +821,8 @@ void HandleDriveControls() {
   float zoomScale = Clamp(35.f / Focal(), 0.15f, 1.5f);
   ri.lookYawDeg = -in.MouseDX() * g->cfg.mouseSensitivity * zoomScale;
   ri.lookPitchDeg = -in.MouseDY() * g->cfg.mouseSensitivity * zoomScale * (g->cfg.invertY ? -1.f : 1.f);
-  Vec3 range = g->rig.mode == RigMode::Free && g->rangeCar ? CarPosition(g->rangeCar) : g->anchor;
+  uint8_t* player = PlayerCar();  // Free mode rides along with it (FollowDrivenCar)
+  Vec3 range = g->rig.mode == RigMode::Free && player ? CarPosition(player) : g->anchor;
   g->rig.Update(ri, 0, range);
 }
 
@@ -993,6 +1023,14 @@ void Tick() {
   } else {
     HandleControls(dt);
     if (g->state == State::Off) return;
+    if (g->driving) {
+      int fin = PlayerFinishTick();
+      if (fin != 0 && fin != g->finishAtDrive) {
+        Exit("race finished while driving");
+        return;
+      }
+      if (g->rig.mode == RigMode::Free) FollowDrivenCar();
+    }
     if (g->state == State::Active) {
       ApplyCamera(g->lastDt);
       if (g->focusMode == FocusMode::Aim) UpdateAim();
