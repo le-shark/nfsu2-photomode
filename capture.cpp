@@ -132,13 +132,10 @@ void Capture::Finish() {
   int w = width_ * p_.sample.tiles, h = height_ * p_.sample.tiles;
   std::string path = p_.outPath;
   auto img = std::make_shared<std::vector<uint8_t>>(std::move(image_));
-  const watermark::Mark mark = p_.mark;
-  const watermark::Corner corner = p_.corner;
   Release();
   ++saving_;
   Notify("Saving...");
-  std::thread([this, img, w, h, path, mark, corner] {
-    if (mark.image) watermark::Composite(img->data(), w, h, mark, corner);
+  std::thread([this, img, w, h, path] {
     bool ok = u2::dev::SavePng(path, w, h, img->data());
     U2LOG("png %s (%dx%d): %s", path.c_str(), w, h, ok ? "saved" : "FAILED");
     std::string name = path.substr(path.find_last_of("\\/") + 1);

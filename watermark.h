@@ -1,9 +1,9 @@
 #pragma once
 // Watermarks (user 2026-10-20): a logo in a corner of the screen while photo mode is open and in the saved photo.
 // Built-in logos are PNGs inside the ASI (photomode.rc); a WATERMARK.png next to the ASI is the Custom one.
-// - Screen: Overlay draws it at the end of each frame (EndScene, after WidescreenFix's gamma), so it looks as it will
-//   in the file.
-// - Photo: Composite blends it into the finished RGB image just before the PNG is written (any size: 1x, 2x).
+// Overlay draws it into the finished 3D frame before the menu (user: never over the photo-mode menu), so the photo's
+// resolve frames, read back from that same frame, carry it too: at 2x and with tiles each screen-sized part draws its
+// piece of the logo placed in the whole image.
 // Size and margin are given for a 1080-pixel-high image and scale with the image height, so the screen and the photo
 // match at 1x and 2x.
 #include <cstdint>
@@ -36,9 +36,6 @@ struct Rect {
 };
 Rect Place(const Mark& m, int imageW, int imageH, Corner c);
 
-// Blends the mark into an RGB image (3 bytes per pixel, R G B), bilinear, sRGB blending as the screen does.
-void Composite(uint8_t* rgb, int w, int h, const Mark& m, Corner c);
-
 // PNG decoding with Windows' own codec (WIC). The caller's thread must allow COM (frame code, not DllMain).
 bool LoadResourcePng(int id, Image* out);
 bool LoadFilePng(const std::wstring& path, Image* out);
@@ -49,7 +46,9 @@ std::wstring ModuleDir();
 class Overlay {
  public:
   ~Overlay() { Free(); }
-  void Draw(IDirect3DDevice9* dev, const Mark& m, Corner c);
+  // Onto the backbuffer, which shows the part of an imageW x imageH picture starting at (offX, offY) (the whole screen
+  // normally; one quarter during a 2x resolve).
+  void Draw(IDirect3DDevice9* dev, const Mark& m, Corner c, int imageW, int imageH, int offX, int offY);
   void Free();  // before a device reset, and when photo mode closes
 
  private:

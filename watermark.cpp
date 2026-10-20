@@ -75,44 +75,6 @@ Rect Place(const Mark& m, int imageW, int imageH, Corner c) {
   return {right ? imageW - g - w : g, bottom ? imageH - g - h : g, w, h};
 }
 
-void Composite(uint8_t* rgb, int W, int H, const Mark& m, Corner c) {
-  if (!m.image || m.image->w == 0) return;
-  const Image& im = *m.image;
-  const Rect r = Place(m, W, H, c);
-  const float sx = im.w / r.w, sy = im.h / r.h;  // logo pixels per image pixel
-  const int x0 = (std::max)(0, static_cast<int>(std::floor(r.x))), x1 = (std::min)(W, static_cast<int>(std::ceil(r.x + r.w)));
-  const int y0 = (std::max)(0, static_cast<int>(std::floor(r.y))), y1 = (std::min)(H, static_cast<int>(std::ceil(r.y + r.h)));
-  auto texel = [&](int x, int y, float p[4]) {  // premultiplied, transparent outside
-    if (x < 0 || y < 0 || x >= im.w || y >= im.h) {
-      p[0] = p[1] = p[2] = p[3] = 0;
-      return;
-    }
-    const uint8_t* s = &im.rgba[(static_cast<size_t>(y) * im.w + x) * 4];
-    const float a = s[3] / 255.0f;
-    p[0] = s[0] * a, p[1] = s[1] * a, p[2] = s[2] * a, p[3] = a;
-  };
-  for (int y = y0; y < y1; ++y) {
-    const float v = (y + 0.5f - r.y) * sy - 0.5f;
-    const int ty = static_cast<int>(std::floor(v));
-    const float fy = v - ty;
-    for (int x = x0; x < x1; ++x) {
-      const float u = (x + 0.5f - r.x) * sx - 0.5f;
-      const int tx = static_cast<int>(std::floor(u));
-      const float fx = u - tx;
-      float a[4], b[4], cc[4], d[4], p[4];
-      texel(tx, ty, a), texel(tx + 1, ty, b), texel(tx, ty + 1, cc), texel(tx + 1, ty + 1, d);
-      for (int i = 0; i < 4; ++i)
-        p[i] = (a[i] * (1 - fx) + b[i] * fx) * (1 - fy) + (cc[i] * (1 - fx) + d[i] * fx) * fy;
-      if (p[3] <= 0) continue;
-      uint8_t* dst = rgb + (static_cast<size_t>(y) * W + x) * 3;
-      for (int i = 0; i < 3; ++i) {
-        float o = p[i] + dst[i] * (1 - p[3]);
-        dst[i] = static_cast<uint8_t>(o < 0 ? 0 : (o > 255 ? 255 : o + 0.5f));
-      }
-    }
-  }
-}
-
 bool LoadResourcePng(int id, Image* out) {
   HMODULE mod = ThisModule();
   HRSRC res = FindResourceW(mod, MAKEINTRESOURCEW(id), MAKEINTRESOURCEW(10) /*RT_RCDATA*/);
@@ -228,13 +190,19 @@ bool Overlay::Ensure(IDirect3DDevice9* dev, const Image* img) {
   return true;
 }
 
-void Overlay::Draw(IDirect3DDevice9* dev, const Mark& m, Corner c) {
+void Overlay::Draw(IDirect3DDevice9* dev, const Mark& m, Corner c, int imageW, int imageH, int offX, int offY) {
   if (!dev || !m.image || !Ensure(dev, m.image.get())) return;
   IDirect3DSurface9 *bb = nullptr, *rt = nullptr;
   if (FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb))) return;
   D3DSURFACE_DESC d;
   bb->GetDesc(&d);
-  const Rect r = Place(m, static_cast<int>(d.Width), static_cast<int>(d.Height), c);
+  Rect r = Place(m, imageW, imageH, c);
+  r.x -= offX;
+  r.y -= offY;
+  if (r.x + r.w <= 0 || r.y + r.h <= 0 || r.x >= d.Width || r.y >= d.Height) {  // not in this part
+    bb->Release();
+    return;
+  }
   // Stream 0 and the render target are not in the recorded block (accum.cpp Draw, WidescreenFix postfxcore).
   IDirect3DVertexBuffer9* vb = nullptr;
   UINT offset = 0, stride = 0;

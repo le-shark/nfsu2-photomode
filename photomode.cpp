@@ -1,6 +1,7 @@
 // NFSU2 Photo Mode: controller (state machine, hooks, menu, camera, capture glue).
 #include <windows.h>
 #include <shlobj.h>
+#include <d3d9.h>
 
 #include <cmath>
 #include <cstdio>
@@ -675,10 +676,6 @@ void StartCapture() {
               g->cfg.antialias};
   p.shutterSec = lens::kShutters[g->shutterIdx];
   p.outPath = NewPicturePath();
-  if (g->watermark) {
-    p.mark = g->marks[g->watermark];
-    p.corner = g->wmCorner;
-  }
   if (p.sample.tiles > 1) {
     // 2x: supersampled in one pass (motion blur works); tiles only when the targets don't fit.
     const int w = 2 * g->accum.Width(), h = 2 * g->accum.Height();
@@ -916,10 +913,6 @@ HRESULT __stdcall EndSceneDetour(IDirect3DDevice9* dev) {
     g->frameArmed = false;
     // Read back only a resolve frame whose mean was really drawn (Render3D ran this frame).
     if (g->state == State::Capturing && dev == Device() && g->frame.shown) g->capture.OnEndScene(dev);
-    // The watermark on screen, after WidescreenFix's gamma as in the file. Not on resolve frames: they are read back
-    // above (the photo gets it blended in before saving, capture.cpp) and never presented.
-    if (g->state != State::Off && dev == Device() && !g->frame.resolve && g->watermark)
-      g->wmOverlay.Draw(dev, g->marks[g->watermark], g->wmCorner);
   }
   return oEndScene(dev);
 }
@@ -1104,6 +1097,28 @@ void __cdecl FrameDetour() {
   oFrame();
 }
 
+// The watermark goes into the finished 3D frame, under the menu (user 2026-10-20), after the sample was taken and the
+// mean drawn. A resolve frame is read back from this frame, so the photo carries it: at 2x (and with tiles) the
+// screen shows one quarter of the whole image, so the logo is placed in the whole image and shifted by the quarter.
+void DrawWatermark(IDirect3DDevice9* dev) {
+  if (g->state == State::Off || !g->watermark || !g->marks[g->watermark].image) return;
+  IDirect3DSurface9* bb = nullptr;
+  if (FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb))) return;
+  D3DSURFACE_DESC d;
+  bb->GetDesc(&d);
+  bb->Release();
+  int w = static_cast<int>(d.Width), h = static_cast<int>(d.Height), ox = 0, oy = 0;
+  const int tiles = g->capture.Params().sample.tiles;
+  if (g->state == State::Capturing && g->frame.resolve && tiles > 1) {
+    const int t = g->frame.region >= 0 ? g->frame.region : g->capture.Tile();  // quarter q at (q % 2, q / 2)
+    ox = (t % tiles) * w;
+    oy = (t / tiles) * h;
+    w *= tiles;
+    h *= tiles;
+  }
+  g->wmOverlay.Draw(dev, g->marks[g->watermark], g->wmCorner, w, h, ox, oy);
+}
+
 // Pre-FE point: the backbuffer holds the 3D scene + game post FX; the 2D pass 0x5CBF40(0) with the
 // mirror, letterbox and FE comes next (0x5D2B5A..0x5D2B60). Skipped by the game on frames without 3D.
 void __cdecl Render3DDetour() {
@@ -1125,7 +1140,7 @@ void __cdecl Render3DDetour() {
     oRender3D();
   }
   if (g->state == State::Off) return;
-  if (!g->accum.Created() || !g->accum.Ensure(dev)) return;  // created by the preview or StartCapture
+  if (!g->accum.Created() || !g->accum.Ensure(dev)) return DrawWatermark(dev);  // made by the preview or StartCapture
   Accum& acc = super ? g->bigAccum : g->accum;
   if (g->frame.sample) {
     acc.AddSample(dev);
@@ -1144,6 +1159,7 @@ void __cdecl Render3DDetour() {
     g->frame.hold = false;
   }
   if (g->frame.showHold) g->accum.ShowHold(dev);
+  DrawWatermark(dev);
 }
 
 // Any other mover that still targets the player camera gets our matrix instead.
