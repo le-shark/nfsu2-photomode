@@ -42,7 +42,8 @@ enum class State { Off, Active, Capturing };
 // distance, editable only in Manual. Quality left the menu to free the row: [Capture] DefaultQuality still sets it
 // and its code stays (lens.h kQualitySamples).
 // User 2026-10-19: Target is "Focus Target", above Focus Mode (it is also the orbit camera's car).
-enum Row { RowCamera, RowFocal, RowRoll, RowTarget, RowFocusMode, RowFocus, RowAperture, RowShutter, RowFollow, RowResolution, RowTake, RowCount };
+// User 2026-10-20: Drive (beta request), the last row: the menu scrolls to it (12 rows, 11 slots; u2sdk optmenu).
+enum Row { RowCamera, RowFocal, RowRoll, RowTarget, RowFocusMode, RowFocus, RowAperture, RowShutter, RowFollow, RowResolution, RowTake, RowDrive, RowCount };
 
 constexpr float kMinFocusM = 0.3f, kMaxFocusM = 500;
 constexpr float kBackGuardSec = 0.3f;
@@ -93,6 +94,8 @@ struct PhotoMode {
   CamPose captureCam{};         // camera and car when the shutter opened
   CarPose captureCar{};
   bool uiHidden = false;
+  bool driving = false;         // Drive: the world runs and the car takes the driving keys (StartDrive)
+  uint8_t savedShowcaseKeys = 0;
   bool openedBefore = false;    // Camera Mode, Focal Length and Roll are kept from the previous opening (Enter)
   // The camera when photo mode closed, relative to its car (SaveView / RestoreView).
   struct View {
@@ -517,6 +520,45 @@ void __cdecl SaveRegistryDetour() {
         g->saved.mbEnable);
 }
 
+// ---- drive -------------------------------------------------------------------------------------------
+// User 2026-10-20 (beta request), like the career Showcase photo shoot's Control Car (research
+// docs/research/2026-10-20-photomode-drive-and-scrolling.md): the world runs and the car drives while photo mode stays
+// open; the camera stays ours (Orbit follows the car, Free stays put), the menu is hidden, the preview is off.
+// - The freeze is released; the race coordinator stayed in state 4 under it, so the car is in its driving input mode.
+// - The keyboard gets the game's map back (u2sdk optmenu SetGameInput, 0x5B7ED0 with the saved byte) and byte
+//   0x836352 = 1, which the Showcase sets so the map selector 0x5CFBF0 picks its format 2: driving keys only, no
+//   pause, camera, HUD, engage, map or SMS keys (template 0x7FD330). (Its other readers 0x62118F, 0x630883, 0x630C29
+//   are not known; restored when driving stops.)
+// - The pause-key block 0x861E78 set by the menu stays, so pad Start does not pause either.
+constexpr uintptr_t kShowcaseKeys = 0x836352;
+
+void StartDrive() {
+  if (g->driving || g->state != State::Active || !g->cfg.drive) return;
+  g->driving = true;
+  g->savedShowcaseKeys = Var<uint8_t>(kShowcaseKeys);
+  Var<uint8_t>(kShowcaseKeys) = 1;
+  menu::SetHidden(true);
+  menu::SetGameInput(true);
+  freeze::Hold(false);
+  g->accum.Reset();
+  g->frame = {};
+  SetUncapped(false);
+  U2LOG("drive: on");
+}
+
+void StopDrive() {
+  if (!g->driving) return;
+  g->driving = false;
+  Var<uint8_t>(kShowcaseKeys) = g->savedShowcaseKeys;
+  freeze::Hold(true);
+  menu::SetGameInput(false);
+  g->accum.Reset();
+  g->stillTime = 0;
+  // The pad button that stopped it must not also reach the menu once it shows again.
+  g->backGuard = kBackGuardSec;
+  U2LOG("drive: off");
+}
+
 void FreeSupersample() {
   g->super.Free();
   g->bigAccum.Free();
@@ -527,6 +569,10 @@ void Exit(const char* why, bool byPlayer = false) {
   if (g->state == State::Off) return;
   const bool backToPause = byPlayer && g->fromPause && IsInGame();
   g->fromPause = false;
+  if (g->driving) {  // the freeze is set below either way
+    g->driving = false;
+    Var<uint8_t>(kShowcaseKeys) = g->savedShowcaseKeys;
+  }
   // Only in gameplay: after leaving it the cars may be gone (RestoreView then starts from the game camera).
   if (IsInGame()) SaveView();
   else g->view.valid = false;
@@ -559,6 +605,7 @@ void Exit(const char* why, bool byPlayer = false) {
 }
 
 void StartCapture() {
+  if (g->driving) return;  // stop driving first (the world is moving)
   if (!g->captureHooks) {
     Toast("Capture unavailable (see the log)");
     return;
@@ -671,13 +718,14 @@ void Adjust(int row, int dir) {
   }
 }
 
-bool IsActionRow(int row) { return row == RowTake; }
+bool IsActionRow(int row) { return row == RowTake || row == RowDrive; }
 // The focus distance is shown live in every mode but only editable in Manual (native disabled row: grey, skipped).
 bool IsRowEnabled(int row) { return row != RowFocus || g->focusMode == FocusMode::Manual; }
 
 void Activate(int row) {
   if (g->state != State::Active) return;
   if (row == RowTake) StartCapture();
+  else if (row == RowDrive) StartDrive();
   else Adjust(row, 1);
 }
 
@@ -685,7 +733,7 @@ void Activate(int row) {
 std::string RowLabel(int row) {
   static const char* names[RowCount] = {"Camera Mode", "Focal Length", "Roll",     "Focus Target",
                                         "Focus Mode", "Focus",        "Aperture", "Shutter Speed",
-                                        "Shutter Follow", "Resolution", "Take Picture"};
+                                        "Shutter Follow", "Resolution", "Take Picture", "Drive"};
   return row >= 0 && row < RowCount ? names[row] : "";
 }
 
@@ -728,15 +776,40 @@ void MenuBack() {
 }
 
 // ---- per-frame ------------------------------------------------------------------------------
+// While driving the keys and the pad drive the car: only the photo-mode key (close), the Drive key or Esc / pad Back
+// (stop driving) and mouse look are ours.
+void HandleDriveControls() {
+  Input& in = g->input;
+  if (in.KeyPressed(g->cfg.hotkey)) {
+    Exit("user", true);
+    return;
+  }
+  if (in.KeyPressed(g->cfg.driveKey) || in.KeyPressed(VK_ESCAPE) || in.PadPressed(PadBack)) {
+    StopDrive();
+    return;
+  }
+  RigInput ri;
+  float zoomScale = Clamp(35.f / Focal(), 0.15f, 1.5f);
+  ri.lookYawDeg = -in.MouseDX() * g->cfg.mouseSensitivity * zoomScale;
+  ri.lookPitchDeg = -in.MouseDY() * g->cfg.mouseSensitivity * zoomScale * (g->cfg.invertY ? -1.f : 1.f);
+  Vec3 range = g->rig.mode == RigMode::Free && g->rangeCar ? CarPosition(g->rangeCar) : g->anchor;
+  g->rig.Update(ri, 0, range);
+}
+
 void HandleControls(float dt) {
   Input& in = g->input;
   const PadState& pad = in.Pad();
+  if (g->driving) return HandleDriveControls();
 
   if (g->backGuard <= 0 && (in.KeyPressed(g->cfg.hotkey) || in.PadPressed(PadB))) {
     Exit("user", true);
     return;
   }
   if (in.KeyPressed('H') || in.PadPressed(PadY)) g->uiHidden = !g->uiHidden;
+  if (g->cfg.drive && in.KeyPressed(g->cfg.driveKey)) {
+    StartDrive();
+    return;
+  }
   if (in.KeyPressed(VK_SPACE) || in.PadPressed(PadX)) {
     StartCapture();
     return;
@@ -923,14 +996,20 @@ void Tick() {
     if (g->state == State::Active) {
       ApplyCamera(g->lastDt);
       if (g->focusMode == FocusMode::Aim) UpdateAim();
-      UpdatePreview(dt);
+      if (g->driving) {  // the world moves: no accumulation (it would ghost), no uncapped frames
+        g->accum.Reset();
+        g->frame = {};
+        SetUncapped(false);
+      } else {
+        UpdatePreview(dt);
+      }
     }
   }
   if (!menu::Open()) {
     Exit("menu unavailable");
     return;
   }
-  menu::SetHidden(g->uiHidden && g->state == State::Active);
+  menu::SetHidden((g->uiHidden && g->state == State::Active) || g->driving);
   menu::Update("Photo Mode", StatusText());
   g->lastDt = dt > 0 ? dt : g->lastDt;
 }
@@ -1088,7 +1167,7 @@ bool Install() {
     return false;  // created hooks are never enabled
   }
   // Footer: user 2026-10-19, "H - Hide/Show UI" at the bottom of the bar; 2026-10-20 "Space - Take Picture" next to it.
-  if (!menu::Install(menu::Callbacks{RowCount, &RowLabel, &RowValue, &Adjust, &Activate, &MenuBack, &IsActionRow, &IsRowEnabled,
+  if (!menu::Install(menu::Callbacks{g->cfg.drive ? RowCount : RowDrive, &RowLabel, &RowValue, &Adjust, &Activate, &MenuBack, &IsActionRow, &IsRowEnabled,
                                      "H - Hide/Show UI    Space - Take Picture"},
                      g->cfg.menuLayout, g->cfg.verbose))
     return false;

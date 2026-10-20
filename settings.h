@@ -11,6 +11,8 @@ struct Settings {
   int hotkey = 0x23;             // VK_END (user 2026-10-19: Tab may also be the game's message key in free roam)
   bool padCombo = true;          // L3 + R3 opens photo mode
   bool pauseMenuEntry = true;    // a "Photo Mode" icon in the game's pause menu (user 2026-10-20)
+  bool drive = true;             // the Drive row and key: drive the car while photo mode stays open (user 2026-10-20)
+  int driveKey = 'V';
   // [Camera]
   float moveSpeed = 6;           // m/s
   float mouseSensitivity = 0.12f;// degrees per mouse count
