@@ -12,6 +12,7 @@
 #include "capture.h"
 #include "follow.h"
 #include "lens.h"
+#include "pauseentry.h"
 #include "rig.h"
 #include "sampling.h"
 #include "supersample.h"
@@ -117,6 +118,7 @@ struct PhotoMode {
   bool endSceneHooked = false;
   bool captureHooks = false;  // EndScene and Present both hooked
   float postExitLog = 0;      // verbose: seconds left to log game state after exit
+  float pauseRequest = 0;     // seconds left to open photo mode after its pause-menu icon resumed the race
   POINT cursorAtEnter{};
 
   // GPU accumulation (live preview and capture)
@@ -822,6 +824,18 @@ void Tick() {
 
   if (g->postExitLog > 0) LogPostExit(dt);
   if (g->state == State::Off) {
+    // The pause-menu icon resumes the race as Resume Race does (pauseentry.cpp); open once the game has unpaused.
+    if (pause::TakeRequest()) g->pauseRequest = 3;
+    if (g->pauseRequest > 0) {
+      g->pauseRequest -= dt;
+      if (CanEnter()) {
+        g->pauseRequest = 0;
+        Enter();
+        return;
+      }
+      if (g->pauseRequest <= 0)
+        U2LOG("pause menu: photo mode not opened (flow=%d paused=%d)", GameFlowState(), IsGamePaused());
+    }
     // L3 + R3 (Start would also open the game's pause menu).
     bool combo = g->cfg.padCombo && g->input.PadDown(PadLS) && g->input.PadDown(PadRS) &&
                  (g->input.PadPressed(PadLS) || g->input.PadPressed(PadRS));
@@ -1039,6 +1053,8 @@ bool Install() {
       U2LOG("SaveRegistrySettings 0x5BEEA0: entry bytes differ (another mod?); not hooked");
     }
   }
+  // Optional: without it photo mode still opens with its key.
+  if (g->cfg.pauseMenuEntry && !pause::Install()) U2LOG("pause menu: no Photo Mode icon (see above)");
   if (!ok) {
     U2LOG("some hooks failed; photo mode disabled");
     return false;  // created hooks are never enabled

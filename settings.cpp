@@ -20,6 +20,7 @@ void Settings::Load() {
   U2LOG("settings: %s", ini.Path().c_str());
   if (int vk = u2::ParseVirtualKey(ini.GetString("PhotoMode", "Hotkey", "END"))) hotkey = vk;
   padCombo = ini.GetBool("PhotoMode", "GamepadCombo", padCombo);
+  pauseMenuEntry = ini.GetBool("PhotoMode", "PauseMenu", pauseMenuEntry);
 
   moveSpeed = ini.GetFloat("Camera", "MoveSpeed", moveSpeed);
   mouseSensitivity = ini.GetFloat("Camera", "MouseSensitivity", mouseSensitivity);
@@ -46,7 +47,7 @@ void Settings::Load() {
   menuLayout.backingAlpha = ini.GetInt("Menu", "BackingAlpha", menuLayout.backingAlpha);
 
   verbose = ini.GetBool("Debug", "Verbose", verbose);
-  U2LOG("settings: hotkey=0x%02X padCombo=%d move=%.1f sens=%.3f maxDist=%.0f out=%s", hotkey, padCombo, moveSpeed,
+  U2LOG("settings: hotkey=0x%02X padCombo=%d pauseMenu=%d move=%.1f sens=%.3f maxDist=%.0f out=%s", hotkey, padCombo, pauseMenuEntry, moveSpeed,
         mouseSensitivity, maxDistance, outputDir.c_str());
 }
 }  // namespace photomode
