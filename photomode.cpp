@@ -92,6 +92,15 @@ struct PhotoMode {
   CarPose captureCar{};
   bool uiHidden = false;
   bool openedBefore = false;    // Camera Mode, Focal Length and Roll are kept from the previous opening (Enter)
+  // The camera when photo mode closed, relative to its car (SaveView / RestoreView).
+  struct View {
+    bool valid = false;
+    Rig rig;
+    uint8_t* ref = nullptr;     // the car it was relative to; null = the player
+    uint8_t* target = nullptr;  // the Focus Target; null = the player
+    Vec3 carPos{};
+    float carHeading = 0;       // degrees
+  } view;
   std::string toast;
   float toastTime = 0;
   float backGuard = 0;          // seconds left in which Back/close keys are ignored
@@ -362,6 +371,50 @@ void ApplyCamera(float dt) {
 // Not while another ASI holds the freeze (the daylight tuner is open): its menu owns the options screen.
 bool CanEnter() { return IsInGame() && !IsGamePaused() && !IsNetworkSession() && Device() && !freeze::AnyHeld(); }
 
+// User 2026-10-20 (after the beta report on reset settings): the camera comes back where it was left, relative to its
+// car (the Focus Target, or in Free mode the car its range stayed around), turned with the car's heading. Height,
+// pitch and roll stay level with the world, so a car on a slope or on its roof does not tilt the view.
+float CarHeading(uint8_t* car) {
+  Vec3 axes[3];
+  CarAxes(car, axes);  // row 0 = forward (TargetCarPose)
+  return std::atan2(axes[0].y, axes[0].x) * kRadToDeg;
+}
+
+// The player or an active racer (u2::RacerCars includes the player). Pointers are only compared, never read.
+bool IsActiveCar(uint8_t* car) {
+  RacerCar cars[kMaxCars];
+  for (int i = 0, n = RacerCars(cars, kMaxCars); i < n; ++i)
+    if (cars[i].car == car) return true;
+  return false;
+}
+
+void SaveView() {
+  uint8_t* ref = g->rig.mode == RigMode::Free && g->rangeCar ? g->rangeCar : TargetCar();
+  if (!ref) {
+    g->view.valid = false;
+    return;
+  }
+  g->view = {true, g->rig, ref == PlayerCar() ? nullptr : ref, g->target, CarPosition(ref), CarHeading(ref)};
+}
+
+// False when there is nothing to restore or its car has left the race: the camera then starts at the game camera.
+bool RestoreView() {
+  const auto& v = g->view;
+  uint8_t* ref = v.ref ? v.ref : PlayerCar();
+  if (!v.valid || !ref || !IsActiveCar(ref)) return false;
+  g->target = v.target && IsActiveCar(v.target) ? v.target : nullptr;
+  UpdateAnchor();
+  const float turn = CarHeading(ref) - v.carHeading;
+  const Vec3 pos = CarPosition(ref);
+  g->rig = v.rig;
+  g->rig.maxDist = g->cfg.maxDistance;
+  g->rig.moveSpeed = g->cfg.moveSpeed;
+  g->rig.yaw += turn;
+  g->rig.eye = pos + RotateAxis(v.rig.eye - v.carPos, Vec3{0, 0, 1}, turn * kDegToRad);
+  g->rangeCar = g->rig.mode == RigMode::Free && ref != TargetCar() ? ref : nullptr;
+  return true;
+}
+
 void Enter() {
   g->rangeCar = nullptr;
   CameraParams* cam = PlayerCamera();
@@ -372,15 +425,17 @@ void Enter() {
   if (!UpdateAnchor()) g->anchor = ToVec3(cam->Position);
   g->rig.maxDist = g->cfg.maxDistance;
   g->rig.moveSpeed = g->cfg.moveSpeed;
-  // Beta feedback 2026-10-20 ("the camera settings reset everytime I deactivate it"): Camera Mode, Focal Length and
-  // Roll stay as they were left (the other rows always did); only the first opening takes the game camera's focal
-  // length. The camera itself still starts where the game's camera is.
+  // Beta feedback 2026-10-20 ("the camera settings reset everytime I deactivate it"): Camera Mode, Focal Length,
+  // Roll and the camera itself (RestoreView) stay as they were left (the other rows always did); only the first
+  // opening takes the game camera's focal length. Without a view to restore the camera starts at the game's.
   const float roll = g->rig.roll;
-  g->rig.InitFromCamera(ToVec3(cam->Position), ToVec3(cam->Direction), g->anchor);
   float focal = GameFovToFocal(cam->FieldOfView, FovCal());
-  if (g->openedBefore) {
+  const bool restored = RestoreView();
+  if (!restored) {
+    g->rig.InitFromCamera(ToVec3(cam->Position), ToVec3(cam->Direction), g->anchor);
     g->rig.roll = roll;
-  } else {
+  }
+  if (!g->openedBefore) {
     g->focalIdx = lens::Closest(lens::kFocals, focal);
     g->openedBefore = true;
   }
@@ -401,9 +456,10 @@ void Enter() {
   g->state = State::Active;
   ApplyCamera(0);
   // Camera::StopUpdating (set only by mods such as ExOpts) makes SetCameraMatrix ignore us.
-  U2LOG("enter: cam pos (%.1f %.1f %.1f) dir (%.2f %.2f %.2f) fov %u (%.0fmm) car (%.1f %.1f %.1f) stopUpdating=%d",
+  U2LOG("enter: cam pos (%.1f %.1f %.1f) dir (%.2f %.2f %.2f) fov %u (%.0fmm) car (%.1f %.1f %.1f) stopUpdating=%d view %s",
         cam->Position.x, cam->Position.y, cam->Position.z, cam->Direction.x, cam->Direction.y, cam->Direction.z,
-        cam->FieldOfView, focal, g->anchor.x, g->anchor.y, g->anchor.z, Var<int>(addr::CameraStopUpdating));
+        cam->FieldOfView, focal, g->anchor.x, g->anchor.y, g->anchor.z, Var<int>(addr::CameraStopUpdating),
+        restored ? "restored" : "from the game camera");
 }
 
 // Screen-space effects that break at 2x (verified-in-binary.md "What changes on paused frames"):
@@ -462,6 +518,9 @@ void FreeSupersample() {
 
 void Exit(const char* why) {
   if (g->state == State::Off) return;
+  // Only in gameplay: after leaving it the cars may be gone (RestoreView then starts from the game camera).
+  if (IsInGame()) SaveView();
+  else g->view.valid = false;
   g->capture.Abort("photo mode closed");
   g->frame = {};
   g->accum.Free();  // the targets are recreated on the next enter
