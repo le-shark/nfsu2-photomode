@@ -17,6 +17,10 @@
 //   blocks 0x5004C0 / 0x5012C0, sets Career+0x7138 and posts event 7 with the port, 0x602C56..0x602C62). The port is
 //   the one that paused, RaceCoordinator+0x20 (written by the state-4 event 7 handler, native-screen.md 2.1); the
 //   player is the one of 0x8900AC / 0x8900B0 whose +8 equals it, as 0x4A7BF0 picks it.
+// - That pause menu opens on our icon (user 2026-10-20). Setup 0x4D9300 always starts on the first icon: it sets the
+//   last button to 0 (0x4D9391) and passes it to the scroller's SetInitialPos (menu+0x4C, vtable +0x20, an index in
+//   the order the icons were added; ExOpts LanguageSelectScreen.h:205-209, career hub.cpp), then Update (+4), then
+//   tail-calls RefreshHeader (0x4D93BC). Our RefreshHeader hook does the same two calls with our icon's index first.
 #include "pauseentry.h"
 
 #include <cstdint>
@@ -50,6 +54,11 @@ AddOptionFn oAddOption = nullptr;
 RefreshFn oRefresh = nullptr;
 bool g_request = false;
 int g_port = 0;  // the port that paused, read when the icon is selected
+// Icon count of the pause menu being built (AddOption), our icon's index in it, and whether the next pause menu
+// should open on it. A RefreshHeader call ends the building: Setup calls it last.
+void* g_menu = nullptr;
+int g_count = 0, g_ourIndex = -1;
+bool g_built = true, g_selectOurs = false;
 
 constexpr uintptr_t kPlayers = 0x8900AC, kPauseJoyHandler = 0x602BD0, kPauseKeyBlock = 0x861E78;
 constexpr uint32_t kJoyPause = 0xBD;
@@ -70,13 +79,22 @@ int __fastcall AddOptionDetour(void* menu, void* edx, void* opt) {
   // Read before the call: AddOption may free the option when there is no slot.
   bool afterOptions = opt && menu && *static_cast<uintptr_t*>(opt) == kOptionsOptVtbl &&
                       *static_cast<uintptr_t*>(menu) == kPauseVtbl;
+  const bool pause = menu && *static_cast<uintptr_t*>(menu) == kPauseVtbl;
+  if (pause && (g_built || menu != g_menu)) {
+    g_menu = menu;
+    g_count = 0;
+    g_ourIndex = -1;
+    g_built = false;
+  }
   int r = oAddOption(menu, edx, opt);
+  if (pause && r) ++g_count;
   if (afterOptions && u2::IsInGame() && !u2::IsNetworkSession()) {
     if (void* o = GameMalloc(0x48)) {
       IconOption_ctor(o, nullptr, kIconShowcase, kScShowcase, 0);
       *static_cast<void**>(o) = g_vtbl;
       AddOptionFn add = *reinterpret_cast<AddOptionFn*>(*static_cast<uint8_t**>(menu) + 0x18);  // slot 6, as 0x4C2A7D
       int s = add(menu, nullptr, o);
+      if (s) g_ourIndex = g_count++;
       U2LOG("pause menu: Photo Mode icon %s", s ? "added" : "NO SLOT (deleted by the game)");
     }
   }
@@ -84,8 +102,21 @@ int __fastcall AddOptionDetour(void* menu, void* edx, void* opt) {
 }
 
 void __fastcall RefreshDetour(void* menu, void* edx) {
+  const bool pause = menu && *static_cast<uintptr_t*>(menu) == kPauseVtbl;
+  if (pause && !g_built) {  // Setup's last call: the icons are all in
+    g_built = true;
+    if (g_selectOurs && menu == g_menu && g_ourIndex >= 0) {
+      using PosFn = void(__fastcall*)(void*, void*, int);
+      using UpdFn = void(__fastcall*)(void*, void*);
+      uint8_t* scroller = static_cast<uint8_t*>(menu) + 0x4C;
+      (*reinterpret_cast<PosFn*>(*reinterpret_cast<uint8_t**>(scroller) + 0x20))(scroller, nullptr, g_ourIndex);
+      (*reinterpret_cast<UpdFn*>(*reinterpret_cast<uint8_t**>(scroller) + 4))(scroller, nullptr);
+      U2LOG("pause menu: opened on Photo Mode (icon %d of %d)", g_ourIndex + 1, g_count);
+    }
+    g_selectOurs = false;
+  }
   oRefresh(menu, edx);
-  if (!menu || *static_cast<uintptr_t*>(menu) != kPauseVtbl) return;
+  if (!pause) return;
   void* label = *reinterpret_cast<void**>(static_cast<uint8_t*>(menu) + 0x134);
   if (IsOurs(CurrentOption(menu)) && label) FEngPrintf(label, "%s", "Photo Mode");
 }
@@ -118,6 +149,7 @@ bool ReopenPauseMenu() {
     auto p = reinterpret_cast<uint8_t**>(kPlayers)[i];
     if (!p || *reinterpret_cast<int*>(p + 8) != g_port) continue;
     using JoyFn = void(__fastcall*)(void*, void*, int, uint32_t, uint32_t);
+    g_selectOurs = true;
     Fn<JoyFn>(kPauseJoyHandler)(p, nullptr, g_port, kJoyPause, 0);
     U2LOG("pause menu: back to the pause menu (port %d)", g_port);
     return true;
