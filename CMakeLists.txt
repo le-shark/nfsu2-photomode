@@ -18,6 +18,10 @@ u2_add_script(photomode NFSU2PhotoMode
   capture.cpp
   accum.cpp
   supersample.cpp
+  watermark.cpp
   photomode.rc
   ${SHADER_HEADERS})
 target_include_directories(photomode PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+# The resource script embeds the built-in watermark PNGs: rebuild it when they change.
+set_source_files_properties(photomode.rc PROPERTIES OBJECT_DEPENDS
+  "${CMAKE_CURRENT_SOURCE_DIR}/nfsplanet_watermark.png;${CMAKE_CURRENT_SOURCE_DIR}/nfs.png")

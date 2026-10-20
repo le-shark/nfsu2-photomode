@@ -16,6 +16,8 @@
 #include "rig.h"
 #include "sampling.h"
 #include "supersample.h"
+#include "watermark.h"
+#include "watermark_res.h"
 #include "settings.h"
 #include "u2sdk/optmenu.h"
 #include "u2sdk/d3d.h"
@@ -43,7 +45,9 @@ enum class State { Off, Active, Capturing };
 // and its code stays (lens.h kQualitySamples).
 // User 2026-10-19: Target is "Focus Target", above Focus Mode (it is also the orbit camera's car).
 // User 2026-10-20: Drive (beta request), the last row: the menu scrolls to it (12 rows, 11 slots; u2sdk optmenu).
-enum Row { RowCamera, RowFocal, RowRoll, RowTarget, RowFocusMode, RowFocus, RowAperture, RowShutter, RowFollow, RowResolution, RowTake, RowDrive, RowCount };
+// User 2026-10-20: Watermark (default None) and Watermark Pos. (disabled while None), before Take Picture.
+enum Row { RowCamera, RowFocal, RowRoll, RowTarget, RowFocusMode, RowFocus, RowAperture, RowShutter, RowFollow, RowResolution,
+           RowWatermark, RowWatermarkPos, RowTake, RowDrive, RowCount };
 
 constexpr float kMinFocusM = 0.3f, kMaxFocusM = 500;
 constexpr float kBackGuardSec = 0.3f;
@@ -94,6 +98,12 @@ struct PhotoMode {
   CamPose captureCam{};         // camera and car when the shutter opened
   CarPose captureCar{};
   bool uiHidden = false;
+  // Watermarks (watermark.h): 0 None, 1 NFS-Planet, 2 NFS (both inside the ASI), 3 Custom (WATERMARK.png next to it).
+  int watermark = 0;
+  watermark::Corner wmCorner = watermark::Corner::BottomRight;
+  watermark::Mark marks[4];
+  bool builtinsLoaded = false;
+  watermark::Overlay wmOverlay;
   bool driving = false;         // Drive: the world runs and the car takes the driving keys (StartDrive)
   uint8_t savedShowcaseKeys = 0;
   int finishAtDrive = 0;        // the player's finish tick when driving started (PlayerFinishTick)
@@ -426,7 +436,35 @@ bool RestoreView() {
   return true;
 }
 
+// ---- watermarks ---------------------------------------------------------------------------------
+// User 2026-10-20: each logo at its own pixel size on a 1080-high image (scaled with the image height); margins:
+// NFS-Planet a little (10), NFS and Custom some (24). The built-ins are decoded once; WATERMARK.png (any case: the file
+// system ignores it) next to the ASI is looked for each time photo mode opens, so it can be added or changed in game.
+constexpr const char* kWatermarkNames[] = {"None", "NFS-Planet", "NFS", "Custom"};
+bool WatermarkAvailable(int i) { return i == 0 || (i > 0 && i < 4 && g->marks[i].image); }
+
+void LoadWatermarks() {
+  using namespace watermark;
+  if (!g->builtinsLoaded) {
+    g->builtinsLoaded = true;
+    auto planet = std::make_shared<Image>(), nfs = std::make_shared<Image>();
+    if (LoadResourcePng(IDR_WM_NFSPLANET, planet.get())) g->marks[1] = {planet, 1, 10};
+    if (LoadResourcePng(IDR_WM_NFS, nfs.get())) g->marks[2] = {nfs, 1, 24};
+  }
+  const std::wstring path = ModuleDir() + L"WATERMARK.png";
+  auto custom = std::make_shared<Image>();
+  if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES && LoadFilePng(path, custom.get())) {
+    g->marks[3] = {custom, 1, 24};
+    U2LOG("watermark: custom WATERMARK.png %dx%d", custom->w, custom->h);
+  } else {
+    if (g->marks[3].image) U2LOG("watermark: custom WATERMARK.png gone or unreadable");
+    g->marks[3] = {};
+  }
+  if (!WatermarkAvailable(g->watermark)) g->watermark = 0;
+}
+
 void Enter() {
+  LoadWatermarks();
   g->rangeCar = nullptr;
   CameraParams* cam = PlayerCamera();
   g->saved = Saved{Var<float>(addr::GameSpeed), Var<int>(addr::g_DepthOfFieldEnable), Var<int>(addr::g_MotionBlurEnable),
@@ -592,6 +630,7 @@ void Exit(const char* why, bool byPlayer = false) {
   g->capture.Abort("photo mode closed");
   g->frame = {};
   g->accum.Free();  // the targets are recreated on the next enter
+  g->wmOverlay.Free();
   RestoreCaptureEffects();
   FreeSupersample();
   SetUncapped(false);
@@ -636,6 +675,10 @@ void StartCapture() {
               g->cfg.antialias};
   p.shutterSec = lens::kShutters[g->shutterIdx];
   p.outPath = NewPicturePath();
+  if (g->watermark) {
+    p.mark = g->marks[g->watermark];
+    p.corner = g->wmCorner;
+  }
   if (p.sample.tiles > 1) {
     // 2x: supersampled in one pass (motion blur works); tiles only when the targets don't fit.
     const int w = 2 * g->accum.Width(), h = 2 * g->accum.Height();
@@ -727,13 +770,27 @@ void Adjust(int row, int dir) {
     case RowShutter: g->shutterIdx = ClampInt(g->shutterIdx + dir, 0, lens::Count(lens::kShutters) - 1); break;
     case RowFollow: g->follow = static_cast<Follow>(Wrap(static_cast<int>(g->follow) + dir, static_cast<int>(Follow::Count))); break;
     case RowResolution: g->tiles = ClampInt(g->tiles + dir, 1, lens::kMaxTiles); break;
+    case RowWatermark:
+      for (int i = Wrap(g->watermark + dir, 4); ; i = Wrap(i + dir, 4))
+        if (WatermarkAvailable(i)) {
+          g->watermark = i;
+          break;
+        }
+      break;
+    case RowWatermarkPos:  // Pos. only matters with a watermark (IsRowEnabled)
+      if (g->watermark) g->wmCorner = static_cast<watermark::Corner>(Wrap(static_cast<int>(g->wmCorner) + dir, 4));
+      break;
     default: break;
   }
 }
 
 bool IsActionRow(int row) { return row == RowTake || row == RowDrive; }
 // The focus distance is shown live in every mode but only editable in Manual (native disabled row: grey, skipped).
-bool IsRowEnabled(int row) { return row != RowFocus || g->focusMode == FocusMode::Manual; }
+bool IsRowEnabled(int row) {
+  if (row == RowFocus) return g->focusMode == FocusMode::Manual;
+  if (row == RowWatermarkPos) return g->watermark != 0;
+  return true;
+}
 
 void Activate(int row) {
   if (g->state != State::Active) return;
@@ -746,7 +803,8 @@ void Activate(int row) {
 std::string RowLabel(int row) {
   static const char* names[RowCount] = {"Camera Mode", "Focal Length", "Roll",     "Focus Target",
                                         "Focus Mode", "Focus",        "Aperture", "Shutter Speed",
-                                        "Shutter Follow", "Resolution", "Take Picture", "Drive"};
+                                        "Shutter Follow", "Resolution", "Watermark", "Watermark Pos.",
+                                        "Take Picture", "Drive"};
   return row >= 0 && row < RowCount ? names[row] : "";
 }
 
@@ -769,6 +827,8 @@ std::string RowValue(int row) {
     case RowShutter: return lens::kShutterNames[g->shutterIdx];
     case RowFollow: return FollowName(g->follow);
     case RowResolution: std::snprintf(b, sizeof b, "%dx", g->tiles); break;
+    case RowWatermark: return kWatermarkNames[g->watermark];
+    case RowWatermarkPos: return watermark::CornerName(g->wmCorner);
     default: break;
   }
   return b;
@@ -856,6 +916,10 @@ HRESULT __stdcall EndSceneDetour(IDirect3DDevice9* dev) {
     g->frameArmed = false;
     // Read back only a resolve frame whose mean was really drawn (Render3D ran this frame).
     if (g->state == State::Capturing && dev == Device() && g->frame.shown) g->capture.OnEndScene(dev);
+    // The watermark on screen, after WidescreenFix's gamma as in the file. Not on resolve frames: they are read back
+    // above (the photo gets it blended in before saving, capture.cpp) and never presented.
+    if (g->state != State::Off && dev == Device() && !g->frame.resolve && g->watermark)
+      g->wmOverlay.Draw(dev, g->marks[g->watermark], g->wmCorner);
   }
   return oEndScene(dev);
 }
@@ -1134,6 +1198,7 @@ void __fastcall FeRenderDetour(void* feng, void* edx) {
 void OnDeviceReset() {
   g->capture.Abort("device reset");
   g->accum.Free();  // DEFAULT-pool targets must be released before the game's Reset
+  g->wmOverlay.Free();
   FreeSupersample();
   g->frame = {};
   SetUncapped(false);

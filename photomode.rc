@@ -1,5 +1,10 @@
 #include <winver.h>
 #include "version.h"
+#include "watermark_res.h"
+
+// Built-in watermarks (user 2026-10-20): everything ships inside the ASI.
+IDR_WM_NFSPLANET RCDATA "nfsplanet_watermark.png"
+IDR_WM_NFS RCDATA "nfs.png"
 
 VS_VERSION_INFO VERSIONINFO
 FILEVERSION PHOTOMODE_VERSION_NUM

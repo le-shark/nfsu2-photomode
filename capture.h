@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "sampling.h"
+#include "watermark.h"
 #include "u2sdk/u2math.h"
 
 struct IDirect3DDevice9;
@@ -22,6 +23,8 @@ struct CaptureParams {
   bool supersample = false; // 2x: one pass into a 2W x 2H target (supersample.h), resolved in quarters
   float shutterSec = 0;     // 0 = no motion blur
   std::string outPath;      // full path of the .png
+  watermark::Mark mark;     // blended into the image before it is written (no image = none)
+  watermark::Corner corner = watermark::Corner::BottomRight;
 };
 
 // What the controller does this frame.
