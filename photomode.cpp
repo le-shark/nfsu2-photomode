@@ -81,7 +81,8 @@ struct PhotoMode {
   Saved saved{};
 
   // menu values
-  int focalIdx = 10, fstopIdx = lens::kDefaultFStop, shutterIdx = 0, qualityIdx = 1, tiles = 1;
+  float focalMm = 50;  // any whole mm between the table's ends (lens::StepFocal)
+  int fstopIdx = lens::kDefaultFStop, shutterIdx = 0, qualityIdx = 1, tiles = 1;
   FocusMode focusMode = FocusMode::Closest;  // user 2026-10-19: default Closest
   float focusDist = 5;
   float aimDist = 10;           // last aim hit; kept while the ray hits nothing
@@ -163,7 +164,7 @@ PresentFn oPresent;
 
 // ---- helpers --------------------------------------------------------------------------------
 float FovCal() { return g->cfg.fovCalibration > 0 ? g->cfg.fovCalibration : kDefaultVertFovScale; }
-float Focal() { return lens::kFocals[g->focalIdx]; }
+float Focal() { return g->focalMm; }
 float FStop() { return lens::kFStops[g->fstopIdx]; }
 
 void Toast(const std::string& s, float seconds = 3) {
@@ -441,7 +442,7 @@ void Enter() {
     g->rig.roll = roll;
   }
   if (!g->openedBefore) {
-    g->focalIdx = lens::Closest(lens::kFocals, focal);
+    g->focalMm = lens::kFocals[lens::Closest(lens::kFocals, focal)];
     g->openedBefore = true;
   }
   g->uiHidden = false;
@@ -647,7 +648,8 @@ void Adjust(int row, int dir) {
       g->rig.SetMode(g->rig.mode == RigMode::Orbit ? RigMode::Free : RigMode::Orbit, g->anchor);
       g->rangeCar = nullptr;  // a new Free mode starts around the target; Orbit circles the target
       break;
-    case RowFocal: g->focalIdx = ClampInt(g->focalIdx + dir, 0, lens::Count(lens::kFocals) - 1); break;
+    // Ctrl: fine steps (user 2026-10-20), for the menu's Left / Right and the wheel alike.
+    case RowFocal: g->focalMm = lens::StepFocal(g->focalMm, dir, g->input.KeyDown(VK_CONTROL)); break;
     case RowRoll: g->rig.roll = Clamp(std::round(g->rig.roll) + dir, -kMaxRoll, kMaxRoll); break;
     case RowFocusMode: {
       FocusMode prev = g->focusMode;

@@ -33,6 +33,29 @@ inline int Closest(const float (&t)[N], float v) {
   return best;
 }
 
+// One focal length step (user 2026-10-20: finer control without making the usual zoom slower). A normal step goes to
+// the next lens of kFocals in that direction (from a value between two lenses, to the nearer one that way); a fine
+// step (Ctrl) is about 2 %, rounded to whole millimetres and at least 1 mm. Kept within the table's ends.
+inline float StepFocal(float mm, int dir, bool fine) {
+  const int n = Count(kFocals);
+  const float lo = kFocals[0], hi = kFocals[n - 1];
+  float next = mm;
+  if (fine) {
+    float d = std::round(mm * 0.02f);
+    if (d < 1) d = 1;
+    next = std::round(mm) + (dir > 0 ? d : -d);
+  } else if (dir > 0) {
+    next = hi;
+    for (int i = 0; i < n; ++i)
+      if (kFocals[i] > mm + 0.01f) { next = kFocals[i]; break; }
+  } else if (dir < 0) {
+    next = lo;
+    for (int i = n - 1; i >= 0; --i)
+      if (kFocals[i] < mm - 0.01f) { next = kFocals[i]; break; }
+  }
+  return next < lo ? lo : (next > hi ? hi : next);
+}
+
 inline void FormatFStop(char* buf, size_t n, float f) {
   if (f <= 0) std::snprintf(buf, n, "Off");
   else if (f < 10) std::snprintf(buf, n, "F/%.1f", f);

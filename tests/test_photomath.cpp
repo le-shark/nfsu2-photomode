@@ -97,6 +97,20 @@ TEST(LensAperture) {
   CHECK_NEAR(lens::ApertureRadiusM(50, 0), 0, 1e-9);
 }
 
+TEST(FocalSteps) {
+  CHECK_NEAR(lens::StepFocal(50, 1, false), 60, 1e-4);   // next lens
+  CHECK_NEAR(lens::StepFocal(50, -1, false), 40, 1e-4);
+  CHECK_NEAR(lens::StepFocal(73, 1, false), 85, 1e-4);   // between lenses: the next one that way
+  CHECK_NEAR(lens::StepFocal(73, -1, false), 70, 1e-4);
+  CHECK_NEAR(lens::StepFocal(50, 1, true), 51, 1e-4);    // fine: 2 %, at least 1 mm
+  CHECK_NEAR(lens::StepFocal(200, 1, true), 204, 1e-4);
+  CHECK_NEAR(lens::StepFocal(200, -1, true), 196, 1e-4);
+  CHECK_NEAR(lens::StepFocal(10, 1, true), 11, 1e-4);
+  CHECK_NEAR(lens::StepFocal(300, 1, false), 300, 1e-4);  // ends
+  CHECK_NEAR(lens::StepFocal(10, -1, true), 10, 1e-4);
+  CHECK_NEAR(lens::StepFocal(299, 1, true), 300, 1e-4);
+}
+
 TEST(LensTables) {
   CHECK(lens::Closest(lens::kFocals, 52) == 10);  // 50 mm
   CHECK(lens::Count(lens::kShutters) == lens::Count(lens::kShutterNames));
