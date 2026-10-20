@@ -96,8 +96,6 @@ struct PhotoMode {
   bool uiHidden = false;
   bool driving = false;         // Drive: the world runs and the car takes the driving keys (StartDrive)
   uint8_t savedShowcaseKeys = 0;
-  CarPose driveCarPrev{};       // Free mode while driving: the car's pose last frame (FollowDrivenCar)
-  bool driveFollow = false;
   int finishAtDrive = 0;        // the player's finish tick when driving started (PlayerFinishTick)
   bool openedBefore = false;    // Camera Mode, Focal Length and Roll are kept from the previous opening (Enter)
   // The camera when photo mode closed, relative to its car (SaveView / RestoreView).
@@ -531,8 +529,9 @@ void __cdecl SaveRegistryDetour() {
 // - The freeze is released; the race coordinator stayed in state 4 under it, so the car is in its driving input mode.
 // - The keyboard gets the game's map back (u2sdk optmenu SetGameInput, 0x5B7ED0 with the saved byte) and byte
 //   0x836352 = 1, which the Showcase sets so the map selector 0x5CFBF0 picks its format 2: driving keys only, no
-//   pause, camera, HUD, engage, map or SMS keys (template 0x7FD330). (Its other readers 0x62118F, 0x630883, 0x630C29
-//   are not known; restored when driving stops.)
+//   pause, camera, HUD, engage, map or SMS keys (template 0x7FD330). Its other readers (0x62118F, 0x630883, 0x630C29,
+//   CarRenderInfo::Render) only draw racers at full detail and with their real trunk audio parts; wheels are not
+//   affected (verified-in-binary.md "Showcase byte 0x836352"). Restored when driving stops.
 // - The pause-key block 0x861E78 set by the menu stays, so pad Start does not pause either.
 constexpr uintptr_t kShowcaseKeys = 0x836352;
 
@@ -545,24 +544,9 @@ int PlayerFinishTick() {
   return p ? *reinterpret_cast<int*>(p + 0x50) : 0;
 }
 
-// Free mode while driving (user 2026-10-20): the camera moves with the player's car as Shutter Follow "Rig" does
-// during an exposure (follow.h, rigidly attached), applied frame to frame so mouse look still turns it.
-void FollowDrivenCar() {
-  uint8_t* car = PlayerCar();
-  if (!car) return;
-  CarPose now = PoseOf(car, CarPosition(car));
-  if (g->driveFollow) {
-    CamPose p = FollowPose(Follow::Rig, RigPose(), g->driveCarPrev, now);
-    g->rig.SetPose(p.eye, p.fwd, p.up, g->anchor);
-  }
-  g->driveCarPrev = now;
-  g->driveFollow = true;
-}
-
 void StartDrive() {
   if (g->driving || g->state != State::Active || !g->cfg.drive) return;
   g->driving = true;
-  g->driveFollow = false;
   g->finishAtDrive = PlayerFinishTick();
   g->savedShowcaseKeys = Var<uint8_t>(kShowcaseKeys);
   Var<uint8_t>(kShowcaseKeys) = 1;
@@ -821,8 +805,7 @@ void HandleDriveControls() {
   float zoomScale = Clamp(35.f / Focal(), 0.15f, 1.5f);
   ri.lookYawDeg = -in.MouseDX() * g->cfg.mouseSensitivity * zoomScale;
   ri.lookPitchDeg = -in.MouseDY() * g->cfg.mouseSensitivity * zoomScale * (g->cfg.invertY ? -1.f : 1.f);
-  uint8_t* player = PlayerCar();  // Free mode rides along with it (FollowDrivenCar)
-  Vec3 range = g->rig.mode == RigMode::Free && player ? CarPosition(player) : g->anchor;
+  Vec3 range = g->rig.mode == RigMode::Free && g->rangeCar ? CarPosition(g->rangeCar) : g->anchor;
   g->rig.Update(ri, 0, range);
 }
 
@@ -1029,7 +1012,6 @@ void Tick() {
         Exit("race finished while driving");
         return;
       }
-      if (g->rig.mode == RigMode::Free) FollowDrivenCar();
     }
     if (g->state == State::Active) {
       ApplyCamera(g->lastDt);
