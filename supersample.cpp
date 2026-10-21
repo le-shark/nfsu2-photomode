@@ -78,6 +78,11 @@ bool Supersample::Create(IDirect3DDevice9* dev, int w, int h, bool intzDepth) {
   for (Swap& s : swaps_) {
     if (!Var<void*>(s.texAddr)) continue;  // the game didn't create it (effect off): nothing to swap
     if (s.texAddr != addr::StreakTexture && !needPair) continue;
+    // Already this size (1x photos with FSAA): the game's own buffer fits our depth and keeps its streak history.
+    D3DSURFACE_DESC gd;
+    if (SUCCEEDED(static_cast<IDirect3DTexture9*>(Var<void*>(s.texAddr))->GetLevelDesc(0, &gd)) &&
+        static_cast<int>(gd.Width) == w && static_cast<int>(gd.Height) == h)
+      continue;
     if (!CreateSwap(dev, s)) {
       Free();
       return false;

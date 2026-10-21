@@ -181,6 +181,8 @@ struct PhotoMode {
   // 2x photos: the 3D pass renders into a 2W x 2H target; its own accumulator at that size.
   Supersample super;
   Accum bigAccum{"accum2x"};
+  // 1x capture with in-game FSAA: sample frames render into `super` at screen size, without MSAA (StartCapture).
+  bool flat = false;
   int savedStreaks = -1, savedFog = -1, savedRain = -1;  // -1 = not changed
   bool rezeroNativeFx = false;  // a device reset put the player's DOF/MB flags back; zero them again
   SampleKey accKey{};          // what the accumulated image shows
@@ -756,7 +758,18 @@ void StopDrive() {
   U2LOG("drive: off");
 }
 
+// In-game FSAA on: the backbuffer is multisampled.
+bool BackBufferMultisampled() {
+  IDirect3DSurface9* bb = nullptr;
+  if (!Device() || FAILED(Device()->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb))) return false;
+  D3DSURFACE_DESC d;
+  const bool ms = SUCCEEDED(bb->GetDesc(&d)) && d.MultiSampleType != D3DMULTISAMPLE_NONE;
+  bb->Release();
+  return ms;
+}
+
 void FreeSupersample() {
+  g->flat = false;
   g->super.Free();
   g->bigAccum.Free();
 }
@@ -843,6 +856,16 @@ void StartCapture() {
         Toast("Capture failed: not enough video memory for 2x motion blur");
         return;
       }
+    }
+  } else if (BackBufferMultisampled()) {
+    // User 2026-10-21 ("don't like" the top line of 1x photos): with MSAA the game's full-screen post-FX quads (clip
+    // +-1, verified-in-binary.md "Full-screen post-FX quads") leave the top/left half of row 0 and column 0 unwritten,
+    // so those samples keep the image from before bleach. Rendered without MSAA, as 2x photos are, every pixel is
+    // covered (FSAA-off and 2x photos measured clean). The jittered samples still smooth the edges.
+    g->flat = g->super.Create(Device(), g->accum.Width(), g->accum.Height());
+    if (!g->flat) {
+      FreeSupersample();
+      U2LOG("capture: no screen-size target; 1x photo with in-game FSAA (top row / left column)");
     }
   }
   std::string err;
@@ -1358,10 +1381,11 @@ void __cdecl Render3DDetour() {
     DrawOverlays(dev);
     return;
   }
-  if (super && (g->frame.sample || g->frame.warm)) {
+  const bool flat = g->state == State::Capturing && g->flat && g->super.Ready();
+  if ((super || flat) && (g->frame.sample || g->frame.warm)) {
     g->super.Begin(dev);
     oRender3D();
-    if (g->frame.sample) g->bigAccum.AddSample(dev);
+    if (g->frame.sample) (super ? g->bigAccum : g->accum).AddSample(dev);
     const bool warm = g->frame.warm;
     g->frame.sample = g->frame.warm = false;
     g->super.End(dev);
