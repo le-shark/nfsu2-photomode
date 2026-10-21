@@ -10,7 +10,7 @@ namespace photomode {
 using u2::Var;
 namespace addr = u2::addr;
 
-bool Supersample::Create(IDirect3DDevice9* dev, int w, int h) {
+bool Supersample::Create(IDirect3DDevice9* dev, int w, int h, bool intzDepth) {
   Free();
   D3DCAPS9 caps{};
   IDirect3DSurface9* bb = nullptr;
@@ -27,7 +27,13 @@ bool Supersample::Create(IDirect3DDevice9* dev, int w, int h) {
   }
   // Same format as the backbuffer (the post FX use its alpha); no MSAA: supersampling replaces it.
   HRESULT hr = dev->CreateRenderTarget(w, h, d.Format, D3DMULTISAMPLE_NONE, 0, FALSE, &rt_, nullptr);
-  if (SUCCEEDED(hr)) hr = dev->CreateDepthStencilSurface(w, h, D3DFMT_D24S8, D3DMULTISAMPLE_NONE, 0, FALSE, &ds_, nullptr);
+  if (SUCCEEDED(hr) && intzDepth) {  // as daylight/depth.cpp Ensure
+    hr = dev->CreateTexture(w, h, 1, D3DUSAGE_DEPTHSTENCIL, static_cast<D3DFORMAT>(MAKEFOURCC('I', 'N', 'T', 'Z')),
+                            D3DPOOL_DEFAULT, &dsTex_, nullptr);
+    if (SUCCEEDED(hr)) hr = dsTex_->GetSurfaceLevel(0, &ds_);
+  } else if (SUCCEEDED(hr)) {
+    hr = dev->CreateDepthStencilSurface(w, h, D3DFMT_D24S8, D3DMULTISAMPLE_NONE, 0, FALSE, &ds_, nullptr);
+  }
   if (FAILED(hr)) {
     U2LOG("supersample: %dx%d targets failed (hr=0x%08lX)", w, h, hr);
     Free();
@@ -81,6 +87,10 @@ void Supersample::Free() {
   if (ds_) {
     ds_->Release();
     ds_ = nullptr;
+  }
+  if (dsTex_) {
+    dsTex_->Release();
+    dsTex_ = nullptr;
   }
   w_ = h_ = 0;
 }

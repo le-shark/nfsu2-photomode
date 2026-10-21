@@ -1,3 +1,6 @@
+#include <cmath>
+#include <vector>
+#include "focusprobe.h"
 #include <cstdlib>
 #include <string>
 
@@ -438,4 +441,54 @@ TEST(AspectRatioFrames) {
     const frame::Rect s1 = frame::Fit(1920, 1080, i), s2 = frame::Fit(3840, 2160, i);
     CHECK(std::abs(s2.w - 2 * s1.w) <= 1 && std::abs(s2.h - 2 * s1.h) <= 1);
   }
+}
+
+// A synthetic depth image: camera 0.8 m up at the origin looking along world +X (Z up), a wall at x = 20 and a car box whose
+// front face is at x = 7.8 (centre x = 10, half 2.2 x 0.9 x 0.65 around z = 0.5).
+TEST(FocusProbeFindsDrawnSurfaces) {
+  using namespace daylight::aomath;
+  const double eye[3] = {0, 0, 0.8};
+  double view[16] = {0, 0, 1, 0, -1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1};
+  view[12] = -(eye[0] * view[0] + eye[1] * view[4] + eye[2] * view[8]);
+  view[13] = -(eye[0] * view[1] + eye[1] * view[5] + eye[2] * view[9]);
+  view[14] = -(eye[0] * view[2] + eye[1] * view[6] + eye[2] * view[10]);
+  const double n = 0.5, f = 15000, sy = 1.0 / std::tan(0.4), sx = sy * 9 / 16;
+  const double proj[16] = {sx, 0, 0, 0, 0, sy, 0, 0, 0, 0, f / (f - n), 1, 0, 0, -n * f / (f - n), 0};
+  double vp[16];
+  Mul(view, proj, vp);
+  float vpf[16], eyef[3] = {0, 0, 0.8f};
+  for (int i = 0; i < 16; ++i) vpf[i] = static_cast<float>(vp[i]);
+  Frame fr;
+  CHECK(BuildFrame(vpf, eyef, &fr));
+  const float p22 = static_cast<float>(f / (f - n)), p32 = static_cast<float>(-n * f / (f - n));
+  const int w = 320, h = 180;
+  std::vector<float> depth(w * h);
+  for (int y = 0; y < h; ++y)
+    for (int x = 0; x < w; ++x) {
+      const double u = (x + 0.5) / w, v = (y + 0.5) / h;
+      double ray[3];
+      for (int i = 0; i < 3; ++i) ray[i] = fr.rayTL[i] + u * fr.rayDU[i] + v * fr.rayDV[i];  // at view z 1 (= world x)
+      double z = 20;
+      const double t = 7.8, py = ray[1] * t, pz = eye[2] + ray[2] * t;
+      if (std::fabs(py) <= 0.9 && pz >= 0.5 - 0.65 && pz <= 0.5 + 0.65) z = t;
+      depth[y * w + x] = static_cast<float>(p22 + p32 / z);
+    }
+  CarPose car;
+  car.pos = {10, 0, 0};
+  car.axis[0] = {1, 0, 0}, car.axis[1] = {0, 1, 0}, car.axis[2] = {0, 0, 1};
+  car.boxMin = {-2.2f, -0.9f, -0.15f}, car.boxMax = {2.2f, 0.9f, 1.15f};
+  const probe::Result r = probe::Evaluate(depth.data(), w, h, w, fr, p22, p32, {0, 0, 0.8f}, &car);
+  CHECK(r.aimHit);
+  CHECK_NEAR(r.aimZ, 7.8, 0.01);  // the box's face at the centre (the eye is at its height)
+  CHECK(r.carHit);
+  CHECK_NEAR(r.carZ, 7.8, 0.01);
+  CHECK(r.carTexels > 0);
+  // Without the car the wall is still found at the centre? Only where the box is not: move the car aside.
+  car.pos = {10, 50, 0};
+  const probe::Result r2 = probe::Evaluate(depth.data(), w, h, w, fr, p22, p32, {0, 0, 0.8f}, &car);
+  CHECK(!r2.carHit);  // nothing drawn inside the moved box
+  // Sky: depth 1 everywhere.
+  std::vector<float> sky(w * h, 1.0f);
+  const probe::Result r3 = probe::Evaluate(sky.data(), w, h, w, fr, p22, p32, {0, 0, 0.8f}, &car);
+  CHECK(!r3.aimHit && !r3.carHit);
 }

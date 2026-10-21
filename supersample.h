@@ -16,7 +16,9 @@ class Supersample {
  public:
   // Creates the targets (w x h, backbuffer format, no MSAA, plus D24S8). Logs and returns false
   // when the device can't hold them.
-  bool Create(IDirect3DDevice9* dev, int w, int h);
+  // intzDepth: the depth is an INTZ texture the shaders can read (DepthTexture; the focus probe, focusprobe.h).
+  bool Create(IDirect3DDevice9* dev, int w, int h, bool intzDepth = false);
+  IDirect3DTexture9* DepthTexture() const { return dsTex_; }
   void Free();  // capture end, exit, device reset
   bool Ready() const { return rt_ && ds_; }
   int Width() const { return w_; }
@@ -43,6 +45,7 @@ class Supersample {
 
   IDirect3DSurface9* rt_ = nullptr;
   IDirect3DSurface9* ds_ = nullptr;
+  IDirect3DTexture9* dsTex_ = nullptr;  // INTZ, when asked for
   // Streak/glow feedback buffer, and the full-size pair bleach/overbright copy back from.
   Swap swaps_[3] = {{u2::addr::StreakTexture, u2::addr::StreakSurface},
                     {u2::addr::FullTexture0, u2::addr::FullSurface0},

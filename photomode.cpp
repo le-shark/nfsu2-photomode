@@ -14,6 +14,7 @@
 
 #include "accum.h"
 #include "capture.h"
+#include "focusprobe.h"
 #include "follow.h"
 #include "frame.h"
 #include "grid.h"
@@ -77,7 +78,20 @@ struct FramePlan {
   bool resolve = false; // capture resolve frame: read back at EndScene, never presented
   bool warm = false;    // 2x capture warm-up: render into the 2x targets, don't sample
   int region = -1;      // supersample resolve: quarter of the 2x mean to show
+  bool probeHold = false;// focus probe, frame N: keep this frame (Accum::Hold) without emptying the mean
+  bool probe = false;    // focus probe, frame N+1: render the depth (focusprobe.h), show the held frame
   ProjAdjust adj;
+};
+
+// What the focus probe measured for: the camera, the lens and the Focus Target.
+struct PoseKey {
+  Vec3 eye, fwd, up;
+  float focal = 0;
+  uint8_t* car = nullptr;
+  bool operator==(const PoseKey& o) const {
+    auto same = [](const Vec3& a, const Vec3& b) { return a.x == b.x && a.y == b.y && a.z == b.z; };
+    return same(eye, o.eye) && same(fwd, o.fwd) && same(up, o.up) && focal == o.focal && car == o.car;
+  }
 };
 
 // Center / Closest = autofocus on the target car's centre / nearest corner. Aim = whatever the
@@ -106,6 +120,12 @@ struct PhotoMode {
   CarPose captureCar{};
   bool uiHidden = false;
   bool grid = false;            // Grid row (grid.h): thirds lines on screen, never in the photo
+  probe::FocusProbe probe;      // precise Aim / Closest (focusprobe.h)
+  int probeStage = 0;           // 1: frame held, the probe renders next frame
+  PoseKey lastPose, probedPose;
+  bool probed = false;          // probeRes belongs to probedPose
+  probe::Result probeRes;
+  bool captureAfterProbe = false;  // Take Picture before the probe ran: the capture starts after it
   int aspect = 0;               // Aspect Ratio row (frame.h), 0 Native
   bool crop = true;             // Crop to Ratio: the PNG without the bars
   grid::Overlay gridOverlay;
@@ -275,13 +295,24 @@ CamPose RigPose() {
   return {eye, Normalize(target - eye), up};
 }
 
-// Autofocus: the car's centre, or the nearest corner of an approximate car box (photographers
-// focus on the near headlight).
+PoseKey CurrentPoseKey() {
+  const CamPose c = RigPose();
+  return {c.eye, c.fwd, c.up, Focal(), TargetCar()};
+}
+// The focus probe's result for the camera as it is now (focusprobe.h), or null while it moves / before it ran.
+const probe::Result* FreshProbe() {
+  return g->probed && g->probedPose == CurrentPoseKey() ? &g->probeRes : nullptr;
+}
+
+// Autofocus: the car's centre, or its nearest point (photographers focus on the near headlight): the nearest drawn
+// point once the focus probe has run, else the nearest corner of an approximate car box.
 float AutoFocusDistance(FocusMode mode) {
   if (mode == FocusMode::Aim) return g->aimDist;
   CamPose cam = RigPose();
   CarPose car = TargetCarPose();
   float d = mode == FocusMode::Closest ? NearestCarDepth(cam, car) : CarCentreDepth(cam, car);
+  if (mode == FocusMode::Closest)
+    if (const probe::Result* r = FreshProbe(); r && r->carHit) d = r->carZ;
   return d < kMinFocusM ? kMinFocusM : d;
 }
 // Aim autofocus: nearest hit of the view's centre ray on the static world (u2::WorldRayHit) or a
@@ -303,8 +334,13 @@ void UpdateAim() {
   }
   g->aimHit = source >= 0;
   if (g->aimHit) g->aimDist = best < kMinFocusM ? kMinFocusM : best;
+  if (const probe::Result* r = FreshProbe()) {  // what is drawn at the centre (focusprobe.h) replaces the ray
+    g->aimHit = r->aimHit;
+    if (r->aimHit) g->aimDist = r->aimZ < kMinFocusM ? kMinFocusM : r->aimZ;
+    source = r->aimHit ? 2 : -1;
+  }
   if (g->cfg.verbose && (source != g->aimLogged || std::fabs(g->aimDist - g->aimLoggedDist) > 0.1f * g->aimLoggedDist)) {
-    static const char* names[] = {"none", "world", "car"};
+    static const char* names[] = {"none", "world", "car", "depth"};
     U2LOG("aim: %s %.2f m (eye %.1f %.1f %.1f dir %.2f %.2f %.2f)", names[source + 1], g->aimDist, cam.eye.x, cam.eye.y,
           cam.eye.z, dir.x, dir.y, dir.z);
     g->aimLogged = source;
@@ -337,6 +373,51 @@ SampleKey CurrentKey() {
 
 // Live preview: once the camera and settings have been still for [Preview] Delay, accumulate
 // jittered samples (the same ones a photo uses) up to the quality's sample count and show the mean.
+void StartCapture();
+
+// The focus probe (focusprobe.h) for Aim / Closest with an aperture: once the camera has stood still for a frame,
+// that frame is held (frame N) and the next one renders the depth instead (frame N+1). Then nothing until the
+// camera, the lens or the Focus Target changes.
+bool ProbeWanted() {
+  return (g->focusMode == FocusMode::Aim || g->focusMode == FocusMode::Closest) && FStop() > 0 && !g->probe.Failed();
+}
+bool ProbePending() { return ProbeWanted() && !FreshProbe(); }
+
+void PlanProbe() {
+  const PoseKey k = CurrentPoseKey();
+  const bool still = k == g->lastPose;
+  g->lastPose = k;
+  if (!ProbePending() || !still) {
+    g->probeStage = 0;
+    if (g->captureAfterProbe && !ProbePending()) {
+      g->captureAfterProbe = false;
+      StartCapture();
+    }
+    return;
+  }
+  if (g->probeStage == 1) {  // frame N+1: the probe replaces this frame's sample
+    g->frame = {};
+    g->frame.probe = true;
+    g->probeStage = 0;
+    SetUncapped(false);
+    return;
+  }
+  if (!g->accum.Ensure(Device())) return;  // the held copy lives in the accumulator
+  g->frame.probeHold = true;
+  g->probeStage = 1;
+}
+
+void OnProbe(bool ok, const probe::Result& r) {
+  g->probedPose = CurrentPoseKey();
+  g->probed = true;
+  g->probeRes = ok ? r : probe::Result{};
+  if (g->cfg.verbose)
+    U2LOG("focus probe: %s, aim %s %.2f m, car %s %.2f m (%d texels)", ok ? "read" : "FAILED",
+          g->probeRes.aimHit ? "hit" : "none", g->probeRes.aimZ, g->probeRes.carHit ? "hit" : "none",
+          g->probeRes.carZ, g->probeRes.carTexels);
+  if (g->focusMode == FocusMode::Aim) UpdateAim();
+}
+
 void UpdatePreview(float dt) {
   SampleKey key = CurrentKey();
   if (key == g->accKey) {
@@ -683,6 +764,10 @@ void Exit(const char* why, bool byPlayer = false) {
   g->capture.Abort("photo mode closed");
   g->frame = {};
   g->accum.Free();  // the targets are recreated on the next enter
+  g->probe.Free();
+  g->probed = false;
+  g->probeStage = 0;
+  g->captureAfterProbe = false;
   g->wmOverlay.Free();
   g->gridOverlay.Free();
   RestoreCaptureEffects();
@@ -713,6 +798,10 @@ void Exit(const char* why, bool byPlayer = false) {
 
 void StartCapture() {
   if (g->driving) return;  // stop driving first (the world is moving)
+  if (g->state == State::Active && ProbePending()) {  // focus on the measured point: start right after the probe
+    g->captureAfterProbe = true;
+    return;
+  }
   if (!g->captureHooks) {
     Toast("Capture unavailable (see the log)");
     return;
@@ -1148,6 +1237,7 @@ void Tick() {
         SetUncapped(false);
       } else {
         UpdatePreview(dt);
+        PlanProbe();
       }
     }
   }
@@ -1237,6 +1327,24 @@ void __cdecl Render3DDetour() {
   // inside this call), and the sample is folded in while that target is still bound.
   const bool super = g->state == State::Capturing && g->capture.Params().supersample && g->super.Ready();
   IDirect3DDevice9* dev = Device();
+  if (g->frame.probe && g->state == State::Active) {  // focus probe frame N+1 (PlanProbe)
+    g->frame.probe = false;
+    probe::Result r;
+    bool ok = false;
+    if (g->probe.Ensure(dev)) {
+      g->probe.Begin(dev);
+      oRender3D();
+      g->probe.End(dev);
+      const CarPose car = TargetCarPose();
+      ok = g->probe.Read(dev, TargetCar() ? &car : nullptr, &r);
+    } else {
+      oRender3D();
+    }
+    OnProbe(ok, r);
+    g->accum.ShowHold(dev);  // the frame held just before: the same view, so nothing blinks
+    DrawOverlays(dev);
+    return;
+  }
   if (super && (g->frame.sample || g->frame.warm)) {
     g->super.Begin(dev);
     oRender3D();
@@ -1270,6 +1378,10 @@ void __cdecl Render3DDetour() {
     g->frame.hold = false;
   }
   if (g->frame.showHold) g->accum.ShowHold(dev);
+  if (g->frame.probeHold) {  // focus probe frame N: keep it for the next frame (PlanProbe)
+    g->accum.Hold(dev);
+    g->frame.probeHold = false;
+  }
   DrawOverlays(dev);
 }
 
@@ -1325,6 +1437,9 @@ void __fastcall FeRenderDetour(void* feng, void* edx) {
 void OnDeviceReset() {
   g->capture.Abort("device reset");
   g->accum.Free();  // DEFAULT-pool targets must be released before the game's Reset
+  g->probe.Free();
+  g->probed = false;
+  g->probeStage = 0;
   g->wmOverlay.Free();
   g->gridOverlay.Free();
   FreeSupersample();
