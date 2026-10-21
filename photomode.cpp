@@ -130,7 +130,7 @@ struct PhotoMode {
   int aspect = 0;               // Aspect Ratio row (frame.h), 0 Native
   bool crop = true;             // Crop to Ratio: the PNG without the bars
   grid::Overlay gridOverlay;
-  // Watermarks (watermark.h): 0 None, 1 NFS-Planet, 2 NFS (both inside the ASI), then the WATERMARK files next to it.
+  // Watermarks (watermark.h): 0 None, 1 NFS-Planet, 2 NFS (both inside the ASI), then the images in the "watermarks" folder.
   int watermark = 0;
   watermark::Corner wmCorner = watermark::Corner::BottomRight;
   std::vector<std::string> wmNames;
@@ -536,9 +536,9 @@ bool RestoreView() {
 
 // ---- watermarks ---------------------------------------------------------------------------------
 // User 2026-10-20: each logo at its own pixel size on a 1080-high image (scaled with the image height); margins:
-// NFS-Planet a little (10), NFS and the files some (24). The built-ins are decoded once; the WATERMARK files next to
-// the ASI (watermark::ListName; "Custom" first, the rest by name) are read again each time photo mode opens, so they
-// can be added or changed in game. The choice is kept by its name.
+// NFS-Planet a little (10), NFS and the files some (24). The built-ins are decoded once; the images in the "watermarks"
+// folder next to the ASI (watermark::ListName, sorted by name) are read again each time photo mode opens, so they can
+// be added or changed in game. The choice is kept by its name.
 bool WatermarkAvailable(int i) {
   return i == 0 || (i > 0 && i < static_cast<int>(g->marks.size()) && g->marks[i].image);
 }
@@ -561,19 +561,30 @@ void LoadWatermarks() {
     std::wstring path;
   };
   std::vector<File> files;
-  const std::wstring dir = ModuleDir();
+  // The folder found by comparing names without case, so it is found even in a case-sensitive directory.
+  std::wstring dir;
   WIN32_FIND_DATAW fd;
-  HANDLE find = FindFirstFileW((dir + L"WATERMARK*").c_str(), &fd);
+  HANDLE find = FindFirstFileW((ModuleDir() + L"*").c_str(), &fd);
+  if (find != INVALID_HANDLE_VALUE) {
+    do {
+      if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && _wcsicmp(fd.cFileName, L"watermarks") == 0) {
+        dir = ModuleDir() + fd.cFileName + L"\\";
+        break;
+      }
+    } while (FindNextFileW(find, &fd));
+    FindClose(find);
+  }
+  find = dir.empty() ? INVALID_HANDLE_VALUE : FindFirstFileW((dir + L"*").c_str(), &fd);
   if (find != INVALID_HANDLE_VALUE) {
     do {
       std::string name;
-      if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && ListName(fd.cFileName, &name))
-        files.push_back({name, dir + fd.cFileName});
+      constexpr DWORD kSkip = FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM;  // Thumbs.db
+      if (!(fd.dwFileAttributes & kSkip) && ListName(fd.cFileName, &name)) files.push_back({name, dir + fd.cFileName});
     } while (FindNextFileW(find, &fd));
     FindClose(find);
   }
   auto key = [](const File& f) {
-    std::string k = f.name == "Custom" ? std::string(1, '\0') : f.name;
+    std::string k = f.name;
     for (char& c : k) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     return k;
   };

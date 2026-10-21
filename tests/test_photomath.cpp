@@ -375,15 +375,12 @@ TEST(MenuTablesConsistent) {
 
 TEST(WatermarkListNames) {
   std::string n;
-  CHECK(watermark::ListName(L"WATERMARK.png", &n) && n == "Custom");
-  CHECK(watermark::ListName(L"watermark.PNG", &n) && n == "Custom");
-  CHECK(watermark::ListName(L"WaterMark_My Logo.png", &n) && n == "My Logo");
-  CHECK(watermark::ListName(L"WATERMARK_v1.2.png", &n) && n == "v1.2");
-  CHECK(watermark::ListName(L"WATERMARK_jpg", &n) && n == "jpg");
-  CHECK(!watermark::ListName(L"WATERMARK_.png", &n));
-  CHECK(!watermark::ListName(L"WATERMARKS.png", &n));
-  CHECK(!watermark::ListName(L"WATER.png", &n));
-  CHECK(!watermark::ListName(L"logo.png", &n));
+  CHECK(watermark::ListName(L"My Logo.png", &n) && n == "My Logo");
+  CHECK(watermark::ListName(L"WATERMARK.PNG", &n) && n == "WATERMARK");
+  CHECK(watermark::ListName(L"v1.2.png", &n) && n == "v1.2");
+  CHECK(watermark::ListName(L"logo", &n) && n == "logo");
+  CHECK(watermark::ListName(L"café.png", &n) && n == "caf?");
+  CHECK(!watermark::ListName(L".png", &n));
 }
 
 TEST(GridThirdsLines) {
