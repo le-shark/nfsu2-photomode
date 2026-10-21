@@ -1,6 +1,7 @@
 #include <string>
 
 #include "follow.h"
+#include "grid.h"
 #include "lens.h"
 #include "rig.h"
 #include "sampling.h"
@@ -377,4 +378,23 @@ TEST(WatermarkListNames) {
   CHECK(!watermark::ListName(L"WATERMARKS.png", &n));
   CHECK(!watermark::ListName(L"WATER.png", &n));
   CHECK(!watermark::ListName(L"logo.png", &n));
+}
+
+TEST(GridThirdsLines) {
+  using grid::Line;
+  CHECK(grid::Thickness(1080) == 2);
+  CHECK(grid::Thickness(2160) == 4);
+  CHECK(grid::Thickness(720) == 1);
+  CHECK(grid::Thickness(480) == 1);
+  Line l[grid::kMaxLines];
+  CHECK(grid::Thirds(0, 0, 1920, 1080, l) == 8);
+  CHECK(l[0].x == 639 && l[0].w == 2 && l[0].h == 1080);  // 640 - 1
+  CHECK(l[1].x == 1279 && l[1].w == 2);
+  CHECK(l[2].y == 359 && l[2].h == 2 && l[2].x == 0 && l[2].w == 639);
+  CHECK(l[3].x == 641 && l[3].w == 638);
+  CHECK(l[4].x == 1281 && l[4].x + l[4].w == 1920);
+  CHECK(l[5].y == 719);
+  int area = 0;  // nothing drawn twice: the pieces add up to the lines' union
+  for (const Line& x : l) area += x.w * x.h;
+  CHECK(area == 2 * 2 * 1080 + 2 * 2 * 1920 - 4 * 2 * 2);
 }

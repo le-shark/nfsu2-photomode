@@ -15,6 +15,7 @@
 #include "accum.h"
 #include "capture.h"
 #include "follow.h"
+#include "grid.h"
 #include "lens.h"
 #include "pauseentry.h"
 #include "rig.h"
@@ -51,7 +52,7 @@ enum class State { Off, Active, Capturing };
 // User 2026-10-20: Drive (beta request), the last row: the menu scrolls to it (12 rows, 11 slots; u2sdk optmenu).
 // User 2026-10-20: Watermark (default None) and Watermark Pos. (disabled while None), before Take Picture.
 enum Row { RowCamera, RowFocal, RowRoll, RowTarget, RowFocusMode, RowFocus, RowAperture, RowShutter, RowFollow, RowResolution,
-           RowWatermark, RowWatermarkPos, RowTake, RowDrive, RowCount };
+           RowGrid, RowWatermark, RowWatermarkPos, RowTake, RowDrive, RowCount };
 
 constexpr float kMinFocusM = 0.3f, kMaxFocusM = 500;
 constexpr float kBackGuardSec = 0.3f;
@@ -102,6 +103,8 @@ struct PhotoMode {
   CamPose captureCam{};         // camera and car when the shutter opened
   CarPose captureCar{};
   bool uiHidden = false;
+  bool grid = false;            // Grid row (grid.h): thirds lines on screen, never in the photo
+  grid::Overlay gridOverlay;
   // Watermarks (watermark.h): 0 None, 1 NFS-Planet, 2 NFS (both inside the ASI), then the WATERMARK files next to it.
   int watermark = 0;
   watermark::Corner wmCorner = watermark::Corner::BottomRight;
@@ -671,6 +674,7 @@ void Exit(const char* why, bool byPlayer = false) {
   g->frame = {};
   g->accum.Free();  // the targets are recreated on the next enter
   g->wmOverlay.Free();
+  g->gridOverlay.Free();
   RestoreCaptureEffects();
   FreeSupersample();
   SetUncapped(false);
@@ -806,6 +810,7 @@ void Adjust(int row, int dir) {
     case RowShutter: g->shutterIdx = ClampInt(g->shutterIdx + dir, 0, lens::Count(lens::kShutters) - 1); break;
     case RowFollow: g->follow = static_cast<Follow>(Wrap(static_cast<int>(g->follow) + dir, static_cast<int>(Follow::Count))); break;
     case RowResolution: g->tiles = ClampInt(g->tiles + dir, 1, lens::kMaxTiles); break;
+    case RowGrid: g->grid = !g->grid; break;
     case RowWatermark:
       for (int n = static_cast<int>(g->marks.size()), i = Wrap(g->watermark + dir, n); ; i = Wrap(i + dir, n))
         if (WatermarkAvailable(i)) {
@@ -839,7 +844,7 @@ void Activate(int row) {
 std::string RowLabel(int row) {
   static const char* names[RowCount] = {"Camera Mode", "Focal Length", "Roll",     "Focus Target",
                                         "Focus Mode", "Focus",        "Aperture", "Shutter Speed",
-                                        "Shutter Follow", "Resolution", "Watermark", "Watermark Pos.",
+                                        "Shutter Follow", "Resolution", "Grid", "Watermark", "Watermark Pos.",
                                         "Take Picture", "Drive"};
   return row >= 0 && row < RowCount ? names[row] : "";
 }
@@ -863,6 +868,7 @@ std::string RowValue(int row) {
     case RowShutter: return lens::kShutterNames[g->shutterIdx];
     case RowFollow: return FollowName(g->follow);
     case RowResolution: std::snprintf(b, sizeof b, "%dx", g->tiles); break;
+    case RowGrid: return g->grid ? "On" : "Off";
     case RowWatermark: return g->watermark < static_cast<int>(g->wmNames.size()) ? g->wmNames[g->watermark] : "None";
     case RowWatermarkPos: return watermark::CornerName(g->wmCorner);
     default: break;
@@ -1158,6 +1164,14 @@ void DrawWatermark(IDirect3DDevice9* dev) {
   g->wmOverlay.Draw(dev, g->marks[g->watermark], g->wmCorner, w, h, ox, oy);
 }
 
+// The grid comes after the watermark and, like the menu, stays out of the frames read back into the photo. The held
+// tile frame and the samples were taken earlier in this hook, so they never have it.
+void DrawOverlays(IDirect3DDevice9* dev) {
+  DrawWatermark(dev);
+  if (g->grid && g->state != State::Off && !(g->state == State::Capturing && g->frame.resolve))
+    g->gridOverlay.Draw(dev);
+}
+
 // Pre-FE point: the backbuffer holds the 3D scene + game post FX; the 2D pass 0x5CBF40(0) with the
 // mirror, letterbox and FE comes next (0x5D2B5A..0x5D2B60). Skipped by the game on frames without 3D.
 void __cdecl Render3DDetour() {
@@ -1179,7 +1193,7 @@ void __cdecl Render3DDetour() {
     oRender3D();
   }
   if (g->state == State::Off) return;
-  if (!g->accum.Created() || !g->accum.Ensure(dev)) return DrawWatermark(dev);  // made by the preview or StartCapture
+  if (!g->accum.Created() || !g->accum.Ensure(dev)) return DrawOverlays(dev);  // made by the preview or StartCapture
   Accum& acc = super ? g->bigAccum : g->accum;
   if (g->frame.sample) {
     acc.AddSample(dev);
@@ -1198,7 +1212,7 @@ void __cdecl Render3DDetour() {
     g->frame.hold = false;
   }
   if (g->frame.showHold) g->accum.ShowHold(dev);
-  DrawWatermark(dev);
+  DrawOverlays(dev);
 }
 
 // Any other mover that still targets the player camera gets our matrix instead.
@@ -1254,6 +1268,7 @@ void OnDeviceReset() {
   g->capture.Abort("device reset");
   g->accum.Free();  // DEFAULT-pool targets must be released before the game's Reset
   g->wmOverlay.Free();
+  g->gridOverlay.Free();
   FreeSupersample();
   g->frame = {};
   SetUncapped(false);
