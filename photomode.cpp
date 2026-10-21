@@ -25,6 +25,7 @@
 #include "watermark_res.h"
 #include "settings.h"
 #include "u2sdk/optmenu.h"
+#include "u2sdk/crash.h"
 #include "u2sdk/d3d.h"
 #include "u2sdk/dev.h"
 #include "u2sdk/feng.h"
@@ -140,6 +141,9 @@ struct PhotoMode {
   bool frameArmed = false;    // main-frame EndScene pending
   bool endSceneHooked = false;
   bool captureHooks = false;  // EndScene and Present both hooked
+  int heldReload = 0;           // HoldShaderReload: a reload request made with photo mode open
+  double offSince = 0;          // seconds since photo mode closed, while a request is held
+  bool firstFrameDone = false;
   float postExitLog = 0;      // verbose: seconds left to log game state after exit
   float pauseRequest = 0;     // seconds left to open photo mode after its pause-menu icon resumed the race
   bool fromPause = false;     // opened from the pause-menu icon: closing it goes back to the pause menu
@@ -696,6 +700,7 @@ void Exit(const char* why, bool byPlayer = false) {
   // Put the cursor back: the game/WidescreenFix mouse-look reads cursor deltas.
   SetCursorPos(g->cursorAtEnter.x, g->cursorAtEnter.y);
   g->state = State::Off;
+  g->offSince = 0;  // a held shader reload goes back 1 s from now
   if (g->cfg.verbose) g->postExitLog = 3;
   U2LOG("exit (%s): speed=%.2f hud=%d", why, Var<float>(addr::GameSpeed), Var<int>(addr::DrawHud));
 }
@@ -1137,8 +1142,36 @@ void Tick() {
 }
 
 // ---- hooks ----------------------------------------------------------------------------------
+// Shader-reload hold (2026-10-21, a tester's crash, status doc "Beta feedback"): another mod in their setup set the
+// effect-reload request [0x8707C4] (no game code writes it) just after photo mode opened, and the reload crashed
+// inside NFSU2ShaderLoader. A request made while photo mode is open is held (cleared before RenderFrame reads it at
+// 0x5D2BFA, later in this same frame) and put back 1 s after photo mode closes, so the mod still gets its reload,
+// outside photo mode. With photo mode closed nothing is touched.
+void HoldShaderReload(float dt) {
+  int& request = Var<int>(addr::EffectReloadRequest);
+  if (g->state != State::Off) {
+    if (!request) return;
+    if (!g->heldReload) U2LOG("shader reload requested by another mod (value %d) with photo mode open: held until it closes", request);
+    g->heldReload = request;
+    request = 0;
+    return;
+  }
+  if (!g->heldReload) return;
+  g->offSince += dt;
+  if (g->offSince < 1.0) return;
+  if (!request) request = g->heldReload;
+  U2LOG("shader reload: the held request (value %d) handed back to the game", g->heldReload);
+  g->heldReload = 0;
+}
+
 void __cdecl FrameDetour() {
+  if (!g->firstFrameDone) {  // every ASI is loaded by now
+    g->firstFrameDone = true;
+    crash::LogModules();
+    if (g->cfg.verbose) crash::WatchWrites(addr::EffectReloadRequest, "shader reload request");
+  }
   Tick();
+  HoldShaderReload(g->lastDt);
   oFrame();
 }
 
