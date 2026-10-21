@@ -78,6 +78,7 @@ struct FramePlan {
   bool resolve = false; // capture resolve frame: read back at EndScene, never presented
   bool warm = false;    // 2x capture warm-up: render into the 2x targets, don't sample
   int region = -1;      // supersample resolve: quarter of the 2x mean to show
+  bool edges = false;   // with resolve: the FSAA edge frame, only the edge pieces (edges.h)
   bool probeHold = false;// focus probe, frame N: keep this frame (Accum::Hold) without emptying the mean
   bool probe = false;    // focus probe, frame N+1: render the depth (focusprobe.h), show the held frame
   ProjAdjust adj;
@@ -1202,6 +1203,7 @@ void Tick() {
       g->frame.adj = cf.adj;
       g->frame.resolve = cf.resolve;
       g->frame.region = cf.region;
+      g->frame.edges = cf.edges;
       g->frame.warm = cf.warm;
       // The screen shows the developing mean (1x) or the held frame (tiles), never the jittered
       // or zoomed samples; the menu with its progress stays live on top.
@@ -1364,6 +1366,20 @@ void __cdecl Render3DDetour() {
   if (g->frame.sample) {
     acc.AddSample(dev);
     g->frame.sample = false;  // one sample per planned frame
+  }
+  if (g->frame.show && acc.Count() > 0 && g->frame.edges) {  // FSAA edge frame (edges.h), read back at EndScene
+    IDirect3DSurface9* bb = nullptr;
+    edges::Piece pieces[edges::kPieces];
+    if (SUCCEEDED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb))) {
+      D3DSURFACE_DESC d;
+      bb->GetDesc(&d);
+      bb->Release();
+      if (edges::Layout(static_cast<int>(d.Width), static_cast<int>(d.Height), pieces))
+        acc.ShowPieces(dev, g->frame.region >= 0 ? QuarterUv(g->frame.region) : UvRect{0, 0, 1, 1}, pieces,
+                       edges::kPieces);
+    }
+    g->frame.shown = true;
+    return;  // nothing else on this frame: the pieces are all it is read for
   }
   if (g->frame.show && acc.Count() > 0) {
     if (g->frame.region >= 0) acc.ShowRegion(dev, QuarterUv(g->frame.region));  // 2x resolve, 1:1

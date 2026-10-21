@@ -147,7 +147,35 @@ void Accum::Draw(IDirect3DDevice9* dev, IDirect3DSurface9* target, IDirect3DPixe
   // The quad covers the whole target, whatever the accumulator's own size.
   D3DSURFACE_DESC td;
   target->GetDesc(&td);
-  const float tw = static_cast<float>(td.Width), th = static_cast<float>(td.Height);
+  const float x1 = static_cast<float>(td.Width) - 0.5f, y1 = static_cast<float>(td.Height) - 0.5f;
+  const Quad q{-0.5f, -0.5f, x1, y1, uv.u0, uv.v0, uv.u1, uv.v1};
+  DrawQuads(dev, target, ps, t0, t1, c0, &q, 1);
+}
+
+void Accum::ShowPieces(IDirect3DDevice9* dev, const UvRect& uv, const edges::Piece* pieces, int count) {
+  if (failed_ || !scene_ || count_ == 0) return;
+  IDirect3DSurface9* rt = nullptr;
+  if (FAILED(dev->GetRenderTarget(0, &rt))) return;
+  D3DSURFACE_DESC td;
+  rt->GetDesc(&td);
+  // Screen pixel x of the full frame samples u0 + (x + 0.5) * du (Draw above); a piece keeps that per pixel, moved.
+  const float du = (uv.u1 - uv.u0) / td.Width, dv = (uv.v1 - uv.v0) / td.Height;
+  Quad q[edges::kPieces];
+  const int n = count < edges::kPieces ? count : edges::kPieces;
+  for (int i = 0; i < n; ++i) {
+    const edges::Piece& p = pieces[i];
+    q[i] = {p.dx - 0.5f, p.dy - 0.5f, p.dx + p.w - 0.5f, p.dy + p.h - 0.5f,
+            uv.u0 + p.sx * du, uv.v0 + p.sy * dv, uv.u0 + (p.sx + p.w) * du, uv.v0 + (p.sy + p.h) * dv};
+  }
+  const float zero[4] = {};
+  DrawQuads(dev, rt, psShow_, acc_[cur_], nullptr, zero, q, n);
+  rt->Release();
+}
+
+void Accum::DrawQuads(IDirect3DDevice9* dev, IDirect3DSurface9* target, IDirect3DPixelShader9* ps,
+                      IDirect3DTexture9* t0, IDirect3DTexture9* t1, const float c0[4], const Quad* quads, int count) {
+  D3DSURFACE_DESC td;
+  target->GetDesc(&td);
   // Stream 0 and the render target are not part of the recorded block: save them as WidescreenFix
   // postfxcore.ixx SaveVertexState does (DrawPrimitiveUP resets stream 0).
   IDirect3DVertexBuffer9* vb = nullptr;
@@ -171,15 +199,13 @@ void Accum::Draw(IDirect3DDevice9* dev, IDirect3DSurface9* target, IDirect3DPixe
     dev->SetPixelShaderConstantF(0, c0, 1);
     dev->SetTexture(0, t0);
     dev->SetTexture(1, t1);
-    // One pixel past every edge, with the UVs carried on at the same rate (each covered pixel samples exactly what it
-    // did): with in-game FSAA the quad's edges at -0.5 / w - 0.5 left the outermost pixels uncovered, so every
-    // photo had a 1-pixel black frame and 2x photos a black cross where the quarters meet ([game] 2026-10-21).
     struct V { float x, y, z, rhw, u, v; };
-    const float du = (uv.u1 - uv.u0) / tw, dv = (uv.v1 - uv.v0) / th;
-    const float x0 = -1.5f, y0 = -1.5f, x1 = tw + 0.5f, y1 = th + 0.5f;
-    const float u0 = uv.u0 - du, v0 = uv.v0 - dv, u1 = uv.u1 + du, v1 = uv.v1 + dv;
-    const V q[4] = {{x0, y0, 0, 1, u0, v0}, {x1, y0, 0, 1, u1, v0}, {x0, y1, 0, 1, u0, v1}, {x1, y1, 0, 1, u1, v1}};
-    dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, q, sizeof(V));
+    for (int i = 0; i < count; ++i) {
+      const Quad& a = quads[i];
+      const V q[4] = {{a.x0, a.y0, 0, 1, a.u0, a.v0}, {a.x1, a.y0, 0, 1, a.u1, a.v0},
+                      {a.x0, a.y1, 0, 1, a.u0, a.v1}, {a.x1, a.y1, 0, 1, a.u1, a.v1}};
+      dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, q, sizeof(V));
+    }
     dev->SetRenderTarget(0, rt);  // resets the viewport; Apply() below restores the game's
     dev->SetDepthStencilSurface(ds);
     state_->Apply();

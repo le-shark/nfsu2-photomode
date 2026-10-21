@@ -33,6 +33,7 @@ struct CaptureFrame {
   bool newTile = false;     // reset the accumulator first (a new tile starts)
   bool warm = false;        // supersample: render at 2x without sampling (glow buffer warm-up)
   int region = -1;          // supersample resolve: quarter of the 2x mean to show (QuarterUv)
+  bool edges = false;       // with resolve: the FSAA edge frame (edges.h): show only the edge pieces
   u2::ProjAdjust adj;
   float nextGameSpeed = 0;  // shutter: game speed for the next simulation step (0 = frozen)
 };
@@ -60,6 +61,8 @@ class Capture {
 
  private:
   void Release();  // surfaces and buffers
+  void TileRead();  // the tile (with its edges) is complete: the next one, or the PNG
+  void ReadEdges(IDirect3DDevice9* dev);  // the FSAA edge frame
   void Finish();
   void Notify(const std::string& m);
 
@@ -71,6 +74,8 @@ class Capture {
   int warm_ = 0;                   // supersample warm-up frames planned
   bool resolveArmed_ = false;     // a resolve frame is pending its EndScene readback
   bool tileDone_ = false;         // the tile was read back; the next frame starts the next one
+  bool msaa_ = false;             // the back buffer is multisampled: each resolve gets an edge frame (edges.h)
+  bool edgePending_ = false;      // the tile was read back; its edge frame comes next
   IDirect3DSurface9* rt_ = nullptr;
   IDirect3DSurface9* sys_ = nullptr;
   std::vector<uint8_t> image_;

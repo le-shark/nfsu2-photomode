@@ -1,3 +1,4 @@
+#include "edges.h"
 #include <cmath>
 #include <vector>
 #include "focusprobe.h"
@@ -491,4 +492,35 @@ TEST(FocusProbeFindsDrawnSurfaces) {
   std::vector<float> sky(w * h, 1.0f);
   const probe::Result r3 = probe::Evaluate(sky.data(), w, h, w, fr, p22, p32, {0, 0, 0.8f}, &car);
   CHECK(!r3.aimHit && !r3.carHit);
+}
+
+// FSAA edge frame (edges.h): every pixel of the four screen edges is shown exactly once, 1:1, at least 2 pixels
+// inside the screen (WidescreenFix clears the outer 1), and no two pieces overlap.
+TEST(EdgeFramePieces) {
+  static const int kSizes[][2] = {{1920, 1080}, {1366, 768}, {3840, 2160}, {1280, 1024}};
+  for (const auto& s : kSizes) {
+    const int w = s[0], h = s[1];
+    edges::Piece p[edges::kPieces];
+    CHECK(edges::Layout(w, h, p));
+    std::vector<int> shown(static_cast<size_t>(w) * h, 0), used(static_cast<size_t>(w) * h, 0);
+    for (const edges::Piece& pc : p)
+      for (int y = 0; y < pc.h; ++y)
+        for (int x = 0; x < pc.w; ++x) {
+          const int dx = pc.dx + x, dy = pc.dy + y;
+          CHECK(dx >= 2 && dy >= 2 && dx <= w - 3 && dy <= h - 3);
+          ++used[static_cast<size_t>(dy) * w + dx];
+          ++shown[static_cast<size_t>(pc.sy + y) * w + pc.sx + x];
+        }
+    for (int v : used) CHECK(v <= 1);
+    for (int x = 0; x < w; ++x) {  // each edge pixel once per edge it lies on (corners: row and column)
+      CHECK(shown[x] == (x == 0 || x == w - 1 ? 2 : 1));
+      CHECK(shown[static_cast<size_t>(h - 1) * w + x] == (x == 0 || x == w - 1 ? 2 : 1));
+    }
+    for (int y = 1; y < h - 1; ++y) {
+      CHECK(shown[static_cast<size_t>(y) * w] == 1);
+      CHECK(shown[static_cast<size_t>(y) * w + w - 1] == 1);
+    }
+  }
+  edges::Piece p[edges::kPieces];
+  CHECK(!edges::Layout(8, 8, p));  // too small to fit
 }

@@ -9,6 +9,7 @@ struct IDirect3DSurface9;
 struct IDirect3DPixelShader9;
 struct IDirect3DStateBlock9;
 
+#include "edges.h"
 #include "sampling.h"
 
 namespace photomode {
@@ -33,6 +34,8 @@ class Accum {
   void Show(IDirect3DDevice9* dev);
   // Draws one region of the mean 1:1 onto the current render target (2x resolve, one quarter).
   void ShowRegion(IDirect3DDevice9* dev, const UvRect& uv);
+  // The FSAA edge frame (edges.h): pieces of the frame ShowRegion(uv) would draw, each 1:1 at its own place.
+  void ShowPieces(IDirect3DDevice9* dev, const UvRect& uv, const edges::Piece* pieces, int count);
   // Keeps a copy of the current render target (the frame on screen), and draws it back later:
   // tile captures show this still frame under the live menu instead of the zoomed tiles.
   void Hold(IDirect3DDevice9* dev);
@@ -48,6 +51,11 @@ class Accum {
   void Fail(const char* what, long hr);
   void Draw(IDirect3DDevice9* dev, IDirect3DSurface9* target, IDirect3DPixelShader9* ps, IDirect3DTexture9* t0,
             IDirect3DTexture9* t1, const float c0[4], const UvRect& uv);
+  struct Quad {
+    float x0, y0, x1, y1, u0, v0, u1, v1;  // target pixels (edges, -0.5 for pixel centres) and texture coordinates
+  };
+  void DrawQuads(IDirect3DDevice9* dev, IDirect3DSurface9* target, IDirect3DPixelShader9* ps, IDirect3DTexture9* t0,
+                 IDirect3DTexture9* t1, const float c0[4], const Quad* quads, int count);
 
   const char* name_;
   bool failed_ = false;
