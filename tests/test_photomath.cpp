@@ -4,6 +4,7 @@
 #include "lens.h"
 #include "rig.h"
 #include "sampling.h"
+#include "watermark.h"
 #include "test.h"
 
 using namespace photomode;
@@ -363,4 +364,17 @@ TEST(MenuTablesConsistent) {
   lens::FormatFStop(b, sizeof b, 16);
   CHECK(std::string(b) == "F/16");
   for (int f = 0; f < static_cast<int>(Follow::Count); ++f) CHECK(FollowName(static_cast<Follow>(f)) != nullptr);
+}
+
+TEST(WatermarkListNames) {
+  std::string n;
+  CHECK(watermark::ListName(L"WATERMARK.png", &n) && n == "Custom");
+  CHECK(watermark::ListName(L"watermark.PNG", &n) && n == "Custom");
+  CHECK(watermark::ListName(L"WaterMark_My Logo.png", &n) && n == "My Logo");
+  CHECK(watermark::ListName(L"WATERMARK_v1.2.png", &n) && n == "v1.2");
+  CHECK(watermark::ListName(L"WATERMARK_jpg", &n) && n == "jpg");
+  CHECK(!watermark::ListName(L"WATERMARK_.png", &n));
+  CHECK(!watermark::ListName(L"WATERMARKS.png", &n));
+  CHECK(!watermark::ListName(L"WATER.png", &n));
+  CHECK(!watermark::ListName(L"logo.png", &n));
 }

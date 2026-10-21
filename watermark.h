@@ -1,6 +1,7 @@
 #pragma once
 // Watermarks (user 2026-10-20): a logo in a corner of the screen while photo mode is open and in the saved photo.
-// Built-in logos are PNGs inside the ASI (photomode.rc); a WATERMARK.png next to the ASI is the Custom one.
+// Built-in logos are PNGs inside the ASI (photomode.rc); WATERMARK / WATERMARK_<name> files next to the ASI add more
+// (ListName).
 // Overlay draws it into the finished 3D frame before the menu (user: never over the photo-mode menu), so the photo's
 // resolve frames, read back from that same frame, carry it too: at 2x and with tiles each screen-sized part draws its
 // piece of the logo placed in the whole image.
@@ -35,6 +36,27 @@ struct Rect {
   float x, y, w, h;
 };
 Rect Place(const Mark& m, int imageW, int imageH, Corner c);
+
+// User 2026-10-21: every file next to the ASI named WATERMARK (shown as "Custom") or WATERMARK_<name> (shown as
+// <name>), any case, any image type Windows decodes. The list name from a file name, or false for other files.
+inline bool ListName(const std::wstring& file, std::string* name) {
+  const size_t dot = file.find_last_of(L'.');
+  const std::wstring stem = file.substr(0, dot);
+  static const wchar_t kPrefix[] = L"watermark";
+  constexpr size_t n = sizeof kPrefix / sizeof kPrefix[0] - 1;
+  if (stem.size() < n) return false;
+  for (size_t i = 0; i < n; ++i)
+    if (stem[i] != kPrefix[i] && stem[i] != kPrefix[i] - L'a' + L'A') return false;
+  if (stem.size() == n) {
+    *name = "Custom";
+    return true;
+  }
+  if (stem[n] != L'_' || stem.size() == n + 1) return false;
+  name->clear();
+  for (size_t i = n + 1; i < stem.size(); ++i)  // the menu font is ASCII
+    *name += stem[i] < 0x80 ? static_cast<char>(stem[i]) : '?';
+  return true;
+}
 
 // PNG decoding with Windows' own codec (WIC). The caller's thread must allow COM (frame code, not DllMain).
 bool LoadResourcePng(int id, Image* out);

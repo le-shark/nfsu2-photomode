@@ -3,11 +3,14 @@
 #include <shlobj.h>
 #include <d3d9.h>
 
+#include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <string>
+#include <vector>
 
 #include "accum.h"
 #include "capture.h"
@@ -99,10 +102,11 @@ struct PhotoMode {
   CamPose captureCam{};         // camera and car when the shutter opened
   CarPose captureCar{};
   bool uiHidden = false;
-  // Watermarks (watermark.h): 0 None, 1 NFS-Planet, 2 NFS (both inside the ASI), 3 Custom (WATERMARK.png next to it).
+  // Watermarks (watermark.h): 0 None, 1 NFS-Planet, 2 NFS (both inside the ASI), then the WATERMARK files next to it.
   int watermark = 0;
   watermark::Corner wmCorner = watermark::Corner::BottomRight;
-  watermark::Mark marks[4];
+  std::vector<std::string> wmNames;
+  std::vector<watermark::Mark> marks;
   bool builtinsLoaded = false;
   watermark::Overlay wmOverlay;
   bool driving = false;         // Drive: the world runs and the car takes the driving keys (StartDrive)
@@ -439,29 +443,64 @@ bool RestoreView() {
 
 // ---- watermarks ---------------------------------------------------------------------------------
 // User 2026-10-20: each logo at its own pixel size on a 1080-high image (scaled with the image height); margins:
-// NFS-Planet a little (10), NFS and Custom some (24). The built-ins are decoded once; WATERMARK.png (any case: the file
-// system ignores it) next to the ASI is looked for each time photo mode opens, so it can be added or changed in game.
-constexpr const char* kWatermarkNames[] = {"None", "NFS-Planet", "NFS", "Custom"};
-bool WatermarkAvailable(int i) { return i == 0 || (i > 0 && i < 4 && g->marks[i].image); }
+// NFS-Planet a little (10), NFS and the files some (24). The built-ins are decoded once; the WATERMARK files next to
+// the ASI (watermark::ListName; "Custom" first, the rest by name) are read again each time photo mode opens, so they
+// can be added or changed in game. The choice is kept by its name.
+bool WatermarkAvailable(int i) {
+  return i == 0 || (i > 0 && i < static_cast<int>(g->marks.size()) && g->marks[i].image);
+}
 
 void LoadWatermarks() {
   using namespace watermark;
+  const std::string chosen = g->watermark < static_cast<int>(g->wmNames.size()) ? g->wmNames[g->watermark] : "";
   if (!g->builtinsLoaded) {
     g->builtinsLoaded = true;
     auto planet = std::make_shared<Image>(), nfs = std::make_shared<Image>();
+    g->wmNames = {"None", "NFS-Planet", "NFS"};
+    g->marks.assign(3, Mark{});
     if (LoadResourcePng(IDR_WM_NFSPLANET, planet.get())) g->marks[1] = {planet, 1, 10};
     if (LoadResourcePng(IDR_WM_NFS, nfs.get())) g->marks[2] = {nfs, 1, 24};
   }
-  const std::wstring path = ModuleDir() + L"WATERMARK.png";
-  auto custom = std::make_shared<Image>();
-  if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES && LoadFilePng(path, custom.get())) {
-    g->marks[3] = {custom, 1, 24};
-    U2LOG("watermark: custom WATERMARK.png %dx%d", custom->w, custom->h);
-  } else {
-    if (g->marks[3].image) U2LOG("watermark: custom WATERMARK.png gone or unreadable");
-    g->marks[3] = {};
+  g->wmNames.resize(3);
+  g->marks.resize(3);
+  struct File {
+    std::string name;
+    std::wstring path;
+  };
+  std::vector<File> files;
+  const std::wstring dir = ModuleDir();
+  WIN32_FIND_DATAW fd;
+  HANDLE find = FindFirstFileW((dir + L"WATERMARK*").c_str(), &fd);
+  if (find != INVALID_HANDLE_VALUE) {
+    do {
+      std::string name;
+      if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && ListName(fd.cFileName, &name))
+        files.push_back({name, dir + fd.cFileName});
+    } while (FindNextFileW(find, &fd));
+    FindClose(find);
   }
-  if (!WatermarkAvailable(g->watermark)) g->watermark = 0;
+  auto key = [](const File& f) {
+    std::string k = f.name == "Custom" ? std::string(1, '\0') : f.name;
+    for (char& c : k) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return k;
+  };
+  std::sort(files.begin(), files.end(), [&](const File& a, const File& b) { return key(a) < key(b); });
+  for (const File& f : files) {
+    auto img = std::make_shared<Image>();
+    if (!LoadFilePng(f.path, img.get())) {
+      U2LOG("watermark: %ls not readable as an image; left out", f.path.c_str());
+      continue;
+    }
+    g->wmNames.push_back(f.name);
+    g->marks.push_back({img, 1, 24});
+    U2LOG("watermark: \"%s\" from %ls %dx%d", f.name.c_str(), f.path.c_str(), img->w, img->h);
+  }
+  g->watermark = 0;
+  for (int i = 1; i < static_cast<int>(g->wmNames.size()); ++i)
+    if (g->wmNames[i] == chosen && WatermarkAvailable(i)) {
+      g->watermark = i;
+      break;
+    }
 }
 
 void Enter() {
@@ -768,7 +807,7 @@ void Adjust(int row, int dir) {
     case RowFollow: g->follow = static_cast<Follow>(Wrap(static_cast<int>(g->follow) + dir, static_cast<int>(Follow::Count))); break;
     case RowResolution: g->tiles = ClampInt(g->tiles + dir, 1, lens::kMaxTiles); break;
     case RowWatermark:
-      for (int i = Wrap(g->watermark + dir, 4); ; i = Wrap(i + dir, 4))
+      for (int n = static_cast<int>(g->marks.size()), i = Wrap(g->watermark + dir, n); ; i = Wrap(i + dir, n))
         if (WatermarkAvailable(i)) {
           g->watermark = i;
           break;
@@ -824,7 +863,7 @@ std::string RowValue(int row) {
     case RowShutter: return lens::kShutterNames[g->shutterIdx];
     case RowFollow: return FollowName(g->follow);
     case RowResolution: std::snprintf(b, sizeof b, "%dx", g->tiles); break;
-    case RowWatermark: return kWatermarkNames[g->watermark];
+    case RowWatermark: return g->watermark < static_cast<int>(g->wmNames.size()) ? g->wmNames[g->watermark] : "None";
     case RowWatermarkPos: return watermark::CornerName(g->wmCorner);
     default: break;
   }
@@ -1101,7 +1140,7 @@ void __cdecl FrameDetour() {
 // mean drawn. A resolve frame is read back from this frame, so the photo carries it: at 2x (and with tiles) the
 // screen shows one quarter of the whole image, so the logo is placed in the whole image and shifted by the quarter.
 void DrawWatermark(IDirect3DDevice9* dev) {
-  if (g->state == State::Off || !g->watermark || !g->marks[g->watermark].image) return;
+  if (g->state == State::Off || !WatermarkAvailable(g->watermark) || !g->watermark) return;
   IDirect3DSurface9* bb = nullptr;
   if (FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb))) return;
   D3DSURFACE_DESC d;
