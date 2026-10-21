@@ -4,11 +4,40 @@
 #include <d3d9.h>
 
 #include "u2sdk/game.h"
+#include "u2sdk/hook.h"
 #include "u2sdk/log.h"
 
 namespace photomode {
 using u2::Var;
 namespace addr = u2::addr;
+
+namespace {
+const Supersample* g_active = nullptr;  // the swapped one, between Begin and End
+
+// The Enhanced Contrast (bleach) pass draws its three full-screen quads with UVs offset by half a texel of the screen
+// size [0x870980]/[0x870984] (0x5C6557, 0x5C65F4), not of its target, and its effect (fx\screenfilter.efx) samples
+// with LINEAR filtering and WRAP addressing. On our 2W x 2H target each pass therefore read half a texel right and
+// down: three passes blurred the image [1,3,3,1]/8, moved it 1.5 px, and pulled the opposite edge into the last three
+// columns and rows (7/8, 1/2, 1/8; measured in 2x photos 2026-10-21: 0.87-0.91, 0.48-0.56, 0.11-0.16). While a target
+// is swapped the pass sees that target's size and the old values come back after it; nothing else runs in between.
+// Other readers of the screen size are not touched.
+using BleachQuadPassFn = void(__cdecl*)(int, int, int, int, int, int, int);
+BleachQuadPassFn oBleachQuadPass = nullptr;
+
+void __cdecl BleachQuadPassDetour(int a, int b, int c, int d, int e, int f, int g) {
+  if (!g_active) return oBleachQuadPass(a, b, c, d, e, f, g);
+  const int w = Var<int>(addr::ScreenWidth), h = Var<int>(addr::ScreenHeight);
+  Var<int>(addr::ScreenWidth) = g_active->Width();
+  Var<int>(addr::ScreenHeight) = g_active->Height();
+  oBleachQuadPass(a, b, c, d, e, f, g);
+  Var<int>(addr::ScreenWidth) = w;
+  Var<int>(addr::ScreenHeight) = h;
+}
+}  // namespace
+
+bool Supersample::InstallBleachFix() {
+  return u2::hook::Create(addr::BleachQuadPass, &BleachQuadPassDetour, &oBleachQuadPass, "BleachQuadPass 0x5C6520");
+}
 
 bool Supersample::Create(IDirect3DDevice9* dev, int w, int h, bool intzDepth) {
   Free();
@@ -131,6 +160,7 @@ void Supersample::Begin(IDirect3DDevice9* dev) {
   savedFsaa_ = Var<int>(addr::FsaaLevel);
   Var<int>(addr::FsaaLevel) = 0;
   swapped_ = true;
+  g_active = this;
   dev->SetRenderTarget(0, rt_);
   dev->SetDepthStencilSurface(ds_);
   dev->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL, 0, 1.0f, 0);
@@ -161,6 +191,7 @@ void Supersample::End(IDirect3DDevice9* dev) {
   }
   Var<int>(addr::FsaaLevel) = savedFsaa_;
   swapped_ = false;
+  if (g_active == this) g_active = nullptr;
   // The 2D pass rebinds RT[0] itself (0x5CBF59..), but our own drawing comes first.
   dev->SetRenderTarget(0, static_cast<IDirect3DSurface9*>(savedBackBuffer_));
   dev->SetDepthStencilSurface(static_cast<IDirect3DSurface9*>(savedAutoDepth_));

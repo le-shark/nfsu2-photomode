@@ -1515,6 +1515,16 @@ bool Install() {
       U2LOG("SaveRegistrySettings 0x5BEEA0: entry bytes differ (another mod?); not hooked");
     }
   }
+  // Optional: without it 2x photos with Enhanced Contrast on are blurred, moved 1.5 px and wrap at the right and bottom
+  // edges (supersample.cpp BleachQuadPassDetour).
+  {
+    const auto* e = reinterpret_cast<const uint8_t*>(addr::BleachQuadPass);
+    if (std::memcmp(e, "\x55\x8B\xEC\x83\xE4\xF0\x81\xEC\xC4\x00\x00\x00", 12) == 0 || e[0] == 0xE9) {
+      if (!Supersample::InstallBleachFix()) U2LOG("bleach hook failed: 2x photos with Enhanced Contrast stay soft");
+    } else {
+      U2LOG("BleachQuadPass 0x5C6520: entry bytes differ (another mod?); not hooked");
+    }
+  }
   // Optional: without it photo mode still opens with its key.
   if (g->cfg.pauseMenuEntry && !pause::Install()) U2LOG("pause menu: no Photo Mode icon (see above)");
   if (!ok) {

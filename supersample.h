@@ -28,6 +28,9 @@ class Supersample {
   void Begin(IDirect3DDevice9* dev);
   void End(IDirect3DDevice9* dev);
   bool Swapped() const { return swapped_; }
+  // Hooks the bleach pass so it sees the swapped target's size (supersample.cpp BleachQuadPassDetour). Once, at
+  // startup.
+  static bool InstallBleachFix();
   // Draws the last 2x frame scaled down over the current render target (warm-up frames, before the
   // first sample).
   void Blit(IDirect3DDevice9* dev);
