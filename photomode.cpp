@@ -877,8 +877,9 @@ void StartCapture() {
   if (p.sample.tiles > 1) SetCaptureEffects(!p.supersample);
   if (p.supersample) g->bigAccum.Reset();
   // A 1x photo without shutter is exactly what the preview accumulates: continue from its samples
-  // (instant when it has converged). Anything else starts from an empty mean.
-  g->captureContinued = p.sample.tiles == 1 && p.shutterSec == 0 && CurrentKey() == g->accKey;
+  // (instant when it has converged). Anything else starts from an empty mean. Not with in-game FSAA (g->flat): the
+  // preview's samples are MSAA frames with the light top row / left column (user 2026-10-21: fresh samples instead).
+  g->captureContinued = p.sample.tiles == 1 && p.shutterSec == 0 && !g->flat && CurrentKey() == g->accKey;
   // Tiles empty the mean in the Render3D hook, after holding the frame on screen (see FramePlan).
   if (!g->captureContinued && p.sample.tiles == 1) g->accum.Reset();
   g->captureFromSample = g->captureContinued ? g->accum.Count() : 0;
