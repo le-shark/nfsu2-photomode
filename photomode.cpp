@@ -15,6 +15,7 @@
 #include "accum.h"
 #include "capture.h"
 #include "follow.h"
+#include "frame.h"
 #include "grid.h"
 #include "lens.h"
 #include "pauseentry.h"
@@ -53,7 +54,7 @@ enum class State { Off, Active, Capturing };
 // User 2026-10-20: Drive (beta request), the last row: the menu scrolls to it (12 rows, 11 slots; u2sdk optmenu).
 // User 2026-10-20: Watermark (default None) and Watermark Pos. (disabled while None), before Take Picture.
 enum Row { RowCamera, RowFocal, RowRoll, RowTarget, RowFocusMode, RowFocus, RowAperture, RowShutter, RowFollow, RowResolution,
-           RowGrid, RowWatermark, RowWatermarkPos, RowTake, RowDrive, RowCount };
+           RowAspect, RowCrop, RowGrid, RowWatermark, RowWatermarkPos, RowTake, RowDrive, RowCount };
 
 constexpr float kMinFocusM = 0.3f, kMaxFocusM = 500;
 constexpr float kBackGuardSec = 0.3f;
@@ -105,6 +106,8 @@ struct PhotoMode {
   CarPose captureCar{};
   bool uiHidden = false;
   bool grid = false;            // Grid row (grid.h): thirds lines on screen, never in the photo
+  int aspect = 0;               // Aspect Ratio row (frame.h), 0 Native
+  bool crop = true;             // Crop to Ratio: the PNG without the bars
   grid::Overlay gridOverlay;
   // Watermarks (watermark.h): 0 None, 1 NFS-Planet, 2 NFS (both inside the ASI), then the WATERMARK files next to it.
   int watermark = 0;
@@ -727,6 +730,8 @@ void StartCapture() {
               g->cfg.antialias};
   p.shutterSec = lens::kShutters[g->shutterIdx];
   p.outPath = NewPicturePath();
+  p.aspect = g->aspect;
+  p.crop = g->aspect && g->crop;
   if (p.sample.tiles > 1) {
     // 2x: supersampled in one pass (motion blur works); tiles only when the targets don't fit.
     const int w = 2 * g->accum.Width(), h = 2 * g->accum.Height();
@@ -812,12 +817,17 @@ void Adjust(int row, int dir) {
     }
     case RowFocus:  // Manual only (IsRowEnabled)
       if (g->focusMode != FocusMode::Manual) break;
-      g->focusDist = Clamp(g->focusDist * (dir > 0 ? 1.08f : 1 / 1.08f), kMinFocusM, kMaxFocusM);
+      {  // Ctrl: fine steps of 1 % (user 2026-10-21), as Ctrl on Focal Length
+        const float k = g->input.KeyDown(VK_CONTROL) ? 1.01f : 1.08f;
+        g->focusDist = Clamp(g->focusDist * (dir > 0 ? k : 1 / k), kMinFocusM, kMaxFocusM);
+      }
       break;
     case RowAperture: g->fstopIdx = ClampInt(g->fstopIdx + dir, 0, lens::Count(lens::kFStops) - 1); break;
     case RowShutter: g->shutterIdx = ClampInt(g->shutterIdx + dir, 0, lens::Count(lens::kShutters) - 1); break;
     case RowFollow: g->follow = static_cast<Follow>(Wrap(static_cast<int>(g->follow) + dir, static_cast<int>(Follow::Count))); break;
     case RowResolution: g->tiles = ClampInt(g->tiles + dir, 1, lens::kMaxTiles); break;
+    case RowAspect: g->aspect = Wrap(g->aspect + dir, frame::kCount); break;
+    case RowCrop: if (g->aspect) g->crop = !g->crop; break;  // only with a ratio (IsRowEnabled)
     case RowGrid: g->grid = !g->grid; break;
     case RowWatermark:
       for (int n = static_cast<int>(g->marks.size()), i = Wrap(g->watermark + dir, n); ; i = Wrap(i + dir, n))
@@ -838,6 +848,7 @@ bool IsActionRow(int row) { return row == RowTake || row == RowDrive; }
 bool IsRowEnabled(int row) {
   if (row == RowFocus) return g->focusMode == FocusMode::Manual;
   if (row == RowWatermarkPos) return g->watermark != 0;
+  if (row == RowCrop) return g->aspect != 0;
   return true;
 }
 
@@ -852,7 +863,7 @@ void Activate(int row) {
 std::string RowLabel(int row) {
   static const char* names[RowCount] = {"Camera Mode", "Focal Length", "Roll",     "Focus Target",
                                         "Focus Mode", "Focus",        "Aperture", "Shutter Speed",
-                                        "Shutter Follow", "Resolution", "Grid", "Watermark", "Watermark Pos.",
+                                        "Shutter Follow", "Resolution", "Aspect Ratio", "Crop to Ratio", "Grid", "Watermark", "Watermark Pos.",
                                         "Take Picture", "Drive"};
   return row >= 0 && row < RowCount ? names[row] : "";
 }
@@ -870,12 +881,17 @@ std::string RowValue(int row) {
     }
     case RowFocus:  // the distance the photo uses, live; Aim with nothing at the centre keeps its last distance
       if (g->focusMode == FocusMode::Aim && !g->aimHit) std::snprintf(b, sizeof b, "-- (%.1f m)", g->aimDist);
-      else std::snprintf(b, sizeof b, "%.1f m", FocusDistance());
+      else {  // centimetres under 10 m, so each fine step shows (user 2026-10-21)
+        const float d = FocusDistance();
+        std::snprintf(b, sizeof b, d < 10 ? "%.2f m" : "%.1f m", d);
+      }
       break;
     case RowAperture: lens::FormatFStop(b, sizeof b, FStop()); break;
     case RowShutter: return lens::kShutterNames[g->shutterIdx];
     case RowFollow: return FollowName(g->follow);
     case RowResolution: std::snprintf(b, sizeof b, "%dx", g->tiles); break;
+    case RowAspect: return frame::Name(g->aspect);
+    case RowCrop: return g->crop ? "Yes" : "No";
     case RowGrid: return g->grid ? "On" : "Off";
     case RowWatermark: return g->watermark < static_cast<int>(g->wmNames.size()) ? g->wmNames[g->watermark] : "None";
     case RowWatermarkPos: return watermark::CornerName(g->wmCorner);
@@ -1171,34 +1187,47 @@ void __cdecl FrameDetour() {
   oFrame();
 }
 
-// The watermark goes into the finished 3D frame, under the menu (user 2026-10-20), after the sample was taken and the
-// mean drawn. A resolve frame is read back from this frame, so the photo carries it: at 2x (and with tiles) the
-// screen shows one quarter of the whole image, so the logo is placed in the whole image and shifted by the quarter.
-void DrawWatermark(IDirect3DDevice9* dev) {
-  if (g->state == State::Off || !WatermarkAvailable(g->watermark) || !g->watermark) return;
+// Into the finished 3D frame, under the menu, after the sample was taken and the mean drawn:
+// - the Aspect Ratio bars (user 2026-10-21, solid black) and the watermark (user 2026-10-20) in the photo area. A
+//   resolve frame is read back from this frame, so the photo carries both: at 2x (and with tiles) the screen shows one
+//   quarter of the whole image, so they are placed in the whole image and shifted by the quarter.
+// - the grid, in the photo area on screen only: like the menu, it stays out of the frames read back into the photo.
+//   The held tile frame and the samples were taken earlier in this hook, so they never have any of these.
+void DrawOverlays(IDirect3DDevice9* dev) {
+  if (g->state == State::Off) return;
   IDirect3DSurface9* bb = nullptr;
   if (FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb))) return;
   D3DSURFACE_DESC d;
   bb->GetDesc(&d);
   bb->Release();
-  int w = static_cast<int>(d.Width), h = static_cast<int>(d.Height), ox = 0, oy = 0;
+  const int sw = static_cast<int>(d.Width), sh = static_cast<int>(d.Height);
+  const bool resolve = g->state == State::Capturing && g->frame.resolve;
+  int w = sw, h = sh, ox = 0, oy = 0;
   const int tiles = g->capture.Params().sample.tiles;
-  if (g->state == State::Capturing && g->frame.resolve && tiles > 1) {
+  if (resolve && tiles > 1) {
     const int t = g->frame.region >= 0 ? g->frame.region : g->capture.Tile();  // quarter q at (q % 2, q / 2)
-    ox = (t % tiles) * w;
-    oy = (t / tiles) * h;
+    ox = (t % tiles) * sw;
+    oy = (t / tiles) * sh;
     w *= tiles;
     h *= tiles;
   }
-  g->wmOverlay.Draw(dev, g->marks[g->watermark], g->wmCorner, w, h, ox, oy);
-}
-
-// The grid comes after the watermark and, like the menu, stays out of the frames read back into the photo. The held
-// tile frame and the samples were taken earlier in this hook, so they never have it.
-void DrawOverlays(IDirect3DDevice9* dev) {
-  DrawWatermark(dev);
-  if (g->grid && g->state != State::Off && !(g->state == State::Capturing && g->frame.resolve))
-    g->gridOverlay.Draw(dev);
+  const int aspect = g->state == State::Capturing ? g->capture.Params().aspect : g->aspect;
+  const frame::Rect area = frame::Fit(w, h, aspect);
+  frame::Rect bars[4];
+  grid::Line quads[4];
+  const int nBars = frame::Bars(w, h, area, bars);
+  for (int i = 0; i < nBars; ++i) quads[i] = {bars[i].x - ox, bars[i].y - oy, bars[i].w, bars[i].h};
+  g->gridOverlay.Draw(dev, quads, nBars, 0xFF000000u);
+  if (WatermarkAvailable(g->watermark) && g->watermark) {
+    const watermark::Rect a{static_cast<float>(area.x), static_cast<float>(area.y), static_cast<float>(area.w),
+                            static_cast<float>(area.h)};
+    g->wmOverlay.Draw(dev, g->marks[g->watermark], g->wmCorner, a, h, ox, oy);
+  }
+  if (g->grid && !resolve) {
+    grid::Line lines[grid::kMaxLines];
+    const int n = grid::Thirds(area.x, area.y, area.w, area.h, grid::Thickness(sh), lines);  // w == sw here
+    g->gridOverlay.Draw(dev, lines, n, grid::kLineColour);
+  }
 }
 
 // Pre-FE point: the backbuffer holds the 3D scene + game post FX; the 2D pass 0x5CBF40(0) with the

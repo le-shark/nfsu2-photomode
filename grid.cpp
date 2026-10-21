@@ -39,11 +39,10 @@ void SetStates(IDirect3DDevice9* dev) {
   dev->SetViewport(&vp);
 }
 
-constexpr DWORD kColour = D3DCOLOR_ARGB(0xBB, 0xFF, 0xFF, 0xFF);  // WHITE_LINE's texels
 }  // namespace
 
-void Overlay::Draw(IDirect3DDevice9* dev) {
-  if (!dev || failed_) return;
+void Overlay::Draw(IDirect3DDevice9* dev, const Line* rects, int count, uint32_t argb) {
+  if (!dev || failed_ || count <= 0) return;
   if (!state_) {
     HRESULT hr = dev->BeginStateBlock();
     if (SUCCEEDED(hr)) {
@@ -60,8 +59,6 @@ void Overlay::Draw(IDirect3DDevice9* dev) {
   if (FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb))) return;
   D3DSURFACE_DESC d;
   bb->GetDesc(&d);
-  Line lines[kMaxLines];
-  const int count = Thirds(0, 0, static_cast<int>(d.Width), static_cast<int>(d.Height), lines);
   // Stream 0 and the render target are not in the recorded block (watermark.cpp Draw).
   IDirect3DVertexBuffer9* vb = nullptr;
   UINT offset = 0, stride = 0;
@@ -75,8 +72,10 @@ void Overlay::Draw(IDirect3DDevice9* dev) {
     struct V { float x, y, z, rhw; DWORD c; };
     V q[kMaxLines * 6];
     int n = 0;
+    const DWORD kColour = argb;
+    if (count > kMaxLines) count = kMaxLines;
     for (int i = 0; i < count; ++i) {  // two triangles each; -0.5 puts the quad edges on pixel edges
-      const Line& l = lines[i];
+      const Line& l = rects[i];
       const float a = l.x - 0.5f, t = l.y - 0.5f, r = l.x + l.w - 0.5f, b = l.y + l.h - 0.5f;
       const V c[6] = {{a, t, 0, 1, kColour}, {r, t, 0, 1, kColour}, {a, b, 0, 1, kColour},
                       {r, t, 0, 1, kColour}, {r, b, 0, 1, kColour}, {a, b, 0, 1, kColour}};

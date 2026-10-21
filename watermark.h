@@ -35,7 +35,9 @@ struct Mark {
 struct Rect {
   float x, y, w, h;
 };
-Rect Place(const Mark& m, int imageW, int imageH, Corner c);
+// In the corner of the photo area `area` (the whole image, or the Aspect Ratio frame) of an image imageH pixels
+// high: size and margin scale with the image height, so a logo keeps its size whatever the ratio.
+Rect Place(const Mark& m, const Rect& area, int imageH, Corner c);
 
 // User 2026-10-21: every file next to the ASI named WATERMARK (shown as "Custom") or WATERMARK_<name> (shown as
 // <name>), any case, any image type Windows decodes. The list name from a file name, or false for other files.
@@ -68,9 +70,9 @@ std::wstring ModuleDir();
 class Overlay {
  public:
   ~Overlay() { Free(); }
-  // Onto the backbuffer, which shows the part of an imageW x imageH picture starting at (offX, offY) (the whole screen
-  // normally; one quarter during a 2x resolve).
-  void Draw(IDirect3DDevice9* dev, const Mark& m, Corner c, int imageW, int imageH, int offX, int offY);
+  // Onto the backbuffer, which shows the part of an image imageH pixels high starting at (offX, offY) (the whole
+  // screen normally; one quarter during a 2x resolve); area is the photo area in that image.
+  void Draw(IDirect3DDevice9* dev, const Mark& m, Corner c, const Rect& area, int imageH, int offX, int offY);
   void Free();  // before a device reset, and when photo mode closes
 
  private:

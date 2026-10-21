@@ -3,9 +3,11 @@
 #include <d3d9.h>
 #include <windows.h>
 
+#include <cstring>
 #include <new>
 #include <thread>
 
+#include "frame.h"
 #include "lens.h"
 #include "u2sdk/dev.h"
 #include "u2sdk/log.h"
@@ -132,6 +134,19 @@ void Capture::Finish() {
   int w = width_ * p_.sample.tiles, h = height_ * p_.sample.tiles;
   std::string path = p_.outPath;
   auto img = std::make_shared<std::vector<uint8_t>>(std::move(image_));
+  if (p_.crop) {  // Crop to Ratio: keep the photo area (the same frame::Fit the bars were drawn around), in place
+    const frame::Rect a = frame::Fit(w, h, p_.aspect);
+    if (a.w < w || a.h < h) {
+      uint8_t* px = img->data();
+      for (int y = 0; y < a.h; ++y)
+        std::memmove(px + static_cast<size_t>(y) * a.w * 3, px + (static_cast<size_t>(a.y + y) * w + a.x) * 3,
+                     static_cast<size_t>(a.w) * 3);
+      img->resize(static_cast<size_t>(a.w) * a.h * 3);
+      U2LOG("crop to %s: %dx%d -> %dx%d", frame::Name(p_.aspect), w, h, a.w, a.h);
+      w = a.w;
+      h = a.h;
+    }
+  }
   Release();
   ++saving_;
   Notify("Saving...");

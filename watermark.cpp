@@ -67,12 +67,12 @@ const char* CornerName(Corner c) {
   return n[static_cast<int>(c)];
 }
 
-Rect Place(const Mark& m, int imageW, int imageH, Corner c) {
+Rect Place(const Mark& m, const Rect& area, int imageH, Corner c) {
   const float k = static_cast<float>(imageH) / 1080.0f;
   const float w = m.image->w * m.scale * k, h = m.image->h * m.scale * k, g = m.margin * k;
   const bool right = c == Corner::BottomRight || c == Corner::TopRight;
   const bool bottom = c == Corner::BottomRight || c == Corner::BottomLeft;
-  return {right ? imageW - g - w : g, bottom ? imageH - g - h : g, w, h};
+  return {right ? area.x + area.w - g - w : area.x + g, bottom ? area.y + area.h - g - h : area.y + g, w, h};
 }
 
 bool LoadResourcePng(int id, Image* out) {
@@ -190,13 +190,13 @@ bool Overlay::Ensure(IDirect3DDevice9* dev, const Image* img) {
   return true;
 }
 
-void Overlay::Draw(IDirect3DDevice9* dev, const Mark& m, Corner c, int imageW, int imageH, int offX, int offY) {
+void Overlay::Draw(IDirect3DDevice9* dev, const Mark& m, Corner c, const Rect& area, int imageH, int offX, int offY) {
   if (!dev || !m.image || !Ensure(dev, m.image.get())) return;
   IDirect3DSurface9 *bb = nullptr, *rt = nullptr;
   if (FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb))) return;
   D3DSURFACE_DESC d;
   bb->GetDesc(&d);
-  Rect r = Place(m, imageW, imageH, c);
+  Rect r = Place(m, area, imageH, c);
   r.x -= offX;
   r.y -= offY;
   if (r.x + r.w <= 0 || r.y + r.h <= 0 || r.x >= d.Width || r.y >= d.Height) {  // not in this part

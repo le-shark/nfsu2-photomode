@@ -1,6 +1,8 @@
+#include <cstdlib>
 #include <string>
 
 #include "follow.h"
+#include "frame.h"
 #include "grid.h"
 #include "lens.h"
 #include "rig.h"
@@ -387,7 +389,7 @@ TEST(GridThirdsLines) {
   CHECK(grid::Thickness(720) == 1);
   CHECK(grid::Thickness(480) == 1);
   Line l[grid::kMaxLines];
-  CHECK(grid::Thirds(0, 0, 1920, 1080, l) == 8);
+  CHECK(grid::Thirds(0, 0, 1920, 1080, 2, l) == 8);
   CHECK(l[0].x == 639 && l[0].w == 2 && l[0].h == 1080);  // 640 - 1
   CHECK(l[1].x == 1279 && l[1].w == 2);
   CHECK(l[2].y == 359 && l[2].h == 2 && l[2].x == 0 && l[2].w == 639);
@@ -397,4 +399,43 @@ TEST(GridThirdsLines) {
   int area = 0;  // nothing drawn twice: the pieces add up to the lines' union
   for (const Line& x : l) area += x.w * x.h;
   CHECK(area == 2 * 2 * 1080 + 2 * 2 * 1920 - 4 * 2 * 2);
+  // Inside a 1:1 photo area, the lines stay inside it.
+  const frame::Rect f = frame::Fit(1920, 1080, 6);
+  grid::Thirds(f.x, f.y, f.w, f.h, 2, l);
+  for (const Line& x : l) CHECK(x.x >= f.x && x.y >= f.y && x.x + x.w <= f.x + f.w && x.y + x.h <= f.y + f.h);
+}
+
+TEST(AspectRatioFrames) {
+  frame::Rect f = frame::Fit(1920, 1080, 0);  // Native
+  CHECK(f.x == 0 && f.y == 0 && f.w == 1920 && f.h == 1080);
+  f = frame::Fit(1920, 1080, 1);  // 16:9 on a 16:9 screen: no bars
+  CHECK(f.x == 0 && f.y == 0 && f.w == 1920 && f.h == 1080);
+  f = frame::Fit(1920, 1080, 2);  // 16:10: pillars
+  CHECK(f.h == 1080 && f.w == 1728 && f.x == 96 && f.y == 0);
+  f = frame::Fit(1920, 1080, 3);  // 2.37:1: letterbox
+  CHECK(f.w == 1920 && f.h == 810 && f.y == 135);
+  f = frame::Fit(1920, 1080, 6);  // 1:1
+  CHECK(f.w == 1080 && f.h == 1080 && f.x == 420);
+  f = frame::Fit(1920, 1080, 7);  // 9:16
+  CHECK(f.h == 1080 && f.w == 608 && f.x == 656);
+  f = frame::Fit(1920, 1080, 10);  // 1:2.37
+  CHECK(f.h == 1080 && f.w == 456);
+  f = frame::Fit(2560, 1600, 1);  // 16:9 on 16:10
+  CHECK(f.w == 2560 && f.h == 1440 && f.y == 80);
+  for (int i = 0; i < frame::kCount; ++i) {  // bars + area cover the image exactly once
+    const frame::Rect a = frame::Fit(1366, 768, i);
+    frame::Rect b[4];
+    long long sum = static_cast<long long>(a.w) * a.h;
+    for (int k = 0, n = frame::Bars(1366, 768, a, b); k < n; ++k) {
+      CHECK(b[k].w > 0 && b[k].h > 0);
+      sum += static_cast<long long>(b[k].w) * b[k].h;
+    }
+    CHECK(sum == 1366LL * 768);
+    CHECK(std::string(frame::Name(i)).size() > 0);
+  }
+  // 2x: the whole image's area is twice the screen's, give or take a pixel of rounding.
+  for (int i = 0; i < frame::kCount; ++i) {
+    const frame::Rect s1 = frame::Fit(1920, 1080, i), s2 = frame::Fit(3840, 2160, i);
+    CHECK(std::abs(s2.w - 2 * s1.w) <= 1 && std::abs(s2.h - 2 * s1.h) <= 1);
+  }
 }

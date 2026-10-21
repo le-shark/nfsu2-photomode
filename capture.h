@@ -22,6 +22,8 @@ struct CaptureParams {
   bool supersample = false; // 2x: one pass into a 2W x 2H target (supersample.h), resolved in quarters
   float shutterSec = 0;     // 0 = no motion blur
   std::string outPath;      // full path of the .png
+  int aspect = 0;           // Aspect Ratio (frame.h): the bars are drawn into the image
+  bool crop = false;        // Crop to Ratio: the PNG is the photo area only
 };
 
 // What the controller does this frame.
