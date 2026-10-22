@@ -179,9 +179,6 @@ struct PhotoMode {
   bool frameArmed = false;    // main-frame EndScene pending
   bool endSceneHooked = false;
   bool captureHooks = false;  // EndScene and Present both hooked
-  LARGE_INTEGER switchQpc{};    // LogShaderReload: when photo mode last opened or closed (0: since the game started)
-  bool everOpened = false, reloadSeen = false;
-  int reloadLogged = 0;
   bool firstFrameDone = false;
   float postExitLog = 0;      // verbose: seconds left to log game state after exit
   float pauseRequest = 0;     // seconds left to open photo mode after its pause-menu icon resumed the race
@@ -705,8 +702,6 @@ void Enter() {
   g->stillTime = 0;
   g->frame = {};
   g->state = State::Active;
-  QueryPerformanceCounter(&g->switchQpc);
-  g->everOpened = true;
   ApplyCamera(0);
   // Camera::StopUpdating (set only by mods such as ExOpts) makes SetCameraMatrix ignore us.
   U2LOG("enter: cam pos (%.1f %.1f %.1f) dir (%.2f %.2f %.2f) fov %u (%.0fmm) car (%.1f %.1f %.1f) stopUpdating=%d view %s",
@@ -876,7 +871,6 @@ void Exit(const char* why, bool byPlayer = false) {
   // Put the cursor back: the game/WidescreenFix mouse-look reads cursor deltas.
   SetCursorPos(g->cursorAtEnter.x, g->cursorAtEnter.y);
   g->state = State::Off;
-  QueryPerformanceCounter(&g->switchQpc);
   if (g->cfg.verbose) g->postExitLog = 3;
   U2LOG("exit (%s): speed=%.2f hud=%d", why, Var<float>(addr::GameSpeed), Var<int>(addr::DrawHud));
 }
@@ -1366,34 +1360,12 @@ void Tick() {
 }
 
 // ---- hooks ----------------------------------------------------------------------------------
-// Shader-reload log (2026-10-21, a tester's crash, status doc "Beta feedback"): another mod in their setup set the
-// effect-reload request [0x8707C4] (no game code writes it) just after photo mode opened, and the reload crashed
-// inside NFSU2ShaderLoader. Read only (user: photo mode never changes another mod's request): each request is logged
-// with the time since photo mode opened or closed (or since the first frame), before RenderFrame acts on it
-// (0x5D2BFA, later in this frame). At most kMaxReloadLogs lines, so a mod that reloads every frame cannot flood the log.
-constexpr int kMaxReloadLogs = 10;
-void LogShaderReload() {
-  const int request = Var<int>(addr::EffectReloadRequest);
-  if (request && !g->reloadSeen && g->reloadLogged < kMaxReloadLogs) {
-    ++g->reloadLogged;
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-    const double s = static_cast<double>(now.QuadPart - g->switchQpc.QuadPart) / g->qpcFreq.QuadPart;
-    U2LOG("shader reload requested by another mod (value %d), %.2f s after photo mode %s", request, s,
-          g->state != State::Off ? "opened" : g->everOpened ? "closed" : "loaded");
-  }
-  g->reloadSeen = request != 0;
-}
-
 void __cdecl FrameDetour() {
-  if (!g->firstFrameDone) {  // every ASI is loaded by now
+  if (!g->firstFrameDone) {  // every ASI is loaded by now: the mod list, with load addresses, for testers' logs
     g->firstFrameDone = true;
-    QueryPerformanceCounter(&g->switchQpc);
     crash::LogModules();
-    if (g->cfg.verbose) crash::WatchWrites(addr::EffectReloadRequest, "shader reload request");
   }
   Tick();
-  LogShaderReload();
   oFrame();
 }
 
