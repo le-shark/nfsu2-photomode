@@ -647,6 +647,25 @@ void LoadWatermarks() {
     if (i != g->watermark) g->wm[i].mark.image.reset();
 }
 
+// Native DOF and motion blur off while photo mode is open (useless for photos, docs/kb/photomode-internals.md).
+// DOF = 0 only when RenderFrame's DOF-off path is the game's own code (2026-10-22, a tester's crash with
+// NFSU2HDReflections ImproveMotionBlur): with DOF 0, RenderFrame jumps to 0x5D29D1 (je at 0x5D298C), 2 bytes into the
+// mod's 5-byte JMP at 0x5D29CF (AeroWidescreen NFSHDReflections SOURCE/NFSU2 dllmain.cpp:231-232), so its address bytes
+// run as code; one outcome changes edi, which the reload test at 0x5D2BFA compares with [0x8707C4], and the game then
+// reloads its shaders every frame (the crash in NFSU2ShaderLoader). Writing the saved values back is safe: only 0
+// takes that branch. Motion blur's flag is not involved (the mod never reads it). verified-in-binary.md "Effect reload
+// condition".
+bool DofOffPathIsOriginal() {
+  return std::memcmp(reinterpret_cast<const void*>(0x5D29CF), "\x7A\x0C\xC6\x05\xCC\x07\x87\x00\x00", 9) == 0;
+}
+
+void ZeroNativeFx(bool log) {
+  Var<int>(addr::g_MotionBlurEnable) = 0;
+  if (DofOffPathIsOriginal()) Var<int>(addr::g_DepthOfFieldEnable) = 0;
+  else if (log) U2LOG("enter: native DOF left as it is: another mod patched its off path at 0x5D29CF (HD Reflections "
+                      "ImproveMotionBlur?); zeroing it would crash");
+}
+
 void Enter() {
   LoadWatermarks();
   g->rangeCar = nullptr;
@@ -675,8 +694,7 @@ void Enter() {
   g->uiHidden = false;
   g->backGuard = 0;
   freeze::Hold(true);
-  Var<int>(addr::g_DepthOfFieldEnable) = 0;  // turning effects off is always safe
-  Var<int>(addr::g_MotionBlurEnable) = 0;
+  ZeroNativeFx(true);
   GetCursorPos(&g->cursorAtEnter);
   Var<uint8_t>(addr::FECursorVisible) = 0;  // hide the FE cursor, like the game's showcase photo shoot (0x4CEE11)
   g->input.SetMouseCapture(true);
@@ -1213,10 +1231,7 @@ void Tick() {
   g->frameArmed = true;
   if (g->rezeroNativeFx) {  // after a device reset (OnDeviceReset); the reset frame itself draws nothing
     g->rezeroNativeFx = false;
-    if (g->state != State::Off) {
-      Var<int>(addr::g_DepthOfFieldEnable) = 0;
-      Var<int>(addr::g_MotionBlurEnable) = 0;
-    }
+    if (g->state != State::Off) ZeroNativeFx(false);
   }
   menu::Tick();
   if (g->state == State::Off) {
