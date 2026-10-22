@@ -1365,6 +1365,9 @@ void Tick() {
     return;
   }
   menu::SetHidden((g->uiHidden && g->state == State::Active) || g->driving);
+  // Esc / pad B cancel a capture here (HandleFrame); reaching the menu as Back they also faded every row out for good
+  // (user 2026-10-22: only the grey Focus row was left), so the menu takes no input meanwhile.
+  menu::SetInputBlocked(g->state == State::Capturing || g->backGuard > 0);
   menu::Update("Photo Mode", StatusText());
   g->lastDt = dt > 0 ? dt : g->lastDt;
 }
