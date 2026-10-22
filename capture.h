@@ -58,6 +58,8 @@ class Capture {
   std::string TakeMessage();
   bool Saving() const;
   int Tile() const { return tile_; }  // the tile or 2x quarter being sampled / resolved
+  // The backbuffer is multisampled (in-game FSAA): each resolve frame is followed by an edge frame (edges.h).
+  bool EdgeFrames() const { return edgeFrames_; }
 
  private:
   void Release();  // surfaces and buffers
@@ -74,10 +76,14 @@ class Capture {
   int warm_ = 0;                   // supersample warm-up frames planned
   bool resolveArmed_ = false;     // a resolve frame is pending its EndScene readback
   bool tileDone_ = false;         // the tile was read back; the next frame starts the next one
-  bool msaa_ = false;             // the back buffer is multisampled: each resolve gets an edge frame (edges.h)
+  bool edgeFrames_ = false;       // see EdgeFrames
   bool edgePending_ = false;      // the tile was read back; its edge frame comes next
   IDirect3DSurface9* rt_ = nullptr;
   IDirect3DSurface9* sys_ = nullptr;
+  // The edge frame's readback: only the rectangle its pieces cover (edgeW_ x edgeH_ from the top-left).
+  IDirect3DSurface9* edgeRt_ = nullptr;
+  IDirect3DSurface9* edgeSys_ = nullptr;
+  int edgeW_ = 0, edgeH_ = 0;
   std::vector<uint8_t> image_;
   std::atomic<int> saving_{0};  // PNG writer threads still running
 

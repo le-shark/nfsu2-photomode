@@ -18,13 +18,14 @@
 //   the one that paused, RaceCoordinator+0x20 (written by the state-4 event 7 handler, native-screen.md 2.1); the
 //   player is the one of 0x8900AC / 0x8900B0 whose +8 equals it, as 0x4A7BF0 picks it.
 // - That pause menu opens on our icon (user 2026-10-20). Setup 0x4D9300 always starts on the first icon: it sets the
-//   last button to 0 (0x4D9391) and passes it to the scroller's SetInitialPos (menu+0x4C, vtable +0x20, an index in
-//   the order the icons were added; ExOpts LanguageSelectScreen.h:205-209, career hub.cpp), then Update (+4), then
-//   tail-calls RefreshHeader (0x4D93BC). Our RefreshHeader hook does the same two calls with our icon's index first.
+//   last button to 0 (0x4D9391) and passes it to the scroller's SetInitialPos (menu+0x4C, vtable +0x20 = 0x538A30;
+//   ExOpts LanguageSelectScreen.h:205-209, career hub.cpp), then Update (+4), then tail-calls RefreshHeader
+//   (0x4D93BC). SetInitialPos takes a 1-based position in the order the icons were added (0 = the first): it picks
+//   GetAt(pos - 1) only when pos > 0 (0x538A4D..0x538A55; GetAt 0x43BE60 is 0-based). Our RefreshHeader hook does the
+//   same two calls with our icon's position first.
 #include "pauseentry.h"
 
 #include <cstdint>
-#include <cstring>
 
 #include "u2sdk/game.h"
 #include "u2sdk/hook.h"
@@ -38,7 +39,9 @@ template <typename F>
 F Fn(uintptr_t a) { return reinterpret_cast<F>(a); }
 
 constexpr uintptr_t kAddOption = 0x50DAB0, kRefreshHeader = 0x50DA50;
-constexpr uintptr_t kPauseVtbl = 0x797CB0, kOptionsOptVtbl = 0x795510, kResumeReact = 0x4C24C0;
+// The pause menu's vtable; the Options and Resume Race icon options' vtables (slot 1 = their React).
+constexpr uintptr_t kPauseVtbl = 0x797CB0, kOptionsOptVtbl = 0x795510, kResumeOptVtbl = 0x7954D0;
+constexpr uintptr_t kResumeReact = 0x4C24C0;
 constexpr uint32_t kMsgSelect = 0xC407210;
 constexpr uint32_t kIconShowcase = 0xD1D9D8A4;
 constexpr uint32_t kScShowcase = 0x535A2751;  // SC_SHOWCASE "ShowCase"; the caption is printed by RefreshDetour
@@ -54,13 +57,13 @@ AddOptionFn oAddOption = nullptr;
 RefreshFn oRefresh = nullptr;
 bool g_request = false;
 int g_port = 0;  // the port that paused, read when the icon is selected
-// Icon count of the pause menu being built (AddOption), our icon's index in it, and whether the next pause menu
-// should open on it. A RefreshHeader call ends the building: Setup calls it last.
+// Icon count of the pause menu being built (AddOption), our icon's 1-based position in it, and whether the next pause
+// menu should open on it. A RefreshHeader call ends the building: Setup calls it last.
 void* g_menu = nullptr;
 int g_count = 0, g_ourIndex = -1;
 bool g_built = true, g_selectOurs = false;
 
-constexpr uintptr_t kPlayers = 0x8900AC, kPauseJoyHandler = 0x602BD0, kPauseKeyBlock = 0x861E78;
+constexpr uintptr_t kPauseJoyHandler = 0x602BD0, kPauseKeyBlock = 0x861E78, kPauseBlock2 = 0x85EF50 + 0x1C;
 constexpr uint32_t kJoyPause = 0xBD;
 
 void __fastcall PhotoReact(void* opt, void* edx, const char* pkg, uint32_t msg, void* obj, uint32_t p1, uint32_t p2) {
@@ -76,10 +79,9 @@ bool IsOurs(void* opt) { return opt && *static_cast<void**>(opt) == static_cast<
 void* CurrentOption(void* menu) { return *reinterpret_cast<void**>(static_cast<uint8_t*>(menu) + 0x58); }
 
 int __fastcall AddOptionDetour(void* menu, void* edx, void* opt) {
-  // Read before the call: AddOption may free the option when there is no slot.
-  bool afterOptions = opt && menu && *static_cast<uintptr_t*>(opt) == kOptionsOptVtbl &&
-                      *static_cast<uintptr_t*>(menu) == kPauseVtbl;
   const bool pause = menu && *static_cast<uintptr_t*>(menu) == kPauseVtbl;
+  // Read before the call: AddOption may free the option when there is no slot.
+  const bool afterOptions = pause && opt && *static_cast<uintptr_t*>(opt) == kOptionsOptVtbl;
   if (pause && (g_built || menu != g_menu)) {
     g_menu = menu;
     g_count = 0;
@@ -92,9 +94,11 @@ int __fastcall AddOptionDetour(void* menu, void* edx, void* opt) {
     if (void* o = GameMalloc(0x48)) {
       IconOption_ctor(o, nullptr, kIconShowcase, kScShowcase, 0);
       *static_cast<void**>(o) = g_vtbl;
-      AddOptionFn add = *reinterpret_cast<AddOptionFn*>(*static_cast<uint8_t**>(menu) + 0x18);  // slot 6, as 0x4C2A7D
+      // Slot 6, as 0x4C2A7D. It is AddOption 0x50DAB0 itself ([0x797CC8]), so this goes through our detour again,
+      // which counts our icon: g_count is then its 1-based position, what SetInitialPos takes (RefreshDetour).
+      AddOptionFn add = *reinterpret_cast<AddOptionFn*>(*static_cast<uint8_t**>(menu) + 0x18);
       int s = add(menu, nullptr, o);
-      if (s) g_ourIndex = g_count++;
+      if (s) g_ourIndex = g_count;
       U2LOG("pause menu: Photo Mode icon %s", s ? "added" : "NO SLOT (deleted by the game)");
     }
   }
@@ -111,7 +115,7 @@ void __fastcall RefreshDetour(void* menu, void* edx) {
       uint8_t* scroller = static_cast<uint8_t*>(menu) + 0x4C;
       (*reinterpret_cast<PosFn*>(*reinterpret_cast<uint8_t**>(scroller) + 0x20))(scroller, nullptr, g_ourIndex);
       (*reinterpret_cast<UpdFn*>(*reinterpret_cast<uint8_t**>(scroller) + 4))(scroller, nullptr);
-      U2LOG("pause menu: opened on Photo Mode (icon %d of %d)", g_ourIndex + 1, g_count);
+      U2LOG("pause menu: opened on Photo Mode (icon %d of %d)", g_ourIndex, g_count);
     }
     g_selectOurs = false;
   }
@@ -121,18 +125,14 @@ void __fastcall RefreshDetour(void* menu, void* edx) {
   if (IsOurs(CurrentOption(menu)) && label) FEngPrintf(label, "%s", "Photo Mode");
 }
 
-bool EntryIs(uintptr_t at, const char* bytes, size_t n) {
-  const uint8_t* p = reinterpret_cast<const uint8_t*>(at);
-  if (*p == 0xE9) return true;  // another of our ASIs hooked it first (MinHook chains; lessons.md section 1)
-  return std::memcmp(p, bytes, n) == 0;
-}
 }  // namespace
 
 bool Install() {
+  using u2::hook::EntryIs;
   bool add = EntryIs(kAddOption, "\x8B\x41\x4C\x56\x8B\x74\x24\x08", 8);
   bool ref = EntryIs(kRefreshHeader, "\x56\x8B\xF1\x8B\x46\x58\x85\xC0", 8);
   bool opt = *reinterpret_cast<const uintptr_t*>(kOptionsOptVtbl + 4) == 0x4C2700 &&
-             *reinterpret_cast<const uintptr_t*>(0x7954D0 + 4) == kResumeReact;
+             *reinterpret_cast<const uintptr_t*>(kResumeOptVtbl + 4) == kResumeReact;
   if (!add || !ref || !opt) {
     U2LOG("pause menu: code differs (AddOption %d, RefreshHeader %d, option vtables %d); no Photo Mode icon", add, ref, opt);
     return false;
@@ -144,9 +144,11 @@ bool Install() {
 }
 
 bool ReopenPauseMenu() {
-  if (Var<uint8_t>(kPauseKeyBlock)) return false;  // 0x5004C0 would refuse; the photo menu's block is released later
+  // The handler refuses silently while either pause block is set (0x602C10..0x602C2E): Career+0x7138 (0x5004C0; the
+  // photo menu's block is released a little later) and [0x85EF50]+0x1C (0x5012C0). Asked again next frame meanwhile.
+  if (Var<uint8_t>(kPauseKeyBlock) || Var<uint8_t>(kPauseBlock2)) return false;
   for (int i = 0; i < 2; ++i) {
-    auto p = reinterpret_cast<uint8_t**>(kPlayers)[i];
+    auto p = reinterpret_cast<uint8_t**>(u2::addr::PlayersByNumber)[i];
     if (!p || *reinterpret_cast<int*>(p + 8) != g_port) continue;
     using JoyFn = void(__fastcall*)(void*, void*, int, uint32_t, uint32_t);
     g_selectOurs = true;

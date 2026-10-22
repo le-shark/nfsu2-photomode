@@ -3,13 +3,14 @@
 #include <d3d9.h>
 #include <windows.h>
 
-#include <cstring>
+#include <algorithm>
 #include <new>
 #include <thread>
 
 #include "edges.h"
 #include "frame.h"
 #include "lens.h"
+#include "u2sdk/d3d.h"
 #include "u2sdk/dev.h"
 #include "u2sdk/log.h"
 
@@ -21,21 +22,29 @@ bool Capture::Start(IDirect3DDevice9* dev, const CaptureParams& p, std::string* 
   p_.sample.tiles = u2::ClampInt(p.sample.tiles, 1, lens::kMaxTiles);
   if (p_.sample.samples < 1) p_.sample.samples = 1;
 
-  IDirect3DSurface9* bb = nullptr;
-  if (!dev || FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb))) {
+  D3DSURFACE_DESC d;
+  if (!u2::d3d::BackBufferDesc(dev, &d)) {
     *error = "Capture failed: no back buffer";
     return false;
   }
-  D3DSURFACE_DESC d;
-  bb->GetDesc(&d);
-  bb->Release();
   width_ = static_cast<int>(d.Width);
   height_ = static_cast<int>(d.Height);
   edges::Piece layout[edges::kPieces];
-  msaa_ = d.MultiSampleType != D3DMULTISAMPLE_NONE && edges::Layout(width_, height_, layout);
+  edgeFrames_ = d.MultiSampleType != D3DMULTISAMPLE_NONE && edges::Layout(width_, height_, layout);
+  edgeW_ = edgeH_ = 0;
+  if (edgeFrames_)
+    for (const edges::Piece& pc : layout) {
+      edgeW_ = (std::max)(edgeW_, pc.dx + pc.w);
+      edgeH_ = (std::max)(edgeH_, pc.dy + pc.h);
+    }
 
   if (FAILED(dev->CreateRenderTarget(d.Width, d.Height, D3DFMT_X8R8G8B8, D3DMULTISAMPLE_NONE, 0, FALSE, &rt_, nullptr)) ||
-      FAILED(dev->CreateOffscreenPlainSurface(d.Width, d.Height, D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM, &sys_, nullptr))) {
+      FAILED(dev->CreateOffscreenPlainSurface(d.Width, d.Height, D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM, &sys_, nullptr)) ||
+      (edgeFrames_ &&
+       (FAILED(dev->CreateRenderTarget(edgeW_, edgeH_, D3DFMT_X8R8G8B8, D3DMULTISAMPLE_NONE, 0, FALSE, &edgeRt_,
+                                       nullptr)) ||
+        FAILED(dev->CreateOffscreenPlainSurface(edgeW_, edgeH_, D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM, &edgeSys_,
+                                                nullptr))))) {
     *error = "Capture failed: could not create the capture surfaces";
     Release();
     return false;
@@ -53,7 +62,7 @@ bool Capture::Start(IDirect3DDevice9* dev, const CaptureParams& p, std::string* 
   active_ = true;
   U2LOG("capture start: %dx%d tiles=%d samples=%d lens=%.4fm focus=%.2fm shutter=%.4fs%s -> %s", width_, height_,
         p_.sample.tiles, p_.sample.samples, p_.sample.lensRadius, p_.sample.focusDist, p_.shutterSec,
-        msaa_ ? " fsaa-edges" : "", p_.outPath.c_str());
+        edgeFrames_ ? " fsaa-edges" : "", p_.outPath.c_str());
   return true;
 }
 
@@ -135,7 +144,7 @@ void Capture::OnEndScene(IDirect3DDevice9* dev) {
   }
   sys_->UnlockRect();
   resolveArmed_ = false;
-  if (msaa_) {
+  if (edgeFrames_) {
     edgePending_ = true;  // the next frame shows the edge pieces (BeginFrame)
     return;
   }
@@ -151,16 +160,19 @@ void Capture::TileRead() {
 // The edge frame (edges.h): the pieces at their inside places; each pixel goes back to its edge in this tile, inside
 // the photo area only (the Aspect Ratio bars stay as the normal frame drew them).
 void Capture::ReadEdges(IDirect3DDevice9* dev) {
+  // Only the rectangle the pieces cover (about a quarter of the screen): the full-screen readback cost 2.9 ms at 1080p
+  // and 12-14 ms at 4K per piece (review 2026-10-22).
   IDirect3DSurface9* bb = nullptr;
   if (FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb))) return;
-  HRESULT hr = dev->StretchRect(bb, nullptr, rt_, nullptr, D3DTEXF_NONE);
+  const RECT r{0, 0, edgeW_, edgeH_};
+  HRESULT hr = dev->StretchRect(bb, &r, edgeRt_, nullptr, D3DTEXF_NONE);
   bb->Release();
-  if (FAILED(hr) || FAILED(dev->GetRenderTargetData(rt_, sys_))) {
+  if (FAILED(hr) || FAILED(dev->GetRenderTargetData(edgeRt_, edgeSys_))) {
     Abort("edge readback failed");
     return;
   }
   D3DLOCKED_RECT lr;
-  if (FAILED(sys_->LockRect(&lr, nullptr, D3DLOCK_READONLY))) {
+  if (FAILED(edgeSys_->LockRect(&lr, nullptr, D3DLOCK_READONLY))) {
     Abort("edge lock failed");
     return;
   }
@@ -183,7 +195,7 @@ void Capture::ReadEdges(IDirect3DDevice9* dev) {
         dst[2] = src[0];
         ++written;
       }
-  sys_->UnlockRect();
+  edgeSys_->UnlockRect();
   if (tile_ == 0) U2LOG("capture: FSAA edge frame, %d edge pixels written back per screen piece", written);
   resolveArmed_ = edgePending_ = false;
   TileRead();
@@ -191,26 +203,26 @@ void Capture::ReadEdges(IDirect3DDevice9* dev) {
 
 void Capture::Finish() {
   active_ = false;
-  int w = width_ * p_.sample.tiles, h = height_ * p_.sample.tiles;
+  const int fullW = width_ * p_.sample.tiles, fullH = height_ * p_.sample.tiles;
+  const int aspect = p_.aspect;
+  const bool crop = p_.crop;
   std::string path = p_.outPath;
   auto img = std::make_shared<std::vector<uint8_t>>(std::move(image_));
-  if (p_.crop) {  // Crop to Ratio: keep the photo area (the same frame::Fit the bars were drawn around), in place
-    const frame::Rect a = frame::Fit(w, h, p_.aspect);
-    if (a.w < w || a.h < h) {
-      uint8_t* px = img->data();
-      for (int y = 0; y < a.h; ++y)
-        std::memmove(px + static_cast<size_t>(y) * a.w * 3, px + (static_cast<size_t>(a.y + y) * w + a.x) * 3,
-                     static_cast<size_t>(a.w) * 3);
-      img->resize(static_cast<size_t>(a.w) * a.h * 3);
-      U2LOG("crop to %s: %dx%d -> %dx%d", frame::Name(p_.aspect), w, h, a.w, a.h);
-      w = a.w;
-      h = a.h;
-    }
-  }
   Release();
   ++saving_;
   Notify("Saving...");
-  std::thread([this, img, w, h, path] {
+  // The crop runs on the writer thread too (9.8 ms at 7680x4320, review 2026-10-22).
+  std::thread([this, img, fullW, fullH, aspect, crop, path] {
+    int w = fullW, h = fullH;
+    if (crop) {  // Crop to Ratio: keep the photo area (the same frame::Fit the bars were drawn around)
+      const frame::Rect a = frame::CropInPlace(img->data(), w, h, aspect);
+      if (a.w < w || a.h < h) {
+        img->resize(static_cast<size_t>(a.w) * a.h * 3);
+        U2LOG("crop to %s: %dx%d -> %dx%d", frame::Name(aspect), w, h, a.w, a.h);
+        w = a.w;
+        h = a.h;
+      }
+    }
     bool ok = u2::dev::SavePng(path, w, h, img->data());
     U2LOG("png %s (%dx%d): %s", path.c_str(), w, h, ok ? "saved" : "FAILED");
     std::string name = path.substr(path.find_last_of("\\/") + 1);
@@ -238,6 +250,8 @@ bool Capture::Saving() const { return saving_ > 0; }
 void Capture::Release() {
   if (rt_) { rt_->Release(); rt_ = nullptr; }
   if (sys_) { sys_->Release(); sys_ = nullptr; }
+  if (edgeRt_) { edgeRt_->Release(); edgeRt_ = nullptr; }
+  if (edgeSys_) { edgeSys_->Release(); edgeSys_ = nullptr; }
   std::vector<uint8_t>().swap(image_);
 }
 

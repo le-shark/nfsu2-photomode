@@ -2,6 +2,9 @@
 // Aspect Ratio (user 2026-10-21): the photo area inside the screen (or the whole 2x / tiled image), centred, as large
 // as fits; the rest gets solid black bars, on screen and in the photo. Crop to Ratio cuts the bars off the saved PNG.
 // Pure integer maths, so the screen, the 2x quarters and the crop agree to the pixel (unit-tested).
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
 
 namespace photomode::frame {
 
@@ -45,6 +48,17 @@ inline int Bars(int w, int h, const Rect& f, Rect out[4]) {
   if (f.x > 0) out[n++] = {0, f.y, f.x, f.h};
   if (f.x + f.w < w) out[n++] = {f.x + f.w, f.y, w - f.x - f.w, f.h};
   return n;
+}
+
+// Crop to Ratio: moves the photo area of a w x h RGB image (3 bytes a pixel, rows packed) to the front, rows packed
+// at the area's width, and returns the area. Rows only move forward, so memmove in place is safe.
+inline Rect CropInPlace(uint8_t* px, int w, int h, int i) {
+  const Rect a = Fit(w, h, i);
+  if (a.w < w || a.h < h)
+    for (int y = 0; y < a.h; ++y)
+      std::memmove(px + static_cast<size_t>(y) * a.w * 3, px + (static_cast<size_t>(a.y + y) * w + a.x) * 3,
+                   static_cast<size_t>(a.w) * 3);
+  return a;
 }
 
 }  // namespace photomode::frame

@@ -13,6 +13,7 @@
 #include "sampling.h"
 #include "watermark.h"
 #include "test.h"
+#include "u2sdk/optmenu.h"
 
 using namespace photomode;
 using u2::Vec3;
@@ -379,7 +380,7 @@ TEST(WatermarkListNames) {
   CHECK(watermark::ListName(L"WATERMARK.PNG", &n) && n == "WATERMARK");
   CHECK(watermark::ListName(L"v1.2.png", &n) && n == "v1.2");
   CHECK(watermark::ListName(L"logo", &n) && n == "logo");
-  CHECK(watermark::ListName(L"café.png", &n) && n == "caf?");
+  CHECK(watermark::ListName(L"caf\u00e9.png", &n) && n == "caf?");
   CHECK(!watermark::ListName(L".png", &n));
 }
 
@@ -444,7 +445,7 @@ TEST(AspectRatioFrames) {
 // A synthetic depth image: camera 0.8 m up at the origin looking along world +X (Z up), a wall at x = 20 and a car box whose
 // front face is at x = 7.8 (centre x = 10, half 2.2 x 0.9 x 0.65 around z = 0.5).
 TEST(FocusProbeFindsDrawnSurfaces) {
-  using namespace daylight::aomath;
+  using namespace u2::aomath;
   const double eye[3] = {0, 0, 0.8};
   double view[16] = {0, 0, 1, 0, -1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1};
   view[12] = -(eye[0] * view[0] + eye[1] * view[4] + eye[2] * view[8]);
@@ -461,6 +462,7 @@ TEST(FocusProbeFindsDrawnSurfaces) {
   const float p22 = static_cast<float>(f / (f - n)), p32 = static_cast<float>(-n * f / (f - n));
   const int w = 320, h = 180;
   std::vector<float> depth(w * h);
+  int faceTexels = 0;
   for (int y = 0; y < h; ++y)
     for (int x = 0; x < w; ++x) {
       const double u = (x + 0.5) / w, v = (y + 0.5) / h;
@@ -468,19 +470,50 @@ TEST(FocusProbeFindsDrawnSurfaces) {
       for (int i = 0; i < 3; ++i) ray[i] = fr.rayTL[i] + u * fr.rayDU[i] + v * fr.rayDV[i];  // at view z 1 (= world x)
       double z = 20;
       const double t = 7.8, py = ray[1] * t, pz = eye[2] + ray[2] * t;
-      if (std::fabs(py) <= 0.9 && pz >= 0.5 - 0.65 && pz <= 0.5 + 0.65) z = t;
+      if (std::fabs(py) <= 0.9 && pz >= 0.5 - 0.65 && pz <= 0.5 + 0.65) z = t, ++faceTexels;
       depth[y * w + x] = static_cast<float>(p22 + p32 / z);
     }
   CarPose car;
   car.pos = {10, 0, 0};
   car.axis[0] = {1, 0, 0}, car.axis[1] = {0, 1, 0}, car.axis[2] = {0, 0, 1};
   car.boxMin = {-2.2f, -0.9f, -0.15f}, car.boxMax = {2.2f, 0.9f, 1.15f};
-  const probe::Result r = probe::Evaluate(depth.data(), w, h, w, fr, p22, p32, {0, 0, 0.8f}, &car);
+  const probe::Result r = probe::Evaluate(depth.data(), w, h, w, fr, p22, p32, {0, 0, 0.8f}, &car, true);
   CHECK(r.aimHit);
   CHECK_NEAR(r.aimZ, 7.8, 0.01);  // the box's face at the centre (the eye is at its height)
   CHECK(r.carHit);
   CHECK_NEAR(r.carZ, 7.8, 0.01);
-  CHECK(r.carTexels > 0);
+  CHECK(r.carTexels == faceTexels);  // the flat face, all at carZ; never the wall behind
+  CHECK(probe::Evaluate(depth.data(), w, h, w, fr, p22, p32, {0, 0, 0.8f}, &car).carTexels == 0);  // only on request
+  // The search only covers the box's screen rectangle: the same nearest point as every texel, for cars across the
+  // view, partly off-screen, and around the camera (the whole image then).
+  auto fullSearch = [&](const CarPose& c) {
+    Vec3 b[3];
+    detail::Basis(c, b);
+    const Vec3 centre = c.pos + detail::ToWorld(b, detail::BoxCentre(c)) - Vec3{0, 0, 0.8f};
+    const Vec3 half = detail::BoxHalf(c) + Vec3{probe::kCarInflate, probe::kCarInflate, probe::kCarInflate};
+    const Vec3 tl{fr.rayTL[0], fr.rayTL[1], fr.rayTL[2]}, du{fr.rayDU[0], fr.rayDU[1], fr.rayDU[2]},
+        dv{fr.rayDV[0], fr.rayDV[1], fr.rayDV[2]};
+    float best = -1;
+    for (int y = 0; y < h; ++y)
+      for (int x = 0; x < w; ++x) {
+        const float d = depth[y * w + x];
+        if (d >= probe::kSky) continue;
+        const float z = p32 / (d - p22);
+        const Vec3 l = detail::ToLocal(b, (tl + du * ((x + 0.5f) / w) + dv * ((y + 0.5f) / h)) * z - centre);
+        if (std::fabs(l.x) <= half.x && std::fabs(l.y) <= half.y && std::fabs(l.z) <= half.z && (best < 0 || z < best))
+          best = z;
+      }
+    return best;
+  };
+  const Vec3 places[] = {{10, 0, 0}, {10, 4, 0}, {10, -4.5f, 0}, {8, 0, 0}, {19, 9, 0}, {1, 0, 0}, {0, 0, 0}};
+  for (const Vec3& at : places) {
+    CarPose c = car;
+    c.pos = at;
+    const probe::Result q = probe::Evaluate(depth.data(), w, h, w, fr, p22, p32, {0, 0, 0.8f}, &c);
+    const float best = fullSearch(c);
+    CHECK(q.carHit == (best >= 0));
+    if (q.carHit) CHECK_NEAR(q.carZ, best, 1e-4);
+  }
   // Without the car the wall is still found at the centre? Only where the box is not: move the car aside.
   car.pos = {10, 50, 0};
   const probe::Result r2 = probe::Evaluate(depth.data(), w, h, w, fr, p22, p32, {0, 0, 0.8f}, &car);
@@ -520,4 +553,56 @@ TEST(EdgeFramePieces) {
   }
   edges::Piece p[edges::kPieces];
   CHECK(!edges::Layout(8, 8, p));  // too small to fit
+  CHECK(!edges::Layout(0, 0, p) && !edges::Layout(1, 1, p));
+}
+
+// Long menu values (u2sdk optmenu FitText): a font of 7 units a character, a 70-unit column.
+TEST(MenuValueEllipsis) {
+  auto fits = [](const std::string& t) { return t.size() * 7 <= 70; };
+  CHECK(u2::optmenu::FitText("Short", 31, fits) == "Short");
+  CHECK(u2::optmenu::FitText("Exactly 10", 31, fits) == "Exactly 10");
+  CHECK(u2::optmenu::FitText("A long watermark name", 31, fits) == "A long...");  // the space before ... dropped
+  CHECK(u2::optmenu::FitText("", 31, fits).empty());
+  auto never = [](const std::string&) { return false; };
+  CHECK(u2::optmenu::FitText("Anything", 31, never) == "...");  // nothing fits: a lone ... in the end
+  // Never longer than the buffer, whatever fits says.
+  const std::string longName(40, 'x');
+  auto all = [](const std::string&) { return true; };
+  const std::string t = u2::optmenu::FitText(longName, 31, all);
+  CHECK(t.size() == 31 && t.substr(28) == "...");
+}
+
+// Crop to Ratio in place (frame::CropInPlace): the area's rows end up packed at the front, pixel for pixel.
+TEST(CropKeepsThePhotoArea) {
+  const int w = 16, h = 9;
+  for (int i = 0; i < frame::kCount; ++i) {
+    std::vector<uint8_t> px(static_cast<size_t>(w) * h * 3);
+    for (int y = 0; y < h; ++y)
+      for (int x = 0; x < w; ++x) px[(static_cast<size_t>(y) * w + x) * 3] = static_cast<uint8_t>(y * w + x);
+    const std::vector<uint8_t> before = px;
+    const frame::Rect a = frame::CropInPlace(px.data(), w, h, i);
+    for (int y = 0; y < a.h; ++y)
+      for (int x = 0; x < a.w; ++x)
+        CHECK(px[(static_cast<size_t>(y) * a.w + x) * 3] == before[(static_cast<size_t>(a.y + y) * w + a.x + x) * 3]);
+  }
+}
+
+// Watermark placement (watermark::Place): in the photo area's corner, size and margin scaled with the image height.
+TEST(WatermarkPlacement) {
+  auto img = std::make_shared<watermark::Image>();
+  img->w = 444, img->h = 164;
+  const watermark::Mark m{img, 1, 24};
+  const watermark::Rect area{656, 0, 608, 1080};  // 9:16 on a 1080p screen
+  watermark::Rect r = watermark::Place(m, area, 1080, watermark::Corner::BottomRight);
+  CHECK_NEAR(r.x, 656 + 608 - 24 - 444, 1e-3);
+  CHECK_NEAR(r.y, 1080 - 24 - 164, 1e-3);
+  r = watermark::Place(m, area, 1080, watermark::Corner::TopLeft);
+  CHECK_NEAR(r.x, 656 + 24, 1e-3);
+  CHECK_NEAR(r.y, 24, 1e-3);
+  const watermark::Rect area2{1312, 0, 1215, 2160};  // the same at 2x: twice the size and margin
+  r = watermark::Place(m, area2, 2160, watermark::Corner::BottomLeft);
+  CHECK_NEAR(r.w, 888, 1e-3);
+  CHECK_NEAR(r.h, 328, 1e-3);
+  CHECK_NEAR(r.x, 1312 + 48, 1e-3);
+  CHECK_NEAR(r.y, 2160 - 48 - 328, 1e-3);
 }

@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <d3d9.h>
 
+#include "u2sdk/d3d.h"
 #include "u2sdk/game.h"
 #include "u2sdk/log.h"
 
@@ -63,16 +64,12 @@ void FocusProbe::Fail(const char* what, long hr) {
   if (!failed_) U2LOG("focus probe: %s failed (hr=0x%08lX); Aim / Closest keep the box and ray method", what, hr);
   failed_ = true;
   Free();
-  failed_ = true;
 }
 
 bool FocusProbe::Ensure(IDirect3DDevice9* dev) {
   if (failed_ || !dev) return false;
-  IDirect3DSurface9* bb = nullptr;
-  if (FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb))) return false;
   D3DSURFACE_DESC d;
-  bb->GetDesc(&d);
-  bb->Release();
+  if (!u2::d3d::BackBufferDesc(dev, &d)) return false;
   const int w = static_cast<int>(d.Width) / 2, h = static_cast<int>(d.Height) / 2;
   if (super_.Ready() && w == w_ && h == h_) return true;
   Free();
@@ -102,7 +99,7 @@ bool FocusProbe::Ensure(IDirect3DDevice9* dev) {
   return true;
 }
 
-bool FocusProbe::Read(IDirect3DDevice9* dev, const CarPose* car, Result* out) {
+bool FocusProbe::Read(IDirect3DDevice9* dev, const CarPose* car, bool countTexels, Result* out) {
   *out = {};
   if (failed_ || !super_.DepthTexture() || !r32_) return false;
   // View 1's matrices and eye as this probe frame rendered them (daylight/depth.cpp CurrentView).
@@ -111,8 +108,8 @@ bool FocusProbe::Read(IDirect3DDevice9* dev, const CarPose* car, Result* out) {
   const auto* plat = static_cast<const uint8_t*>(view->PlatInfo);
   const float p22 = *reinterpret_cast<const float*>(plat + 0x68), p32 = *reinterpret_cast<const float*>(plat + 0x78);
   const float eyeF[3] = {view->Camera->Position.x, view->Camera->Position.y, view->Camera->Position.z};
-  daylight::aomath::Frame fr;
-  if (!daylight::aomath::BuildFrame(reinterpret_cast<const float*>(plat + 0x80), eyeF, &fr)) return false;
+  u2::aomath::Frame fr;
+  if (!u2::aomath::BuildFrame(reinterpret_cast<const float*>(plat + 0x80), eyeF, &fr)) return false;
 
   // Depth -> R32F with the copy shader (accum.cpp Draw's pattern: stream 0, RT and DS are not in the block).
   IDirect3DVertexBuffer9* vb = nullptr;
@@ -156,7 +153,7 @@ bool FocusProbe::Read(IDirect3DDevice9* dev, const CarPose* car, Result* out) {
     return false;
   }
   const Vec3 eye{eyeF[0], eyeF[1], eyeF[2]};
-  *out = Evaluate(static_cast<const float*>(lr.pBits), w_, h_, lr.Pitch / 4, fr, p22, p32, eye, car);
+  *out = Evaluate(static_cast<const float*>(lr.pBits), w_, h_, lr.Pitch / 4, fr, p22, p32, eye, car, countTexels);
   sys_->UnlockRect();
   return true;
 }
@@ -168,7 +165,6 @@ void FocusProbe::Free() {
   SafeRelease(ps_);
   SafeRelease(state_);
   w_ = h_ = 0;
-  failed_ = false;
 }
 
 }  // namespace photomode::probe

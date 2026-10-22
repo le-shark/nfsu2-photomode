@@ -20,6 +20,7 @@ u2_add_script(photomode NFSU2PhotoMode
   supersample.cpp
   watermark.cpp
   grid.cpp
+  overlay.cpp
   focusprobe.cpp
   photomode.rc
   ${SHADER_HEADERS})

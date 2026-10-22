@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <d3d9.h>
 
+#include "u2sdk/d3d.h"
 #include "u2sdk/game.h"
 #include "u2sdk/hook.h"
 #include "u2sdk/log.h"
@@ -42,14 +43,11 @@ bool Supersample::InstallBleachFix() {
 bool Supersample::Create(IDirect3DDevice9* dev, int w, int h, bool intzDepth) {
   Free();
   D3DCAPS9 caps{};
-  IDirect3DSurface9* bb = nullptr;
-  if (!dev || FAILED(dev->GetDeviceCaps(&caps)) || FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb))) {
+  D3DSURFACE_DESC d;
+  if (!dev || FAILED(dev->GetDeviceCaps(&caps)) || !u2::d3d::BackBufferDesc(dev, &d)) {
     U2LOG("supersample: no device");
     return false;
   }
-  D3DSURFACE_DESC d;
-  bb->GetDesc(&d);
-  bb->Release();
   if (static_cast<DWORD>(w) > caps.MaxTextureWidth || static_cast<DWORD>(h) > caps.MaxTextureHeight) {
     U2LOG("supersample: %dx%d exceeds the device limit %lux%lu", w, h, caps.MaxTextureWidth, caps.MaxTextureHeight);
     return false;

@@ -58,8 +58,14 @@ enum Row { RowCamera, RowFocal, RowRoll, RowTarget, RowFocusMode, RowFocus, RowA
            RowAspect, RowCrop, RowGrid, RowWatermark, RowWatermarkPos, RowTake, RowDrive, RowCount };
 
 constexpr float kMinFocusM = 0.3f, kMaxFocusM = 500;
-constexpr float kBackGuardSec = 0.3f;
-constexpr float kMinFrameLimit = 1 / 1800.f;  // see addr::FrameLimit  // after a key cancels a capture, the same press must not also exit
+constexpr float kBackGuardSec = 0.3f;  // after a key cancels a capture, the same press must not also exit
+constexpr float kMinFrameLimit = 1 / 1800.f;  // see addr::FrameLimit
+// The pause-menu icon resumes the race first (pauseentry.cpp); photo mode opens once the game has unpaused, given up
+// after this long. The game unpauses within a few frames (Resume Race's own action); 3 s also covers a slow frame.
+constexpr float kPauseOpenWindowSec = 3;
+// Closing back to the pause menu: the world stays frozen while the game's pause handler brings it back, given up after
+// this long (then the race resumes, logged "did not come back").
+constexpr float kPauseReturnWindowSec = 2;
 
 struct Saved {
   float gameSpeed;
@@ -82,6 +88,15 @@ struct FramePlan {
   bool probeHold = false;// focus probe, frame N: keep this frame (Accum::Hold) without emptying the mean
   bool probe = false;    // focus probe, frame N+1: render the depth (focusprobe.h), show the held frame
   ProjAdjust adj;
+};
+
+// One entry of the Watermark row: a built-in (no path) or an image in the watermarks folder.
+struct WmEntry {
+  std::string name;
+  std::wstring path;
+  uint64_t stamp = 0;     // the file's write time and size: the image is decoded again only when they change
+  watermark::Mark mark;   // its image is null until chosen (folder images; EnsureWatermark)
+  bool bad = false;       // it could not be decoded
 };
 
 // What the focus probe measured for: the camera, the lens and the Focus Target.
@@ -124,21 +139,20 @@ struct PhotoMode {
   probe::FocusProbe probe;      // precise Aim / Closest (focusprobe.h)
   int probeStage = 0;           // 1: frame held, the probe renders next frame
   PoseKey lastPose, probedPose;
-  bool probed = false;          // probeRes belongs to probedPose
+  bool probed = false;          // the probe ran for probedPose
+  bool probeOk = false;         // and read: probeRes is valid
   probe::Result probeRes;
   bool captureAfterProbe = false;  // Take Picture before the probe ran: the capture starts after it
   int aspect = 0;               // Aspect Ratio row (frame.h), 0 Native
   bool crop = true;             // Crop to Ratio: the PNG without the bars
-  grid::Overlay gridOverlay;
+  grid::Overlay quadOverlay;    // the Aspect Ratio bars and the Grid lines (grid.h)
   // Watermarks (watermark.h): 0 None, 1 NFS-Planet, 2 NFS (both inside the ASI), then the images in the "watermarks" folder.
   int watermark = 0;
   watermark::Corner wmCorner = watermark::Corner::BottomRight;
-  std::vector<std::string> wmNames;
-  std::vector<watermark::Mark> marks;
-  bool builtinsLoaded = false;
+  std::vector<WmEntry> wm;      // the Watermark row's list (LoadWatermarks): None, the built-ins, the folder images
   watermark::Overlay wmOverlay;
   bool driving = false;         // Drive: the world runs and the car takes the driving keys (StartDrive)
-  uint8_t savedShowcaseKeys = 0;
+  uint8_t savedShowcaseKeys = 0, savedShowcaseDpad = 0;
   int finishAtDrive = 0;        // the player's finish tick when driving started (PlayerFinishTick)
   bool openedBefore = false;    // Camera Mode, Focal Length and Roll are kept from the previous opening (Enter)
   // The camera when photo mode closed, relative to its car (SaveView / RestoreView).
@@ -160,12 +174,12 @@ struct PhotoMode {
   uint8_t* rangeCar = nullptr;
   uint8_t* target = nullptr;  // orbit target car (World car array entry); null = player
   LARGE_INTEGER lastQpc{}, qpcFreq{};
-  float lastDt = 1 / 60.f;
+  float lastDt = 1 / 60.f;      // the previous open frame's time (the camera and shutter steps use it)
   alignas(16) bMatrix4 camMatrix{};  // world->view matrix applied in the SetCameraMatrix hook
   bool frameArmed = false;    // main-frame EndScene pending
   bool endSceneHooked = false;
   bool captureHooks = false;  // EndScene and Present both hooked
-  double sinceSwitch = 0;       // LogShaderReload: seconds since photo mode opened or closed
+  LARGE_INTEGER switchQpc{};    // LogShaderReload: when photo mode last opened or closed (0: since the game started)
   bool everOpened = false, reloadSeen = false;
   int reloadLogged = 0;
   bool firstFrameDone = false;
@@ -181,8 +195,10 @@ struct PhotoMode {
   // 2x photos: the 3D pass renders into a 2W x 2H target; its own accumulator at that size.
   Supersample super;
   Accum bigAccum{"accum2x"};
-  // 1x capture with in-game FSAA: sample frames render into `super` at screen size, without MSAA (StartCapture).
-  bool flat = false;
+  // A capture other than supersampled 2x with in-game FSAA: sample frames render into `super` at screen size,
+  // without MSAA (StartCapture).
+  bool noMsaa = false;
+  bool resetBeforeSample = false;  // a fresh 1x capture: empty the mean at its first sample (Render3DDetour)
   int savedStreaks = -1, savedFog = -1, savedRain = -1;  // -1 = not changed
   bool rezeroNativeFx = false;  // a device reset put the player's DOF/MB flags back; zero them again
   SampleKey accKey{};          // what the accumulated image shows
@@ -302,10 +318,11 @@ PoseKey CurrentPoseKey() {
   const CamPose c = RigPose();
   return {c.eye, c.fwd, c.up, Focal(), TargetCar()};
 }
-// The focus probe's result for the camera as it is now (focusprobe.h), or null while it moves / before it ran.
-const probe::Result* FreshProbe() {
-  return g->probed && g->probedPose == CurrentPoseKey() ? &g->probeRes : nullptr;
-}
+// The focus probe ran for the camera as it is now (read or not; a failed read is not repeated until it moves).
+bool ProbedHere() { return g->probed && g->probedPose == CurrentPoseKey(); }
+// Its result (focusprobe.h), or null while the camera moves, before it ran, or when its read failed: the ray and box
+// methods then stay (review 2026-10-22: an empty result had overwritten a valid Aim ray hit with "no hit").
+const probe::Result* FreshProbe() { return g->probeOk && ProbedHere() ? &g->probeRes : nullptr; }
 
 // Autofocus: the car's centre, or its nearest point (photographers focus on the near headlight): the nearest drawn
 // point once the focus probe has run, else the nearest corner of an approximate car box.
@@ -374,8 +391,6 @@ SampleKey CurrentKey() {
   return {c.eye, c.fwd, c.up, FocalToGameFov(Focal(), FovCal()), p, 0};
 }
 
-// Live preview: once the camera and settings have been still for [Preview] Delay, accumulate
-// jittered samples (the same ones a photo uses) up to the quality's sample count and show the mean.
 void StartCapture();
 
 // The focus probe (focusprobe.h) for Aim / Closest with an aperture: once the camera has stood still for a frame,
@@ -384,8 +399,10 @@ void StartCapture();
 bool ProbeWanted() {
   return (g->focusMode == FocusMode::Aim || g->focusMode == FocusMode::Closest) && FStop() > 0 && !g->probe.Failed();
 }
-bool ProbePending() { return ProbeWanted() && !FreshProbe(); }
+bool ProbePending() { return ProbeWanted() && !ProbedHere(); }
 
+// Frame N+1 follows only once frame N was really held (Render3DDetour sets probeStage 1): on a frame the game skips
+// Render3D (verified-in-binary.md "Frame pacing"), the probe frame would otherwise show an old or empty copy.
 void PlanProbe() {
   const PoseKey k = CurrentPoseKey();
   const bool still = k == g->lastPose;
@@ -407,12 +424,12 @@ void PlanProbe() {
   }
   if (!g->accum.Ensure(Device())) return;  // the held copy lives in the accumulator
   g->frame.probeHold = true;
-  g->probeStage = 1;
 }
 
 void OnProbe(bool ok, const probe::Result& r) {
   g->probedPose = CurrentPoseKey();
   g->probed = true;
+  g->probeOk = ok;
   g->probeRes = ok ? r : probe::Result{};
   if (g->cfg.verbose)
     U2LOG("focus probe: %s, aim %s %.2f m, car %s %.2f m (%d texels)", ok ? "read" : "FAILED",
@@ -421,6 +438,8 @@ void OnProbe(bool ok, const probe::Result& r) {
   if (g->focusMode == FocusMode::Aim) UpdateAim();
 }
 
+// Live preview: once the camera and settings have been still for [Preview] Delay, accumulate
+// jittered samples (the same ones a photo uses) up to the quality's sample count and show the mean.
 void UpdatePreview(float dt) {
   SampleKey key = CurrentKey();
   if (key == g->accKey) {
@@ -539,30 +558,51 @@ bool RestoreView() {
 // ---- watermarks ---------------------------------------------------------------------------------
 // User 2026-10-20: each logo at its own pixel size on a 1080-high image (scaled with the image height); margins:
 // NFS-Planet a little (10), NFS and the files some (24). The built-ins are decoded once; the images in the "watermarks"
-// folder next to the ASI (watermark::ListName, sorted by name) are read again each time photo mode opens, so they can
-// be added or changed in game. The choice is kept by its name.
-bool WatermarkAvailable(int i) {
-  return i == 0 || (i > 0 && i < static_cast<int>(g->marks.size()) && g->marks[i].image);
+// folder next to the ASI (watermark::ListName, sorted by name) are listed again each time photo mode opens, so they can
+// be added or changed in game. A folder image is decoded only when it is chosen, and only the chosen one is kept; an
+// unchanged file (same size and time) is not decoded again (review 2026-10-22: every image was decoded on every
+// opening, about 14 ms each, up to 470 ms and 64 MB for a large one). The choice is kept by its name.
+constexpr int kBuiltinMarks = 3;  // None, NFS-Planet, NFS
+
+// The chosen mark's image, decoding a folder image on first use; false (logged once) when it can't be read.
+bool EnsureWatermark(int i) {
+  if (i <= 0 || i >= static_cast<int>(g->wm.size())) return false;
+  WmEntry& e = g->wm[i];
+  if (e.mark.image) return true;
+  if (e.bad || e.path.empty()) return false;
+  auto img = std::make_shared<watermark::Image>();
+  if (!watermark::LoadFileImage(e.path, img.get())) {
+    U2LOG("watermark: %ls not readable as an image (or larger than 4096 x 4096); left out", e.path.c_str());
+    e.bad = true;
+    return false;
+  }
+  e.mark = {img, 1, 24};
+  U2LOG("watermark: \"%s\" from %ls %dx%d", e.name.c_str(), e.path.c_str(), img->w, img->h);
+  return true;
+}
+
+// Choose mark i (0 = None): a folder image chosen before is released.
+void ChooseWatermark(int i) {
+  if (g->watermark != i && g->watermark >= kBuiltinMarks && g->watermark < static_cast<int>(g->wm.size()))
+    g->wm[g->watermark].mark.image.reset();
+  g->watermark = i;
 }
 
 void LoadWatermarks() {
   using namespace watermark;
-  const std::string chosen = g->watermark < static_cast<int>(g->wmNames.size()) ? g->wmNames[g->watermark] : "";
-  if (!g->builtinsLoaded) {
-    g->builtinsLoaded = true;
+  const std::string chosen = g->watermark < static_cast<int>(g->wm.size()) ? g->wm[g->watermark].name : "";
+  if (g->wm.empty()) {
     auto planet = std::make_shared<Image>(), nfs = std::make_shared<Image>();
-    g->wmNames = {"None", "NFS-Planet", "NFS"};
-    g->marks.assign(3, Mark{});
-    if (LoadResourcePng(IDR_WM_NFSPLANET, planet.get())) g->marks[1] = {planet, 1, 10};
-    if (LoadResourcePng(IDR_WM_NFS, nfs.get())) g->marks[2] = {nfs, 1, 24};
+    g->wm.resize(kBuiltinMarks);
+    g->wm[0].name = "None";
+    g->wm[1].name = "NFS-Planet";
+    g->wm[2].name = "NFS";
+    if (LoadResourceImage(IDR_WM_NFSPLANET, planet.get())) g->wm[1].mark = {planet, 1, 10};
+    if (LoadResourceImage(IDR_WM_NFS, nfs.get())) g->wm[2].mark = {nfs, 1, 24};
   }
-  g->wmNames.resize(3);
-  g->marks.resize(3);
-  struct File {
-    std::string name;
-    std::wstring path;
-  };
-  std::vector<File> files;
+  std::vector<WmEntry> old(g->wm.begin() + kBuiltinMarks, g->wm.end());
+  g->wm.resize(kBuiltinMarks);
+  std::vector<WmEntry> files;
   // The folder found by comparing names without case, so it is found even in a case-sensitive directory.
   std::wstring dir;
   WIN32_FIND_DATAW fd;
@@ -579,34 +619,32 @@ void LoadWatermarks() {
   find = dir.empty() ? INVALID_HANDLE_VALUE : FindFirstFileW((dir + L"*").c_str(), &fd);
   if (find != INVALID_HANDLE_VALUE) {
     do {
-      std::string name;
+      WmEntry e;
       constexpr DWORD kSkip = FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM;  // Thumbs.db
-      if (!(fd.dwFileAttributes & kSkip) && ListName(fd.cFileName, &name)) files.push_back({name, dir + fd.cFileName});
+      if ((fd.dwFileAttributes & kSkip) || !ListName(fd.cFileName, &e.name)) continue;
+      e.path = dir + fd.cFileName;
+      e.stamp = (static_cast<uint64_t>(fd.ftLastWriteTime.dwHighDateTime) << 32 | fd.ftLastWriteTime.dwLowDateTime) ^
+                (static_cast<uint64_t>(fd.nFileSizeHigh) << 32 | fd.nFileSizeLow);
+      for (const WmEntry& o : old)  // unchanged since the last listing: keep its image (or that it can't be read)
+        if (o.path == e.path && o.stamp == e.stamp) e.mark = o.mark, e.bad = o.bad;
+      files.push_back(std::move(e));
     } while (FindNextFileW(find, &fd));
     FindClose(find);
   }
-  auto key = [](const File& f) {
-    std::string k = f.name;
-    for (char& c : k) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    return k;
-  };
-  std::sort(files.begin(), files.end(), [&](const File& a, const File& b) { return key(a) < key(b); });
-  for (const File& f : files) {
-    auto img = std::make_shared<Image>();
-    if (!LoadFilePng(f.path, img.get())) {
-      U2LOG("watermark: %ls not readable as an image; left out", f.path.c_str());
-      continue;
-    }
-    g->wmNames.push_back(f.name);
-    g->marks.push_back({img, 1, 24});
-    U2LOG("watermark: \"%s\" from %ls %dx%d", f.name.c_str(), f.path.c_str(), img->w, img->h);
-  }
+  // By name without case; the path decides between equal names ("logo.png", "logo.jpg"), so the order is stable.
+  std::sort(files.begin(), files.end(), [](const WmEntry& a, const WmEntry& b) {
+    const int c = _stricmp(a.name.c_str(), b.name.c_str());
+    return c != 0 ? c < 0 : a.path < b.path;
+  });
+  for (WmEntry& e : files) g->wm.push_back(std::move(e));
   g->watermark = 0;
-  for (int i = 1; i < static_cast<int>(g->wmNames.size()); ++i)
-    if (g->wmNames[i] == chosen && WatermarkAvailable(i)) {
+  for (int i = 1; i < static_cast<int>(g->wm.size()); ++i)
+    if (g->wm[i].name == chosen && EnsureWatermark(i)) {
       g->watermark = i;
       break;
     }
+  for (int i = kBuiltinMarks; i < static_cast<int>(g->wm.size()); ++i)  // only the chosen one stays decoded
+    if (i != g->watermark) g->wm[i].mark.image.reset();
 }
 
 void Enter() {
@@ -649,7 +687,7 @@ void Enter() {
   g->stillTime = 0;
   g->frame = {};
   g->state = State::Active;
-  g->sinceSwitch = 0;
+  QueryPerformanceCounter(&g->switchQpc);
   g->everOpened = true;
   ApplyCamera(0);
   // Camera::StopUpdating (set only by mods such as ExOpts) makes SetCameraMatrix ignore us.
@@ -719,23 +757,30 @@ void __cdecl SaveRegistryDetour() {
 //   CarRenderInfo::Render) only draw racers at full detail and with their real trunk audio parts; wheels are not
 //   affected (verified-in-binary.md "Showcase byte 0x836352"). Restored when driving stops.
 // - The pause-key block 0x861E78 set by the menu stays, so pad Start does not pause either.
-constexpr uintptr_t kShowcaseKeys = 0x836352;
+// - Format 2 also needs [0x836353] clear (u2::addr::ShowcaseDpad); it is saved and cleared as well (review 2026-10-22).
 
 // The player's finish: in-world player 0 ([0x8900AC], PlayersByNumber) +0x50 is the world-frame tick at which it
 // finished, 0 while racing (ctor 0x5F1670 clears it at 0x5F1808; 0x5EA530 sets it once from the race-end handlers,
 // 0x5EA542..0x5EA54A; verified-in-binary.md "Pause menu icons"). User 2026-10-20: a race that finishes while driving
 // in photo mode ends photo mode.
 int PlayerFinishTick() {
-  auto p = Var<uint8_t*>(0x8900AC);
+  auto p = Var<uint8_t*>(addr::PlayersByNumber);
   return p ? *reinterpret_cast<int*>(p + 0x50) : 0;
+}
+
+void RestoreDriveKeys() {
+  Var<uint8_t>(addr::ShowcaseKeys) = g->savedShowcaseKeys;
+  Var<uint8_t>(addr::ShowcaseDpad) = g->savedShowcaseDpad;
 }
 
 void StartDrive() {
   if (g->driving || g->state != State::Active || !g->cfg.drive) return;
   g->driving = true;
   g->finishAtDrive = PlayerFinishTick();
-  g->savedShowcaseKeys = Var<uint8_t>(kShowcaseKeys);
-  Var<uint8_t>(kShowcaseKeys) = 1;
+  g->savedShowcaseKeys = Var<uint8_t>(addr::ShowcaseKeys);
+  g->savedShowcaseDpad = Var<uint8_t>(addr::ShowcaseDpad);
+  Var<uint8_t>(addr::ShowcaseKeys) = 1;
+  Var<uint8_t>(addr::ShowcaseDpad) = 0;
   menu::SetHidden(true);
   menu::SetGameInput(true);
   freeze::Hold(false);
@@ -748,7 +793,7 @@ void StartDrive() {
 void StopDrive() {
   if (!g->driving) return;
   g->driving = false;
-  Var<uint8_t>(kShowcaseKeys) = g->savedShowcaseKeys;
+  RestoreDriveKeys();
   freeze::Hold(true);
   menu::SetGameInput(false);
   g->accum.Reset();
@@ -758,20 +803,21 @@ void StopDrive() {
   U2LOG("drive: off");
 }
 
-// In-game FSAA on: the backbuffer is multisampled.
-bool BackBufferMultisampled() {
-  IDirect3DSurface9* bb = nullptr;
-  if (!Device() || FAILED(Device()->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb))) return false;
-  D3DSURFACE_DESC d;
-  const bool ms = SUCCEEDED(bb->GetDesc(&d)) && d.MultiSampleType != D3DMULTISAMPLE_NONE;
-  bb->Release();
-  return ms;
-}
-
 void FreeSupersample() {
-  g->flat = false;
+  g->noMsaa = false;
+  g->resetBeforeSample = false;
   g->super.Free();
   g->bigAccum.Free();
+}
+
+// The focus probe and the overlays' GPU objects: on exit and before a device reset. A Take Picture still waiting for
+// the probe stays pending after a reset (the probe runs again, then the capture starts) but not after exit.
+void FreeProbeAndOverlays() {
+  g->probe.Free();
+  g->probed = g->probeOk = false;
+  g->probeStage = 0;
+  g->wmOverlay.Free();
+  g->quadOverlay.Free();
 }
 
 // Closed by the player (not by the game pausing or leaving gameplay) after opening from the pause menu: back there.
@@ -781,7 +827,7 @@ void Exit(const char* why, bool byPlayer = false) {
   g->fromPause = false;
   if (g->driving) {  // the freeze is set below either way
     g->driving = false;
-    Var<uint8_t>(kShowcaseKeys) = g->savedShowcaseKeys;
+    RestoreDriveKeys();
   }
   // Only in gameplay: after leaving it the cars may be gone (RestoreView then starts from the game camera).
   if (IsInGame()) SaveView();
@@ -789,12 +835,8 @@ void Exit(const char* why, bool byPlayer = false) {
   g->capture.Abort("photo mode closed");
   g->frame = {};
   g->accum.Free();  // the targets are recreated on the next enter
-  g->probe.Free();
-  g->probed = false;
-  g->probeStage = 0;
+  FreeProbeAndOverlays();
   g->captureAfterProbe = false;
-  g->wmOverlay.Free();
-  g->gridOverlay.Free();
   RestoreCaptureEffects();
   FreeSupersample();
   SetUncapped(false);
@@ -802,7 +844,7 @@ void Exit(const char* why, bool byPlayer = false) {
   // Going back to the pause menu: the world stays frozen until the game's own pause has taken over (Tick).
   freeze::Hold(backToPause);
   if (backToPause) {
-    g->returnToPause = 2;
+    g->returnToPause = kPauseReturnWindowSec;
     g->pauseAsked = false;
   }
   Var<float>(addr::GameSpeed) = g->saved.gameSpeed;
@@ -816,7 +858,7 @@ void Exit(const char* why, bool byPlayer = false) {
   // Put the cursor back: the game/WidescreenFix mouse-look reads cursor deltas.
   SetCursorPos(g->cursorAtEnter.x, g->cursorAtEnter.y);
   g->state = State::Off;
-  g->sinceSwitch = 0;
+  QueryPerformanceCounter(&g->switchQpc);
   if (g->cfg.verbose) g->postExitLog = 3;
   U2LOG("exit (%s): speed=%.2f hud=%d", why, Var<float>(addr::GameSpeed), Var<int>(addr::DrawHud));
 }
@@ -847,7 +889,10 @@ void StartCapture() {
   p.aspect = g->aspect;
   p.crop = g->aspect && g->crop;
   if (p.sample.tiles > 1) {
-    // 2x: supersampled in one pass (motion blur works); tiles only when the targets don't fit.
+    // 2x: supersampled in one pass (motion blur works); tiles only when the targets don't fit. The probe's targets and
+    // the held copies are not needed meanwhile (7-10 bytes a pixel; rebuilt on demand).
+    g->probe.Free();
+    g->accum.FreeHold();
     const int w = 2 * g->accum.Width(), h = 2 * g->accum.Height();
     p.supersample = g->super.Create(Device(), w, h) && g->bigAccum.Ensure(Device(), w, h);
     if (!p.supersample) {
@@ -857,15 +902,17 @@ void StartCapture() {
         return;
       }
     }
-  } else if (BackBufferMultisampled()) {
+  }
+  D3DSURFACE_DESC bb;
+  if (!p.supersample && d3d::BackBufferDesc(Device(), &bb) && bb.MultiSampleType != D3DMULTISAMPLE_NONE) {
     // User 2026-10-21 ("don't like" the top line of 1x photos): with MSAA the game's full-screen post-FX quads (clip
     // +-1, verified-in-binary.md "Full-screen post-FX quads") leave the top/left half of row 0 and column 0 unwritten,
     // so those samples keep the image from before bleach. Rendered without MSAA, as 2x photos are, every pixel is
-    // covered (FSAA-off and 2x photos measured clean). The jittered samples still smooth the edges.
-    g->flat = g->super.Create(Device(), g->accum.Width(), g->accum.Height());
-    if (!g->flat) {
+    // covered (FSAA-off and 2x photos measured clean). The jittered samples still smooth the edges. Tiles too.
+    g->noMsaa = g->super.Create(Device(), g->accum.Width(), g->accum.Height());
+    if (!g->noMsaa) {
       FreeSupersample();
-      U2LOG("capture: no screen-size target; 1x photo with in-game FSAA (top row / left column)");
+      U2LOG("capture: no screen-size target; photo with in-game FSAA (top row / left column)");
     }
   }
   std::string err;
@@ -877,11 +924,12 @@ void StartCapture() {
   if (p.sample.tiles > 1) SetCaptureEffects(!p.supersample);
   if (p.supersample) g->bigAccum.Reset();
   // A 1x photo without shutter is exactly what the preview accumulates: continue from its samples
-  // (instant when it has converged). Anything else starts from an empty mean. Not with in-game FSAA (g->flat): the
+  // (instant when it has converged). Anything else starts from an empty mean. Not with in-game FSAA (noMsaa): the
   // preview's samples are MSAA frames with the light top row / left column (user 2026-10-21: fresh samples instead).
-  g->captureContinued = p.sample.tiles == 1 && p.shutterSec == 0 && !g->flat && CurrentKey() == g->accKey;
-  // Tiles empty the mean in the Render3D hook, after holding the frame on screen (see FramePlan).
-  if (!g->captureContinued && p.sample.tiles == 1) g->accum.Reset();
+  g->captureContinued = p.sample.tiles == 1 && p.shutterSec == 0 && !g->noMsaa && CurrentKey() == g->accKey;
+  // Tiles empty the mean in the Render3D hook, after holding the frame on screen (see FramePlan); a fresh 1x photo
+  // empties it at its first sample (Render3DDetour), so the preview stays on screen until then.
+  g->resetBeforeSample = !g->captureContinued && p.sample.tiles == 1;
   g->captureFromSample = g->captureContinued ? g->accum.Count() : 0;
   QueryPerformanceCounter(&g->captureStart);
   // Started from the controls (Space / pad X), nothing else plans this frame: keep showing the mean
@@ -955,14 +1003,18 @@ void Adjust(int row, int dir) {
     case RowCrop: if (g->aspect) g->crop = !g->crop; break;  // only with a ratio (IsRowEnabled)
     case RowGrid: g->grid = !g->grid; break;
     case RowWatermark:
-      for (int n = static_cast<int>(g->marks.size()), i = Wrap(g->watermark + dir, n); ; i = Wrap(i + dir, n))
-        if (WatermarkAvailable(i)) {
-          g->watermark = i;
+      // The next one that can be shown (None always can); an unreadable image is skipped from then on.
+      for (int n = static_cast<int>(g->wm.size()), i = Wrap(g->watermark + dir, n); ; i = Wrap(i + dir, n))
+        if (i == 0 || EnsureWatermark(i)) {
+          ChooseWatermark(i);
           break;
         }
       break;
     case RowWatermarkPos:  // Pos. only matters with a watermark (IsRowEnabled)
-      if (g->watermark) g->wmCorner = static_cast<watermark::Corner>(Wrap(static_cast<int>(g->wmCorner) + dir, 4));
+      if (g->watermark) {
+        constexpr int kCorners = static_cast<int>(watermark::Corner::Count);
+        g->wmCorner = static_cast<watermark::Corner>(Wrap(static_cast<int>(g->wmCorner) + dir, kCorners));
+      }
       break;
     default: break;
   }
@@ -1018,7 +1070,7 @@ std::string RowValue(int row) {
     case RowAspect: return frame::Name(g->aspect);
     case RowCrop: return g->crop ? "Yes" : "No";
     case RowGrid: return g->grid ? "On" : "Off";
-    case RowWatermark: return g->watermark < static_cast<int>(g->wmNames.size()) ? g->wmNames[g->watermark] : "None";
+    case RowWatermark: return g->watermark < static_cast<int>(g->wm.size()) ? g->wm[g->watermark].name : "None";
     case RowWatermarkPos: return watermark::CornerName(g->wmCorner);
     default: break;
   }
@@ -1040,6 +1092,22 @@ void MenuBack() {
 }
 
 // ---- per-frame ------------------------------------------------------------------------------
+// Look: the mouse plus a stick (stickX / stickY, degrees per second at full tilt times dt). Narrow lenses get slower
+// look so framing stays controllable.
+void Look(RigInput* ri, float stickX, float stickY) {
+  Input& in = g->input;
+  const float zoomScale = Clamp(35.f / Focal(), 0.15f, 1.5f);
+  const float ySign = g->cfg.invertY ? -1.f : 1.f;
+  ri->lookYawDeg = (-in.MouseDX() * g->cfg.mouseSensitivity - stickX) * zoomScale;
+  ri->lookPitchDeg = (-in.MouseDY() * g->cfg.mouseSensitivity + stickY) * zoomScale * ySign;
+}
+
+// Free mode keeps its range around rangeCar once the target changed (CycleTarget); else around the target.
+void UpdateRig(const RigInput& ri, float dt) {
+  const Vec3 range = g->rig.mode == RigMode::Free && g->rangeCar ? CarPosition(g->rangeCar) : g->anchor;
+  g->rig.Update(ri, dt, range);
+}
+
 // While driving the keys and the pad drive the car: only the photo-mode key (close), the Drive key or Esc / pad Back
 // (stop driving) and mouse look are ours.
 void HandleDriveControls() {
@@ -1053,11 +1121,8 @@ void HandleDriveControls() {
     return;
   }
   RigInput ri;
-  float zoomScale = Clamp(35.f / Focal(), 0.15f, 1.5f);
-  ri.lookYawDeg = -in.MouseDX() * g->cfg.mouseSensitivity * zoomScale;
-  ri.lookPitchDeg = -in.MouseDY() * g->cfg.mouseSensitivity * zoomScale * (g->cfg.invertY ? -1.f : 1.f);
-  Vec3 range = g->rig.mode == RigMode::Free && g->rangeCar ? CarPosition(g->rangeCar) : g->anchor;
-  g->rig.Update(ri, 0, range);
+  Look(&ri, 0, 0);
+  UpdateRig(ri, 0);
 }
 
 void HandleControls(float dt) {
@@ -1090,15 +1155,9 @@ void HandleControls(float dt) {
   ri.moveRight = key('D') - key('A') + pad.lx;
   ri.moveUp = key('E') - key('Q') + pad.rt - pad.lt;
   ri.speedMul = (in.KeyDown(VK_SHIFT) || in.PadDown(PadLS)) ? 4.f : ((in.KeyDown(VK_CONTROL) || in.PadDown(PadRS)) ? 0.25f : 1.f);
-  // Narrow lenses get slower look so framing stays controllable.
-  float zoomScale = Clamp(35.f / Focal(), 0.15f, 1.5f);
-  float ySign = g->cfg.invertY ? -1.f : 1.f;
-  ri.lookYawDeg = (-in.MouseDX() * g->cfg.mouseSensitivity - pad.rx * g->cfg.stickLookSpeed * dt) * zoomScale;
-  ri.lookPitchDeg = (-in.MouseDY() * g->cfg.mouseSensitivity + pad.ry * g->cfg.stickLookSpeed * dt) * zoomScale * ySign;
+  Look(&ri, pad.rx * g->cfg.stickLookSpeed * dt, pad.ry * g->cfg.stickLookSpeed * dt);
   ri.rollDeg = (key('C') - key('Z') + button(PadRB) - button(PadLB)) * g->cfg.rollSpeed * dt;
-  // Free mode keeps its range around rangeCar once the target changed (CycleTarget); else around the target.
-  Vec3 range = g->rig.mode == RigMode::Free && g->rangeCar ? CarPosition(g->rangeCar) : g->anchor;
-  g->rig.Update(ri, dt, range);
+  UpdateRig(ri, dt);
 }
 
 // Grab the finished frame (after WidescreenFix's own EndScene work, before Present).
@@ -1189,7 +1248,7 @@ void Tick() {
       }
     }
     // The pause-menu icon resumes the race as Resume Race does (pauseentry.cpp); open once the game has unpaused.
-    if (pause::TakeRequest()) g->pauseRequest = 3;
+    if (pause::TakeRequest()) g->pauseRequest = kPauseOpenWindowSec;
     if (g->pauseRequest > 0) {
       g->pauseRequest -= dt;
       if (CanEnter()) {
@@ -1230,7 +1289,9 @@ void Tick() {
       // The tile capture's first frame has not rendered yet (no 3D last frame): wait for it.
     } else if (g->capture.Active()) {
       const bool super = g->capture.Params().supersample;
-      CaptureFrame cf = g->capture.BeginFrame((super ? g->bigAccum : g->accum).Count(), g->lastDt);
+      // A fresh 1x capture counts from 0 while the preview's mean is still on screen (resetBeforeSample).
+      const int count = super ? g->bigAccum.Count() : g->resetBeforeSample ? 0 : g->accum.Count();
+      CaptureFrame cf = g->capture.BeginFrame(count, g->lastDt);
       const bool tiles = g->capture.Params().sample.tiles > 1 && !super;
       g->frame.shown = false;
       if (cf.newTile) g->accum.Reset();
@@ -1246,7 +1307,9 @@ void Tick() {
       g->frame.showHold = tiles && !cf.resolve;
       // Resolve frame: FE off (our menu) so the mean is read back clean at EndScene.
       Var<int>(addr::DrawHud) = cf.resolve ? 0 : g->saved.drawHud;
-      SetUncapped((cf.sample || cf.warm) && g->capture.Params().shutterSec == 0);
+      // Resolve and edge frames are never presented (PresentDetour) and the world stays still on them: no need to wait
+      // for the 1/60 limiter (review 2026-10-22: up to 16.7 ms each, 8 of them in a 2x photo with FSAA).
+      SetUncapped(((cf.sample || cf.warm) && g->capture.Params().shutterSec == 0) || cf.resolve);
       // Shutter samples advance the world by a small, non-zero time step through the normal
       // (unpaused) loop path; otherwise the world stays on the game's own pause path.
       freeze::Hold(cf.nextGameSpeed <= 0);
@@ -1291,13 +1354,17 @@ void Tick() {
 // Shader-reload log (2026-10-21, a tester's crash, status doc "Beta feedback"): another mod in their setup set the
 // effect-reload request [0x8707C4] (no game code writes it) just after photo mode opened, and the reload crashed
 // inside NFSU2ShaderLoader. Read only (user: photo mode never changes another mod's request): each request is logged
-// with the time since photo mode opened or closed, before RenderFrame acts on it (0x5D2BFA, later in this frame).
-void LogShaderReload(float dt) {
-  g->sinceSwitch += dt;
+// with the time since photo mode opened or closed (or since the first frame), before RenderFrame acts on it
+// (0x5D2BFA, later in this frame). At most kMaxReloadLogs lines, so a mod that reloads every frame cannot flood the log.
+constexpr int kMaxReloadLogs = 10;
+void LogShaderReload() {
   const int request = Var<int>(addr::EffectReloadRequest);
-  if (request && !g->reloadSeen && g->reloadLogged < 10) {
+  if (request && !g->reloadSeen && g->reloadLogged < kMaxReloadLogs) {
     ++g->reloadLogged;
-    U2LOG("shader reload requested by another mod (value %d), %.2f s after photo mode %s", request, g->sinceSwitch,
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    const double s = static_cast<double>(now.QuadPart - g->switchQpc.QuadPart) / g->qpcFreq.QuadPart;
+    U2LOG("shader reload requested by another mod (value %d), %.2f s after photo mode %s", request, s,
           g->state != State::Off ? "opened" : g->everOpened ? "closed" : "loaded");
   }
   g->reloadSeen = request != 0;
@@ -1306,11 +1373,12 @@ void LogShaderReload(float dt) {
 void __cdecl FrameDetour() {
   if (!g->firstFrameDone) {  // every ASI is loaded by now
     g->firstFrameDone = true;
+    QueryPerformanceCounter(&g->switchQpc);
     crash::LogModules();
     if (g->cfg.verbose) crash::WatchWrites(addr::EffectReloadRequest, "shader reload request");
   }
   Tick();
-  LogShaderReload(g->lastDt);
+  LogShaderReload();
   oFrame();
 }
 
@@ -1321,12 +1389,8 @@ void __cdecl FrameDetour() {
 // - the grid, in the photo area on screen only: like the menu, it stays out of the frames read back into the photo.
 //   The held tile frame and the samples were taken earlier in this hook, so they never have any of these.
 void DrawOverlays(IDirect3DDevice9* dev) {
-  if (g->state == State::Off) return;
-  IDirect3DSurface9* bb = nullptr;
-  if (FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb))) return;
   D3DSURFACE_DESC d;
-  bb->GetDesc(&d);
-  bb->Release();
+  if (g->state == State::Off || !d3d::BackBufferDesc(dev, &d)) return;
   const int sw = static_cast<int>(d.Width), sh = static_cast<int>(d.Height);
   const bool resolve = g->state == State::Capturing && g->frame.resolve;
   int w = sw, h = sh, ox = 0, oy = 0;
@@ -1344,16 +1408,16 @@ void DrawOverlays(IDirect3DDevice9* dev) {
   grid::Line quads[4];
   const int nBars = frame::Bars(w, h, area, bars);
   for (int i = 0; i < nBars; ++i) quads[i] = {bars[i].x - ox, bars[i].y - oy, bars[i].w, bars[i].h};
-  g->gridOverlay.Draw(dev, quads, nBars, 0xFF000000u);
-  if (WatermarkAvailable(g->watermark) && g->watermark) {
+  g->quadOverlay.Draw(dev, quads, nBars, 0xFF000000u);
+  if (g->watermark && EnsureWatermark(g->watermark)) {
     const watermark::Rect a{static_cast<float>(area.x), static_cast<float>(area.y), static_cast<float>(area.w),
                             static_cast<float>(area.h)};
-    g->wmOverlay.Draw(dev, g->marks[g->watermark], g->wmCorner, a, h, ox, oy);
+    g->wmOverlay.Draw(dev, g->wm[g->watermark].mark, g->wmCorner, a, h, ox, oy);
   }
   if (g->grid && !resolve) {
     grid::Line lines[grid::kMaxLines];
     const int n = grid::Thirds(area.x, area.y, area.w, area.h, grid::Thickness(sh), lines);  // w == sw here
-    g->gridOverlay.Draw(dev, lines, n, grid::kLineColour);
+    g->quadOverlay.Draw(dev, lines, n, grid::kLineColour);
   }
 }
 
@@ -1373,7 +1437,7 @@ void __cdecl Render3DDetour() {
       oRender3D();
       g->probe.End(dev);
       const CarPose car = TargetCarPose();
-      ok = g->probe.Read(dev, TargetCar() ? &car : nullptr, &r);
+      ok = g->probe.Read(dev, TargetCar() ? &car : nullptr, g->cfg.verbose, &r);
     } else {
       oRender3D();
     }
@@ -1382,8 +1446,14 @@ void __cdecl Render3DDetour() {
     DrawOverlays(dev);
     return;
   }
-  const bool flat = g->state == State::Capturing && g->flat && g->super.Ready();
-  if ((super || flat) && (g->frame.sample || g->frame.warm)) {
+  const bool noMsaa = g->state == State::Capturing && g->noMsaa && g->super.Ready();
+  // A fresh 1x capture empties the preview's mean only at its first sample, so the screen keeps showing it until then
+  // instead of one sharp frame (review 2026-10-22). Sample 1 ignores the old mean (accum.hlsl), Reset only counts.
+  if (g->frame.sample && g->resetBeforeSample) {
+    g->accum.Reset();
+    g->resetBeforeSample = false;
+  }
+  if ((super || noMsaa) && (g->frame.sample || g->frame.warm)) {
     g->super.Begin(dev);
     oRender3D();
     if (g->frame.sample) (super ? g->bigAccum : g->accum).AddSample(dev);
@@ -1403,17 +1473,13 @@ void __cdecl Render3DDetour() {
     acc.AddSample(dev);
     g->frame.sample = false;  // one sample per planned frame
   }
-  if (g->frame.show && acc.Count() > 0 && g->frame.edges) {  // FSAA edge frame (edges.h), read back at EndScene
-    IDirect3DSurface9* bb = nullptr;
+  if (g->frame.edges) {  // FSAA edge frame (edges.h), read back at EndScene
+    // Pieces of the resolve frame kept just before (Accum::Keep below): the mean with the bars and the watermark, so a
+    // watermark crossing a 2x seam keeps its pixels there (review 2026-10-22: drawn from the bare mean, it had a gap).
+    D3DSURFACE_DESC d;
     edges::Piece pieces[edges::kPieces];
-    if (SUCCEEDED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb))) {
-      D3DSURFACE_DESC d;
-      bb->GetDesc(&d);
-      bb->Release();
-      if (edges::Layout(static_cast<int>(d.Width), static_cast<int>(d.Height), pieces))
-        acc.ShowPieces(dev, g->frame.region >= 0 ? QuarterUv(g->frame.region) : UvRect{0, 0, 1, 1}, pieces,
-                       edges::kPieces);
-    }
+    if (d3d::BackBufferDesc(dev, &d) && edges::Layout(static_cast<int>(d.Width), static_cast<int>(d.Height), pieces))
+      g->accum.ShowKeptPieces(dev, pieces, edges::kPieces);
     g->frame.shown = true;
     return;  // nothing else on this frame: the pieces are all it is read for
   }
@@ -1433,8 +1499,12 @@ void __cdecl Render3DDetour() {
   if (g->frame.probeHold) {  // focus probe frame N: keep it for the next frame (PlanProbe)
     g->accum.Hold(dev);
     g->frame.probeHold = false;
+    if (!g->accum.Failed()) g->probeStage = 1;
   }
   DrawOverlays(dev);
+  // The finished resolve frame, before WidescreenFix clears its edges at EndScene: the next frame's edge pieces.
+  if (g->state == State::Capturing && g->frame.resolve && g->frame.shown && g->capture.EdgeFrames())
+    g->accum.Keep(dev);
 }
 
 // Any other mover that still targets the player camera gets our matrix instead.
@@ -1489,11 +1559,7 @@ void __fastcall FeRenderDetour(void* feng, void* edx) {
 void OnDeviceReset() {
   g->capture.Abort("device reset");
   g->accum.Free();  // DEFAULT-pool targets must be released before the game's Reset
-  g->probe.Free();
-  g->probed = false;
-  g->probeStage = 0;
-  g->wmOverlay.Free();
-  g->gridOverlay.Free();
+  FreeProbeAndOverlays();
   FreeSupersample();
   g->frame = {};
   SetUncapped(false);
@@ -1531,25 +1597,18 @@ bool Install() {
   ok &= hook::Create(addr::Render3D, &Render3DDetour, &oRender3D, "Render3D");
   ok &= d3d::InstallResetHook();
   // Optional: without it a quit with photo mode open can save DOF / motion blur as off (logged, not fatal).
-  {
-    const auto* e = reinterpret_cast<const uint8_t*>(kSaveRegistry);
-    if (std::memcmp(e, "\x51\x56\x8B\x35\x08\x30\x78\x00", 8) == 0 || e[0] == 0xE9) {
-      if (!hook::Create(kSaveRegistry, &SaveRegistryDetour, &oSaveRegistry, "SaveRegistrySettings"))
-        U2LOG("registry-save hook failed: quitting with photo mode open may save DOF / motion blur as off");
-    } else {
-      U2LOG("SaveRegistrySettings 0x5BEEA0: entry bytes differ (another mod?); not hooked");
-    }
-  }
+  // Entry bytes from u2re: push ecx; push esi; mov esi, [0x783008].
+  if (!hook::EntryIs(kSaveRegistry, "\x51\x56\x8B\x35\x08\x30\x78\x00", 8))
+    U2LOG("SaveRegistrySettings 0x5BEEA0: entry bytes differ (another mod?); not hooked");
+  else if (!hook::Create(kSaveRegistry, &SaveRegistryDetour, &oSaveRegistry, "SaveRegistrySettings"))
+    U2LOG("registry-save hook failed: quitting with photo mode open may save DOF / motion blur as off");
   // Optional: without it 2x photos with Enhanced Contrast on are blurred, moved 1.5 px and wrap at the right and bottom
-  // edges (supersample.cpp BleachQuadPassDetour).
-  {
-    const auto* e = reinterpret_cast<const uint8_t*>(addr::BleachQuadPass);
-    if (std::memcmp(e, "\x55\x8B\xEC\x83\xE4\xF0\x81\xEC\xC4\x00\x00\x00", 12) == 0 || e[0] == 0xE9) {
-      if (!Supersample::InstallBleachFix()) U2LOG("bleach hook failed: 2x photos with Enhanced Contrast stay soft");
-    } else {
-      U2LOG("BleachQuadPass 0x5C6520: entry bytes differ (another mod?); not hooked");
-    }
-  }
+  // edges (supersample.cpp BleachQuadPassDetour). Entry bytes from u2re: push ebp; mov ebp, esp; and esp, -16;
+  // sub esp, 0xC4.
+  if (!hook::EntryIs(addr::BleachQuadPass, "\x55\x8B\xEC\x83\xE4\xF0\x81\xEC\xC4\x00\x00\x00", 12))
+    U2LOG("BleachQuadPass 0x5C6520: entry bytes differ (another mod?); not hooked");
+  else if (!Supersample::InstallBleachFix())
+    U2LOG("bleach hook failed: 2x photos with Enhanced Contrast stay soft");
   // Optional: without it photo mode still opens with its key.
   if (g->cfg.pauseMenuEntry && !pause::Install()) U2LOG("pause menu: no Photo Mode icon (see above)");
   if (!ok) {

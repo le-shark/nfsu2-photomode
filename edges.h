@@ -22,7 +22,7 @@ constexpr int kPieces = 8;
 // from y = 8: all at least 2 pixels inside the screen, none overlapping. False for screens too small to fit them.
 inline bool Layout(int w, int h, Piece out[kPieces]) {
   const int hw = (w + 1) / 2, hh = (h + 1) / 2;
-  if (w < 2 || h < 2 || 2 + hw > w - 2 || 8 + hh > h - 2 || 12 > w - 2) return false;
+  if (2 + hw > w - 2 || 8 + hh > h - 2 || 12 > w - 2) return false;
   out[0] = {0, 0, hw, 1, 2, 2};
   out[1] = {hw, 0, w - hw, 1, 2, 3};
   out[2] = {0, h - 1, hw, 1, 2, 4};

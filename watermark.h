@@ -37,7 +37,13 @@ struct Rect {
 };
 // In the corner of the photo area `area` (the whole image, or the Aspect Ratio frame) of an image imageH pixels
 // high: size and margin scale with the image height, so a logo keeps its size whatever the ratio.
-Rect Place(const Mark& m, const Rect& area, int imageH, Corner c);
+inline Rect Place(const Mark& m, const Rect& area, int imageH, Corner c) {
+  const float k = static_cast<float>(imageH) / 1080.0f;
+  const float w = m.image->w * m.scale * k, h = m.image->h * m.scale * k, g = m.margin * k;
+  const bool right = c == Corner::BottomRight || c == Corner::TopRight;
+  const bool bottom = c == Corner::BottomRight || c == Corner::BottomLeft;
+  return {right ? area.x + area.w - g - w : area.x + g, bottom ? area.y + area.h - g - h : area.y + g, w, h};
+}
 
 // User 2026-10-21: every image in the "watermarks" folder next to the ASI (any case; no folder, no extra watermarks),
 // any image type Windows decodes, listed by its file name without the extension. The list name from a file name, or
@@ -52,9 +58,10 @@ inline bool ListName(const std::wstring& file, std::string* name) {
   return true;
 }
 
-// PNG decoding with Windows' own codec (WIC). The caller's thread must allow COM (frame code, not DllMain).
-bool LoadResourcePng(int id, Image* out);
-bool LoadFilePng(const std::wstring& path, Image* out);
+// Image decoding with Windows' own codec (WIC: PNG, JPEG, BMP, ...), at most 4096 x 4096 (64 MB decoded; larger
+// images are refused). The caller's thread must allow COM (frame code, not DllMain).
+bool LoadResourceImage(int id, Image* out);
+bool LoadFileImage(const std::wstring& path, Image* out);
 // The folder of this ASI, with a trailing backslash.
 std::wstring ModuleDir();
 
@@ -69,6 +76,7 @@ class Overlay {
 
  private:
   bool Ensure(IDirect3DDevice9* dev, const Image* img);
+  void Release();  // the texture and state block; a failure stays recorded
   const Image* image_ = nullptr;
   IDirect3DTexture9* tex_ = nullptr;
   IDirect3DStateBlock9* state_ = nullptr;
