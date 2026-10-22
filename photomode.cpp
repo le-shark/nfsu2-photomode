@@ -54,8 +54,9 @@ enum class State { Off, Active, Capturing };
 // User 2026-10-19: Target is "Focus Target", above Focus Mode (it is also the orbit camera's car).
 // User 2026-10-20: Drive (beta request), the last row: the menu scrolls to it (12 rows, 11 slots; u2sdk optmenu).
 // User 2026-10-20: Watermark (default None) and Watermark Pos. (disabled while None), before Take Picture.
+// User 2026-10-22: Take Picture is the last row, Drive above it (MenuRow skips Drive when [PhotoMode] Drive = 0).
 enum Row { RowCamera, RowFocal, RowRoll, RowTarget, RowFocusMode, RowFocus, RowAperture, RowShutter, RowFollow, RowResolution,
-           RowAspect, RowCrop, RowGrid, RowWatermark, RowWatermarkPos, RowTake, RowDrive, RowCount };
+           RowAspect, RowCrop, RowGrid, RowWatermark, RowWatermarkPos, RowDrive, RowTake, RowCount };
 
 constexpr float kMinFocusM = 0.3f, kMaxFocusM = 500;
 constexpr float kBackGuardSec = 0.3f;  // after a key cancels a capture, the same press must not also exit
@@ -1053,7 +1054,7 @@ std::string RowLabel(int row) {
   static const char* names[RowCount] = {"Camera Mode", "Focal Length", "Roll",     "Focus Target",
                                         "Focus Mode", "Focus",        "Aperture", "Shutter Speed",
                                         "Shutter Follow", "Resolution", "Aspect Ratio", "Crop to Ratio", "Grid", "Watermark", "Watermark Pos.",
-                                        "Take Picture", "Drive"};
+                                        "Drive", "Take Picture"};
   return row >= 0 && row < RowCount ? names[row] : "";
 }
 
@@ -1088,6 +1089,15 @@ std::string RowValue(int row) {
   }
   return b;
 }
+
+// The menu's row index to ours: without Drive the menu has one row less and Take Picture moves up into Drive's place.
+int MenuRow(int row) { return !g->cfg.drive && row >= RowDrive ? row + 1 : row; }
+std::string MenuLabel(int row) { return RowLabel(MenuRow(row)); }
+std::string MenuValue(int row) { return RowValue(MenuRow(row)); }
+void MenuAdjust(int row, int dir) { Adjust(MenuRow(row), dir); }
+void MenuActivate(int row) { Activate(MenuRow(row)); }
+bool MenuIsAction(int row) { return IsActionRow(MenuRow(row)); }
+bool MenuIsEnabled(int row) { return IsRowEnabled(MenuRow(row)); }
 
 std::string StatusText() {
   char b[64];
@@ -1603,7 +1613,8 @@ bool Install() {
     return false;  // created hooks are never enabled
   }
   // Footer: user 2026-10-19, "H - Hide/Show UI" at the bottom of the bar; 2026-10-20 "Space - Take Picture" next to it.
-  if (!menu::Install(menu::Callbacks{g->cfg.drive ? RowCount : RowDrive, &RowLabel, &RowValue, &Adjust, &Activate, &MenuBack, &IsActionRow, &IsRowEnabled,
+  if (!menu::Install(menu::Callbacks{g->cfg.drive ? RowCount : RowCount - 1, &MenuLabel, &MenuValue, &MenuAdjust, &MenuActivate, &MenuBack,
+                                     &MenuIsAction, &MenuIsEnabled,
                                      "H - Hide/Show UI    Space - Take Picture"},
                      g->cfg.menuLayout, g->cfg.verbose))
     return false;
