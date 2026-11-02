@@ -234,6 +234,7 @@ struct PhotoMode {
   int savedMirror = 0;
   LARGE_INTEGER previewStart{};
   bool captureContinued = false;  // the capture started from the preview's samples
+  bool worldHeld = false;       // this exposure keeps the world still: cars on the cutscene mover (NisCarsInPlay)
   int captureFromSample = 0;
   LARGE_INTEGER captureStart{};
 };
@@ -1150,6 +1151,9 @@ void Exit(const char* why, bool byPlayer = false) {
   PlayerCamera()->FieldOfView = g->saved.fov;
   tags::Close();
   menu::Close();
+  // The packages we kept from drawing (FeRenderDetour) lost every change made to them meanwhile (their intro fade-in,
+  // say): drawn anew from their state now. [game] 2026-11-02: the post-race menu came back with only "Continue".
+  feng::RedrawAll();
   g->input.SetMouseCapture(false);
   Var<uint8_t>(addr::FECursorVisible) = g->saved.cursorVisible;
   // Put the cursor back: the game/WidescreenFix mouse-look reads cursor deltas.
@@ -1158,6 +1162,22 @@ void Exit(const char* why, bool byPlayer = false) {
   if (g->cfg.verbose) g->postExitLog = 3;
   U2LOG("exit (%s, %s): speed=%.2f hud=%d", why, SceneName(g->scene), Var<float>(addr::GameSpeed), Var<int>(addr::DrawHud));
   g->scene = Scene::None;
+}
+
+// Cars on the game's cutscene mover (movement mode 5, "NISMvr": SetMovementMode 0x5F46A0 case 5, ctor 0x5B6FC0, name
+// 0x7A277C), as on the post-race scene (0x430AA6). Its controller 0x5A44A0 asks for speed = position error / dt and turn
+// rate = heading error / dt (1.0 / dt at 0x5A44CB) and kicks the body with impulses capped per call, not per second
+// (0x59BC60): a shutter sample's world step (shutter / samples, 62.5 us at 1/125 and 128) is 266 times shorter than a
+// frame, so it asks 266 times the speed and gives 128 full kicks in 8 ms. [game] 2026-11-02: a 1/125 photo after the finish
+// spun the car into the road. The game itself never steps them that finely, so with them in play an exposure keeps the
+// world on the game's pause path and only the camera moves (the cars move under a millimetre in such an exposure).
+// Investigation 2026-11-03, verified-in-binary.md "Cutscene mover".
+bool NisCarsInPlay() {
+  constexpr int kMovementNis = 5;
+  uint8_t* cars[kMaxCars];
+  for (int i = 0, n = ActiveCars(cars, kMaxCars); i < n; ++i)
+    if (*reinterpret_cast<int*>(cars[i] + 0x28) == kMovementNis) return true;
+  return false;
 }
 
 void StartCapture() {
@@ -1233,6 +1253,8 @@ void StartCapture() {
   g->captureCam = RigPose();
   g->captureCar = TargetCarPose();
   g->particleCarry = 0;
+  g->worldHeld = p.shutterSec > 0 && !InGarage() && NisCarsInPlay();
+  if (g->worldHeld) U2LOG("capture: cutscene cars in play (post-race): the world stays still during the exposure");
   g->state = State::Capturing;
 }
 
@@ -1649,11 +1671,13 @@ void Tick() {
       g->frame.show = !tiles;
       g->frame.showHold = tiles;
       // The world stays still on resolve frames: no need to wait for the 1/60 limiter (review 2026-10-22).
-      SetUncapped(((cf.sample || cf.warm) && g->capture.Params().shutterSec == 0) || cf.resolve);
+      const bool still = g->capture.Params().shutterSec == 0 || g->worldHeld;
+      SetUncapped(((cf.sample || cf.warm) && still) || cf.resolve);
       // Shutter samples advance the world by a small, non-zero time step through the normal
       // (unpaused) loop path; otherwise the world stays on the game's own pause path.
-      freeze::Hold(cf.nextGameSpeed <= 0);
-      Var<float>(addr::GameSpeed) = cf.nextGameSpeed > 0 ? cf.nextGameSpeed : g->saved.gameSpeed;
+      const bool step = cf.nextGameSpeed > 0 && !g->worldHeld;
+      freeze::Hold(!step);
+      Var<float>(addr::GameSpeed) = step ? cf.nextGameSpeed : g->saved.gameSpeed;
     } else {
       EndCapture();
     }
@@ -1685,7 +1709,9 @@ void Tick() {
     Exit("menu unavailable");
     return;
   }
+  const bool wasHidden = menu::IsHidden();
   menu::SetHidden((g->uiHidden && g->state == State::Active) || g->driving);
+  if (wasHidden && !menu::IsHidden()) feng::RedrawAll();  // our menu's changes while hidden (FeRenderDetour)
   // Esc / pad B cancel a capture here (HandleFrame); reaching the menu as Back they also faded every row out for good
   // (user 2026-10-22: only the grey Focus row was left), so the menu takes no input meanwhile.
   menu::SetInputBlocked(g->state == State::Capturing || g->backGuard > 0);
@@ -1888,7 +1914,9 @@ void __fastcall ProjDetour(void* plat, void* edx, eView* view, float a, float b,
 }
 
 // While photo mode is up only our menu is drawn (HUD, minimap, messages hidden); H hides it too.
-// A package is skipped by detaching its object list (pkg+0x4C) for the call.
+// A package is skipped by detaching its object list (pkg+0x4C) for the call. The FE still counts the frame as drawn
+// (cFEng+0x5250, 0x5367B5) and forgets the skipped objects' changes (investigation 2026-11-03), so whatever is shown
+// again is drawn anew (feng::RedrawAll in Exit and when our menu comes back from hiding).
 // A capture's resolve frame (the one read back into the PNG) hides our menu here too. drawHud = 0 alone is not
 // enough: the FE pass 0x5378C0 reads it through the pointer at 0x5378C1, which NFSU2_CameraToolkit repoints to its
 // own "Draw HUD" flag (camtk dllmain.cpp:220), so with that mod the menu was drawn into photos (beta feedback
