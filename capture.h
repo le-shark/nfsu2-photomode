@@ -27,9 +27,6 @@ struct CaptureParams {
   std::string outPath;      // full path of the .png
   int aspect = 0;           // Aspect Ratio (frame.h): the bars are drawn into the image
   bool crop = false;        // Crop to Ratio: the PNG is the photo area only
-  // [Debug] Verbose, 1x only: one more frame shows the photo's view on screen with the FE hidden, read back after
-  // WidescreenFix at EndScene as photos were until 2026-11-02, and compared with the photo (CheckScreen, logged).
-  bool screenCheck = false;
 };
 
 // What the controller does this frame.
@@ -39,7 +36,6 @@ struct CaptureFrame {
   bool newTile = false;     // reset the accumulator first (a new tile starts)
   bool warm = false;        // supersample: render at 2x without sampling (glow buffer warm-up)
   int region = -1;          // supersample resolve: quarter of the 2x mean to resolve (QuarterUv)
-  bool check = false;       // the screen check frame (CaptureParams::screenCheck)
   u2::ProjAdjust adj;
   float nextGameSpeed = 0;  // shutter: game speed for the next simulation step (0 = frozen)
 };
@@ -59,8 +55,6 @@ class Capture {
   // screen-sized render target, then ReadResolved gammas it and copies it into the image.
   IDirect3DSurface9* ResolveTarget() const { return active_ && resolveArmed_ ? surf_ : nullptr; }
   void ReadResolved(IDirect3DDevice9* dev);
-  // From EndScene on the check frame: the screen against the photo, logged; then the PNG.
-  void CheckScreen(IDirect3DDevice9* dev);
 
   void Abort(const char* reason);
   float Progress() const;
@@ -82,14 +76,12 @@ class Capture {
   int warm_ = 0;                   // supersample warm-up frames planned
   bool resolveArmed_ = false;     // a resolve is pending its readback
   bool tileDone_ = false;         // the tile was read back; the next frame starts the next one
-  bool checkPending_ = false;     // the photo is read; the screen check frame comes next
   wsfgamma::Gamma gamma_;
   wsfgamma::Use gammaUse_ = wsfgamma::Use::None;
   IDirect3DTexture9* tex_ = nullptr;   // the resolve target (a texture: the gamma reads it)
   IDirect3DSurface9* surf_ = nullptr;  // its level 0
   IDirect3DSurface9* out_ = nullptr;   // the gamma's output (only with the gamma on)
   IDirect3DSurface9* sys_ = nullptr;
-  IDirect3DSurface9* checkRt_ = nullptr;  // the screen check's copy of the backbuffer
   std::vector<uint8_t> image_;
   std::atomic<int> saving_{0};  // PNG writer threads still running
 

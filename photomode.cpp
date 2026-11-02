@@ -93,8 +93,6 @@ struct FramePlan {
   bool resolve = false; // capture resolve frame: the mean is drawn off screen and read back (ResolvePhoto)
   bool warm = false;    // 2x capture warm-up: render into the 2x targets, don't sample
   int region = -1;      // supersample resolve: quarter of the 2x mean to resolve
-  bool check = false;   // verbose screen check frame (CaptureParams::screenCheck): the photo's view, FE hidden
-  bool checkShown = false;  // set by the Render3D hook when it drew the check frame
   bool probeHold = false;// focus probe, frame N: keep this frame (Accum::Hold) without emptying the mean
   bool probe = false;    // focus probe, frame N+1: render the depth (focusprobe.h), show the held frame
   ProjAdjust adj;
@@ -201,8 +199,6 @@ struct PhotoMode {
   alignas(16) bMatrix4 camMatrix{};  // world->view matrix applied in the SetCameraMatrix hook
   bool firstFrameDone = false;
   float postExitLog = 0;      // verbose: seconds left to log game state after exit
-  bool endSceneHooked = false;  // verbose: the screen check's EndScene hook (one attempt)
-  bool screenCheck = false;     // that hook is in
   float pauseRequest = 0;     // seconds left to open photo mode after its pause-menu icon resumed the race
   bool fromPause = false;     // opened from the pause-menu icon: closing it goes back to the pause menu
   float returnToPause = 0;    // seconds left to bring the pause menu back (the world stays frozen meanwhile)
@@ -239,14 +235,12 @@ using MoverUpdateFn = void(__fastcall*)(void*, void*);
 using ProjFn = void(__fastcall*)(void*, void*, eView*, float, float, int);
 using FeRenderFn = void(__fastcall*)(void*, void*);
 using FrameFn = void(__cdecl*)();
-using EndSceneFn = HRESULT(__stdcall*)(IDirect3DDevice9*);
 SetCameraMatrixFn oSetCameraMatrix;
 MoverUpdateFn oCubicMoverUpdate;
 ProjFn oProj;
 FeRenderFn oFeRender;
 FrameFn oFrame;
 FrameFn oRender3D;
-EndSceneFn oEndScene;
 
 // ---- helpers --------------------------------------------------------------------------------
 float FovCal() { return g->cfg.fovCalibration > 0 ? g->cfg.fovCalibration : kDefaultVertFovScale; }
@@ -1068,7 +1062,6 @@ void StartCapture() {
   p.outPath = NewPicturePath();
   p.aspect = g->aspect;
   p.crop = g->aspect && g->crop;
-  p.screenCheck = g->cfg.verbose && g->screenCheck;
   if (p.sample.tiles > 1) {
     // 2x: supersampled in one pass (motion blur works); tiles only when the targets don't fit. The probe's targets and
     // the held copies are not needed meanwhile (7-10 bytes a pixel; rebuilt on demand).
@@ -1389,15 +1382,6 @@ void HandleControls(float dt) {
   UpdateRig(ri, dt);
 }
 
-// Verbose only: the screen check frame is read back after WidescreenFix's own EndScene work (Capture::CheckScreen).
-HRESULT __stdcall EndSceneDetour(IDirect3DDevice9* dev) {
-  if (g->state == State::Capturing && g->frame.check && g->frame.checkShown && dev == Device()) {
-    g->frame.checkShown = false;
-    g->capture.CheckScreen(dev);
-  }
-  return oEndScene(dev);
-}
-
 void LogPostExit(float dt) {
   float before = g->postExitLog;
   g->postExitLog -= dt;
@@ -1439,11 +1423,6 @@ void Tick() {
   g->lastQpc = now;
   dt = Clamp(dt, 0.0f, 0.1f);
 
-  if (g->cfg.verbose && !g->endSceneHooked && Device()) {
-    g->endSceneHooked = true;
-    g->screenCheck = d3d::HookDeviceMethod(d3d::vt::EndScene, reinterpret_cast<void*>(&EndSceneDetour),
-                                           reinterpret_cast<void**>(&oEndScene), "IDirect3DDevice9::EndScene");
-  }
   if (g->rezeroNativeFx) {  // after a device reset (OnDeviceReset); the reset frame itself draws nothing
     g->rezeroNativeFx = false;
     if (g->state != State::Off) {
@@ -1534,9 +1513,6 @@ void Tick() {
       g->frame.adj = cf.adj;
       g->frame.resolve = cf.resolve;
       g->frame.region = cf.region;
-      g->frame.check = cf.check;
-      g->frame.checkShown = false;
-      Var<int>(addr::DrawHud) = cf.check ? 0 : g->saved.drawHud;
       g->frame.warm = cf.warm;
       // The screen shows the developing mean (1x, 2x) or the held frame (tiles), never the jittered
       // or zoomed samples; the menu with its progress stays live on top. Resolve frames too: the photo is drawn off
@@ -1732,12 +1708,6 @@ void __cdecl Render3DDetour() {
     acc.AddSample(dev);
     g->frame.sample = false;  // one sample per planned frame
   }
-  if (g->state == State::Capturing && g->frame.check) {  // the photo's view as photos were read before 2026-11-02
-    acc.Show(dev);
-    DrawOverlays(dev, true);
-    g->frame.checkShown = true;
-    return;
-  }
   if (g->state == State::Capturing && g->frame.resolve) ResolvePhoto(dev, acc);
   if (g->frame.show && acc.Count() > 0) {
     acc.Show(dev);  // a 2x mean is box-filtered down to the screen
@@ -1796,15 +1766,14 @@ void __fastcall ProjDetour(void* plat, void* edx, eView* view, float a, float b,
 // 2026-10-20: "the photo mode ui visible in end screenshots").
 void __fastcall FeRenderDetour(void* feng, void* edx) {
   if (g->state == State::Off) return oFeRender(feng, edx);
-  const bool check = g->state == State::Capturing && g->frame.check;
-  bool hideMenu = menu::IsHidden() || check;
+  bool hideMenu = menu::IsHidden();
   void* saved[64];
   feng::FEPackage* pkgs[64];
   int n = 0;
   for (auto p = feng::FirstActivePackage(); p && n < 64; p = feng::NextPackage(p)) {
     if (menu::IsMenuPackage(feng::PackageName(p)) && !hideMenu) continue;
     // Tags stay with the menu hidden (H), like the grid; never in a photo.
-    if (tags::IsPackage(feng::PackageName(p)) && g->racerTags && !check) continue;
+    if (tags::IsPackage(feng::PackageName(p)) && g->racerTags) continue;
     pkgs[n] = p;
     saved[n] = feng::PackageObjects(p);
     feng::PackageObjects(p) = nullptr;
