@@ -9,7 +9,6 @@ struct IDirect3DSurface9;
 struct IDirect3DPixelShader9;
 struct IDirect3DStateBlock9;
 
-#include "edges.h"
 #include "sampling.h"
 
 namespace photomode {
@@ -34,16 +33,11 @@ class Accum {
   void Show(IDirect3DDevice9* dev);
   // Draws one region of the mean 1:1 onto the current render target (2x resolve, one quarter).
   void ShowRegion(IDirect3DDevice9* dev, const UvRect& uv);
-  // The FSAA edge frame (edges.h): Keep copies the finished resolve frame (the mean with the bars and the watermark,
-  // before WidescreenFix clears its edges at EndScene); ShowKeptPieces draws pieces of it, each 1:1 at its own place.
-  // Screen-sized accumulator only.
-  void Keep(IDirect3DDevice9* dev);
-  void ShowKeptPieces(IDirect3DDevice9* dev, const edges::Piece* pieces, int count);
   // Keeps a copy of the current render target (the frame on screen), and draws it back later:
   // tile captures show this still frame under the live menu instead of the zoomed tiles.
   void Hold(IDirect3DDevice9* dev);
   void ShowHold(IDirect3DDevice9* dev);
-  // Releases the held and kept copies (before a 2x capture, which needs the video memory).
+  // Releases the held copy (before a 2x capture, which needs the video memory).
   void FreeHold();
   // Releases everything (count 0, failure cleared); the next Ensure recreates it. Called on exit
   // (about 74 MB at 1080p are not kept outside photo mode) and before the game's device Reset
@@ -68,7 +62,6 @@ class Accum {
   int count_ = 0, width_ = 0, height_ = 0, cur_ = 0;
   IDirect3DTexture9* scene_ = nullptr;
   IDirect3DTexture9* hold_ = nullptr;
-  IDirect3DTexture9* kept_ = nullptr;
   IDirect3DTexture9* acc_[2] = {};
   IDirect3DPixelShader9* psAccum_ = nullptr;
   IDirect3DPixelShader9* psShow_ = nullptr;

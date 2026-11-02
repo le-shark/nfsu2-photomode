@@ -88,13 +88,13 @@ struct Saved {
 struct FramePlan {
   bool sample = false;  // fold this frame into the accumulator (projection jittered by adj)
   bool show = false;    // draw the accumulated image over the scene
-  bool shown = false;   // set by the Render3D hook when it drew the mean this frame
   bool hold = false;    // tile capture start: keep the frame on screen, then empty the mean
   bool showHold = false;// tile capture: draw the held frame over the zoomed tile sample
-  bool resolve = false; // capture resolve frame: read back at EndScene, never presented
+  bool resolve = false; // capture resolve frame: the mean is drawn off screen and read back (ResolvePhoto)
   bool warm = false;    // 2x capture warm-up: render into the 2x targets, don't sample
-  int region = -1;      // supersample resolve: quarter of the 2x mean to show
-  bool edges = false;   // with resolve: the FSAA edge frame, only the edge pieces (edges.h)
+  int region = -1;      // supersample resolve: quarter of the 2x mean to resolve
+  bool check = false;   // verbose screen check frame (CaptureParams::screenCheck): the photo's view, FE hidden
+  bool checkShown = false;  // set by the Render3D hook when it drew the check frame
   bool probeHold = false;// focus probe, frame N: keep this frame (Accum::Hold) without emptying the mean
   bool probe = false;    // focus probe, frame N+1: render the depth (focusprobe.h), show the held frame
   ProjAdjust adj;
@@ -199,11 +199,10 @@ struct PhotoMode {
   LARGE_INTEGER lastQpc{}, qpcFreq{};
   float lastDt = 1 / 60.f;      // the previous open frame's time (the camera and shutter steps use it)
   alignas(16) bMatrix4 camMatrix{};  // world->view matrix applied in the SetCameraMatrix hook
-  bool frameArmed = false;    // main-frame EndScene pending
-  bool endSceneHooked = false;
-  bool captureHooks = false;  // EndScene and Present both hooked
   bool firstFrameDone = false;
   float postExitLog = 0;      // verbose: seconds left to log game state after exit
+  bool endSceneHooked = false;  // verbose: the screen check's EndScene hook (one attempt)
+  bool screenCheck = false;     // that hook is in
   float pauseRequest = 0;     // seconds left to open photo mode after its pause-menu icon resumed the race
   bool fromPause = false;     // opened from the pause-menu icon: closing it goes back to the pause menu
   float returnToPause = 0;    // seconds left to bring the pause menu back (the world stays frozen meanwhile)
@@ -241,7 +240,6 @@ using ProjFn = void(__fastcall*)(void*, void*, eView*, float, float, int);
 using FeRenderFn = void(__fastcall*)(void*, void*);
 using FrameFn = void(__cdecl*)();
 using EndSceneFn = HRESULT(__stdcall*)(IDirect3DDevice9*);
-using PresentFn = HRESULT(__stdcall*)(IDirect3DDevice9*, const RECT*, const RECT*, HWND, const RGNDATA*);
 SetCameraMatrixFn oSetCameraMatrix;
 MoverUpdateFn oCubicMoverUpdate;
 ProjFn oProj;
@@ -249,7 +247,6 @@ FeRenderFn oFeRender;
 FrameFn oFrame;
 FrameFn oRender3D;
 EndSceneFn oEndScene;
-PresentFn oPresent;
 
 // ---- helpers --------------------------------------------------------------------------------
 float FovCal() { return g->cfg.fovCalibration > 0 ? g->cfg.fovCalibration : kDefaultVertFovScale; }
@@ -1056,10 +1053,6 @@ void StartCapture() {
     g->captureAfterProbe = true;
     return;
   }
-  if (!g->captureHooks) {
-    Toast("Capture unavailable (see the log)");
-    return;
-  }
   if (g->capture.Saving()) {
     Toast("Still saving the previous picture");
     return;
@@ -1075,6 +1068,7 @@ void StartCapture() {
   p.outPath = NewPicturePath();
   p.aspect = g->aspect;
   p.crop = g->aspect && g->crop;
+  p.screenCheck = g->cfg.verbose && g->screenCheck;
   if (p.sample.tiles > 1) {
     // 2x: supersampled in one pass (motion blur works); tiles only when the targets don't fit. The probe's targets and
     // the held copies are not needed meanwhile (7-10 bytes a pixel; rebuilt on demand).
@@ -1395,26 +1389,13 @@ void HandleControls(float dt) {
   UpdateRig(ri, dt);
 }
 
-// Grab the finished frame (after WidescreenFix's own EndScene work, before Present).
+// Verbose only: the screen check frame is read back after WidescreenFix's own EndScene work (Capture::CheckScreen).
 HRESULT __stdcall EndSceneDetour(IDirect3DDevice9* dev) {
-  if (g->frameArmed) {
-    g->frameArmed = false;
-    // Read back only a resolve frame whose mean was really drawn (Render3D ran this frame).
-    if (g->state == State::Capturing && dev == Device() && g->frame.shown) g->capture.OnEndScene(dev);
+  if (g->state == State::Capturing && g->frame.check && g->frame.checkShown && dev == Device()) {
+    g->frame.checkShown = false;
+    g->capture.CheckScreen(dev);
   }
   return oEndScene(dev);
-}
-
-// A capture's resolve frame (the mean of a tile, FE hidden for the readback) is not presented: the
-// screen keeps the previous frame with the menu. Safe to skip: the game only checks Present for
-// DEVICELOST (0x5D2BC9) and calls TestCooperativeLevel at the start of every frame (0x5D2AF5 ->
-// reset handler 0x5D1C40).
-HRESULT __stdcall PresentDetour(IDirect3DDevice9* dev, const RECT* src, const RECT* dst, HWND wnd, const RGNDATA* dirty) {
-  // Gated on the frame plan, not capture.Active(): the last resolve's EndScene finishes the capture
-  // before this frame's Present.
-  if (g->state == State::Capturing && g->frame.resolve && dev == Device())
-    return S_OK;  // == D3D_OK
-  return oPresent(dev, src, dst, wnd, dirty);
 }
 
 void LogPostExit(float dt) {
@@ -1458,19 +1439,11 @@ void Tick() {
   g->lastQpc = now;
   dt = Clamp(dt, 0.0f, 0.1f);
 
-  if (!g->endSceneHooked && Device()) {
-    // One attempt only; failures are logged by hook::Create.
-    bool end = d3d::HookDeviceMethod(d3d::vt::EndScene, reinterpret_cast<void*>(&EndSceneDetour),
-                                     reinterpret_cast<void**>(&oEndScene), "IDirect3DDevice9::EndScene");
-    bool present = d3d::HookDeviceMethod(d3d::vt::Present, reinterpret_cast<void*>(&PresentDetour),
-                                         reinterpret_cast<void**>(&oPresent), "IDirect3DDevice9::Present");
-    // A capture needs both: without EndScene the resolve frames never read back, and the Present skip would hold
-    // the screen for good (2026-10-18 review).
-    g->captureHooks = end && present;
-    if (!g->captureHooks) U2LOG("capture unavailable: EndScene %s, Present %s", end ? "ok" : "FAILED", present ? "ok" : "FAILED");
+  if (g->cfg.verbose && !g->endSceneHooked && Device()) {
     g->endSceneHooked = true;
+    g->screenCheck = d3d::HookDeviceMethod(d3d::vt::EndScene, reinterpret_cast<void*>(&EndSceneDetour),
+                                           reinterpret_cast<void**>(&oEndScene), "IDirect3DDevice9::EndScene");
   }
-  g->frameArmed = true;
   if (g->rezeroNativeFx) {  // after a device reset (OnDeviceReset); the reset frame itself draws nothing
     g->rezeroNativeFx = false;
     if (g->state != State::Off) {
@@ -1556,22 +1529,21 @@ void Tick() {
       const int count = super ? g->bigAccum.Count() : g->resetBeforeSample ? 0 : g->accum.Count();
       CaptureFrame cf = g->capture.BeginFrame(count, g->lastDt);
       const bool tiles = g->capture.Params().sample.tiles > 1 && !super;
-      g->frame.shown = false;
       if (cf.newTile) g->accum.Reset();
       g->frame.sample = cf.sample;
       g->frame.adj = cf.adj;
       g->frame.resolve = cf.resolve;
       g->frame.region = cf.region;
-      g->frame.edges = cf.edges;
+      g->frame.check = cf.check;
+      g->frame.checkShown = false;
+      Var<int>(addr::DrawHud) = cf.check ? 0 : g->saved.drawHud;
       g->frame.warm = cf.warm;
-      // The screen shows the developing mean (1x) or the held frame (tiles), never the jittered
-      // or zoomed samples; the menu with its progress stays live on top.
-      g->frame.show = !tiles || cf.resolve;
-      g->frame.showHold = tiles && !cf.resolve;
-      // Resolve frame: FE off (our menu) so the mean is read back clean at EndScene.
-      Var<int>(addr::DrawHud) = cf.resolve ? 0 : g->saved.drawHud;
-      // Resolve and edge frames are never presented (PresentDetour) and the world stays still on them: no need to wait
-      // for the 1/60 limiter (review 2026-10-22: up to 16.7 ms each, 8 of them in a 2x photo with FSAA).
+      // The screen shows the developing mean (1x, 2x) or the held frame (tiles), never the jittered
+      // or zoomed samples; the menu with its progress stays live on top. Resolve frames too: the photo is drawn off
+      // screen (ResolvePhoto).
+      g->frame.show = !tiles;
+      g->frame.showHold = tiles;
+      // The world stays still on resolve frames: no need to wait for the 1/60 limiter (review 2026-10-22).
       SetUncapped(((cf.sample || cf.warm) && g->capture.Params().shutterSec == 0) || cf.resolve);
       // Shutter samples advance the world by a small, non-zero time step through the normal
       // (unpaused) loop path; otherwise the world stays on the game's own pause path.
@@ -1651,17 +1623,17 @@ void __cdecl FrameDetour() {
   oFrame();
 }
 
-// Into the finished 3D frame, under the menu, after the sample was taken and the mean drawn:
-// - the Aspect Ratio bars (user 2026-10-21, solid black) and the watermark (user 2026-10-20) in the photo area. A
-//   resolve frame is read back from this frame, so the photo carries both: at 2x (and with tiles) the screen shows one
-//   quarter of the whole image, so they are placed in the whole image and shifted by the quarter.
-// - the grid, in the photo area on screen only: like the menu, it stays out of the frames read back into the photo.
+// Into the current render target (the finished 3D frame under the menu, or a photo's resolve target), after the
+// sample was taken and the mean drawn:
+// - the Aspect Ratio bars (user 2026-10-21, solid black) and the watermark (user 2026-10-20) in the photo area. For a
+//   photo (resolve) at 2x or with tiles the target is one quarter of the whole image, so they are placed in the whole
+//   image and shifted by the quarter.
+// - the grid, in the photo area on screen only: like the menu, it stays out of the photo.
 //   The held tile frame and the samples were taken earlier in this hook, so they never have any of these.
-void DrawOverlays(IDirect3DDevice9* dev) {
+void DrawOverlays(IDirect3DDevice9* dev, bool resolve = false) {
   D3DSURFACE_DESC d;
   if (g->state == State::Off || !d3d::BackBufferDesc(dev, &d)) return;
   const int sw = static_cast<int>(d.Width), sh = static_cast<int>(d.Height);
-  const bool resolve = g->state == State::Capturing && g->frame.resolve;
   int w = sw, h = sh, ox = 0, oy = 0;
   const int tiles = g->capture.Params().sample.tiles;
   if (resolve && tiles > 1) {
@@ -1688,6 +1660,23 @@ void DrawOverlays(IDirect3DDevice9* dev) {
     const int n = grid::Thirds(area.x, area.y, area.w, area.h, grid::Thickness(sh), lines);  // w == sw here
     g->quadOverlay.Draw(dev, lines, n, grid::kLineColour);
   }
+}
+
+// A resolve frame's photo piece, off screen: the mean 1:1 (one quarter at 2x) with the bars and the watermark, then
+// WidescreenFix's gamma and the readback (Capture::ReadResolved). Before 2026-11-02 it was read from the screen at
+// EndScene (FE hidden, frame not presented); with in-game FSAA WidescreenFix clears the screen's edge pixels there, which
+// needed repair frames and left seams in 2x photos (tester, 2026-11-01).
+void ResolvePhoto(IDirect3DDevice9* dev, Accum& acc) {
+  IDirect3DSurface9* target = g->capture.ResolveTarget();
+  IDirect3DSurface9* screen = nullptr;
+  if (!target || acc.Count() == 0 || FAILED(dev->GetRenderTarget(0, &screen))) return;
+  dev->SetRenderTarget(0, target);
+  if (g->frame.region >= 0) acc.ShowRegion(dev, QuarterUv(g->frame.region));
+  else acc.Show(dev);  // the same size: 1:1
+  DrawOverlays(dev, true);
+  dev->SetRenderTarget(0, screen);  // the 2D pass sets its own viewport next (0x5CBF40)
+  screen->Release();
+  g->capture.ReadResolved(dev);
 }
 
 // Pre-FE point: the backbuffer holds the 3D scene + game post FX; the 2D pass 0x5CBF40(0) with the
@@ -1743,20 +1732,15 @@ void __cdecl Render3DDetour() {
     acc.AddSample(dev);
     g->frame.sample = false;  // one sample per planned frame
   }
-  if (g->frame.edges) {  // FSAA edge frame (edges.h), read back at EndScene
-    // Pieces of the resolve frame kept just before (Accum::Keep below): the mean with the bars and the watermark, so a
-    // watermark crossing a 2x seam keeps its pixels there (review 2026-10-22: drawn from the bare mean, it had a gap).
-    D3DSURFACE_DESC d;
-    edges::Piece pieces[edges::kPieces];
-    if (d3d::BackBufferDesc(dev, &d) && edges::Layout(static_cast<int>(d.Width), static_cast<int>(d.Height), pieces))
-      g->accum.ShowKeptPieces(dev, pieces, edges::kPieces);
-    g->frame.shown = true;
-    return;  // nothing else on this frame: the pieces are all it is read for
+  if (g->state == State::Capturing && g->frame.check) {  // the photo's view as photos were read before 2026-11-02
+    acc.Show(dev);
+    DrawOverlays(dev, true);
+    g->frame.checkShown = true;
+    return;
   }
+  if (g->state == State::Capturing && g->frame.resolve) ResolvePhoto(dev, acc);
   if (g->frame.show && acc.Count() > 0) {
-    if (g->frame.region >= 0) acc.ShowRegion(dev, QuarterUv(g->frame.region));  // 2x resolve, 1:1
-    else acc.Show(dev);  // a 2x mean is box-filtered down to the screen
-    g->frame.shown = true;
+    acc.Show(dev);  // a 2x mean is box-filtered down to the screen
   } else if (super && g->frame.show && g->accum.Count() > 0) {
     g->accum.Show(dev);  // 2x capture before its first sample: keep the 1x preview on screen
   }
@@ -1772,9 +1756,6 @@ void __cdecl Render3DDetour() {
     if (!g->accum.Failed()) g->probeStage = 1;
   }
   DrawOverlays(dev);
-  // The finished resolve frame, before WidescreenFix clears its edges at EndScene: the next frame's edge pieces.
-  if (g->state == State::Capturing && g->frame.resolve && g->frame.shown && g->capture.EdgeFrames())
-    g->accum.Keep(dev);
 }
 
 // Any other mover that still targets the player camera gets our matrix instead.
@@ -1815,14 +1796,15 @@ void __fastcall ProjDetour(void* plat, void* edx, eView* view, float a, float b,
 // 2026-10-20: "the photo mode ui visible in end screenshots").
 void __fastcall FeRenderDetour(void* feng, void* edx) {
   if (g->state == State::Off) return oFeRender(feng, edx);
-  bool hideMenu = menu::IsHidden() || (g->state == State::Capturing && g->frame.resolve);
+  const bool check = g->state == State::Capturing && g->frame.check;
+  bool hideMenu = menu::IsHidden() || check;
   void* saved[64];
   feng::FEPackage* pkgs[64];
   int n = 0;
   for (auto p = feng::FirstActivePackage(); p && n < 64; p = feng::NextPackage(p)) {
     if (menu::IsMenuPackage(feng::PackageName(p)) && !hideMenu) continue;
     // Tags stay with the menu hidden (H), like the grid; never in a photo.
-    if (tags::IsPackage(feng::PackageName(p)) && g->racerTags && !(g->state == State::Capturing && g->frame.resolve)) continue;
+    if (tags::IsPackage(feng::PackageName(p)) && g->racerTags && !check) continue;
     pkgs[n] = p;
     saved[n] = feng::PackageObjects(p);
     feng::PackageObjects(p) = nullptr;

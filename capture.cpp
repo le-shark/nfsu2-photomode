@@ -4,10 +4,10 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <new>
 #include <thread>
 
-#include "edges.h"
 #include "frame.h"
 #include "lens.h"
 #include "u2sdk/d3d.h"
@@ -29,22 +29,20 @@ bool Capture::Start(IDirect3DDevice9* dev, const CaptureParams& p, std::string* 
   }
   width_ = static_cast<int>(d.Width);
   height_ = static_cast<int>(d.Height);
-  edges::Piece layout[edges::kPieces];
-  edgeFrames_ = d.MultiSampleType != D3DMULTISAMPLE_NONE && edges::Layout(width_, height_, layout);
-  edgeW_ = edgeH_ = 0;
-  if (edgeFrames_)
-    for (const edges::Piece& pc : layout) {
-      edgeW_ = (std::max)(edgeW_, pc.dx + pc.w);
-      edgeH_ = (std::max)(edgeH_, pc.dy + pc.h);
-    }
-
-  if (FAILED(dev->CreateRenderTarget(d.Width, d.Height, D3DFMT_X8R8G8B8, D3DMULTISAMPLE_NONE, 0, FALSE, &rt_, nullptr)) ||
-      FAILED(dev->CreateOffscreenPlainSurface(d.Width, d.Height, D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM, &sys_, nullptr)) ||
-      (edgeFrames_ &&
-       (FAILED(dev->CreateRenderTarget(edgeW_, edgeH_, D3DFMT_X8R8G8B8, D3DMULTISAMPLE_NONE, 0, FALSE, &edgeRt_,
-                                       nullptr)) ||
-        FAILED(dev->CreateOffscreenPlainSurface(edgeW_, edgeH_, D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM, &edgeSys_,
-                                                nullptr))))) {
+  gammaUse_ = gamma_.Load(dev);
+  if (FAILED(dev->CreateTexture(d.Width, d.Height, 1, D3DUSAGE_RENDERTARGET, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT, &tex_,
+                                nullptr)) ||
+      FAILED(tex_->GetSurfaceLevel(0, &surf_)) ||
+      (gamma_.Loaded() &&
+       FAILED(dev->CreateRenderTarget(d.Width, d.Height, D3DFMT_X8R8G8B8, D3DMULTISAMPLE_NONE, 0, FALSE, &out_, nullptr))) ||
+      FAILED(dev->CreateOffscreenPlainSurface(d.Width, d.Height, D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM, &sys_, nullptr))) {
+    *error = "Capture failed: could not create the capture surfaces";
+    Release();
+    return false;
+  }
+  p_.screenCheck = p.screenCheck && p_.sample.tiles == 1 && !p_.supersample;
+  if (p_.screenCheck && FAILED(dev->CreateRenderTarget(d.Width, d.Height, D3DFMT_X8R8G8B8, D3DMULTISAMPLE_NONE, 0, FALSE,
+                                                       &checkRt_, nullptr))) {
     *error = "Capture failed: could not create the capture surfaces";
     Release();
     return false;
@@ -58,11 +56,13 @@ bool Capture::Start(IDirect3DDevice9* dev, const CaptureParams& p, std::string* 
   }
   tile_ = done_ = warm_ = 0;
   lastPlanned_ = -1;
-  resolveArmed_ = tileDone_ = edgePending_ = false;
+  resolveArmed_ = tileDone_ = checkPending_ = false;
   active_ = true;
-  U2LOG("capture start: %dx%d tiles=%d samples=%d lens=%.4fm focus=%.2fm shutter=%.4fs%s -> %s", width_, height_,
+  static const char* const kGamma[] = {"none (no WidescreenFix gamma)", "off (WidescreenFix ConsoleGamma = 0)",
+                                       "WidescreenFix ConsoleGamma", "FAILED (see above): without gamma"};
+  U2LOG("capture start: %dx%d tiles=%d samples=%d lens=%.4fm focus=%.2fm shutter=%.4fs gamma %s -> %s", width_, height_,
         p_.sample.tiles, p_.sample.samples, p_.sample.lensRadius, p_.sample.focusDist, p_.shutterSec,
-        edgeFrames_ ? " fsaa-edges" : "", p_.outPath.c_str());
+        kGamma[static_cast<int>(gammaUse_)], p_.outPath.c_str());
   return true;
 }
 
@@ -78,6 +78,10 @@ CaptureFrame Capture::BeginFrame(int accumCount, float lastFrameDt) {
       accumCount = 0;
     }
   }
+  if (checkPending_) {  // repeated until its EndScene reads it
+    f.check = true;
+    return f;
+  }
   if (p_.supersample && warm_ < kGlowWarmupFrames) {  // world still frozen; no shutter step
     ++warm_;
     f.warm = true;
@@ -85,11 +89,6 @@ CaptureFrame Capture::BeginFrame(int accumCount, float lastFrameDt) {
   }
   const int n = p_.sample.samples;
   done_ = accumCount < n ? accumCount : n;
-  if (edgePending_) {  // the tile's edge frame (edges.h); repeated until its EndScene reads it
-    f.resolve = resolveArmed_ = f.edges = true;
-    if (p_.supersample) f.region = tile_;
-    return f;
-  }
   if (resolveArmed_ || accumCount >= n) {  // also repeats a resolve whose image was not drawn
     f.resolve = resolveArmed_ = true;
     if (p_.supersample) f.region = tile_;  // quarter q goes into tile slot q
@@ -114,14 +113,17 @@ CaptureFrame Capture::BeginFrame(int accumCount, float lastFrameDt) {
   return f;
 }
 
-void Capture::OnEndScene(IDirect3DDevice9* dev) {
+void Capture::ReadResolved(IDirect3DDevice9* dev) {
   if (!active_ || !resolveArmed_) return;
-  if (edgePending_) return ReadEdges(dev);
-  IDirect3DSurface9* bb = nullptr;
-  if (FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb))) return;
-  HRESULT hr = dev->StretchRect(bb, nullptr, rt_, nullptr, D3DTEXF_NONE);
-  bb->Release();
-  if (FAILED(hr) || FAILED(dev->GetRenderTargetData(rt_, sys_))) {
+  IDirect3DSurface9* src = surf_;
+  if (gamma_.Loaded()) {
+    if (!gamma_.Apply(dev, tex_, out_)) {
+      Abort("WidescreenFix gamma failed");
+      return;
+    }
+    src = out_;
+  }
+  if (FAILED(dev->GetRenderTargetData(src, sys_))) {
     Abort("frame readback failed");
     return;
   }
@@ -130,7 +132,7 @@ void Capture::OnEndScene(IDirect3DDevice9* dev) {
     Abort("frame lock failed");
     return;
   }
-  // The backbuffer already holds the gamma-corrected mean: copy X8R8G8B8 (B,G,R,X) into the tile as RGB.
+  // X8R8G8B8 (B,G,R,X) into the tile as RGB.
   const int tiles = p_.sample.tiles, tx = tile_ % tiles, ty = tile_ / tiles;
   const size_t stride = static_cast<size_t>(width_) * tiles * 3;
   for (int y = 0; y < height_; ++y) {
@@ -144,61 +146,48 @@ void Capture::OnEndScene(IDirect3DDevice9* dev) {
   }
   sys_->UnlockRect();
   resolveArmed_ = false;
-  if (edgeFrames_) {
-    edgePending_ = true;  // the next frame shows the edge pieces (BeginFrame)
-    return;
-  }
-  TileRead();
+  if (tile_ + 1 < tiles * tiles) tileDone_ = true;
+  else if (p_.screenCheck) checkPending_ = true;
+  else Finish();
 }
 
-void Capture::TileRead() {
-  const int tiles = p_.sample.tiles;
-  if (tile_ + 1 >= tiles * tiles) Finish();
-  else tileDone_ = true;
-}
-
-// The edge frame (edges.h): the pieces at their inside places; each pixel goes back to its edge in this tile, inside
-// the photo area only (the Aspect Ratio bars stay as the normal frame drew them).
-void Capture::ReadEdges(IDirect3DDevice9* dev) {
-  // Only the rectangle the pieces cover (about a quarter of the screen): the full-screen readback cost 2.9 ms at 1080p
-  // and 12-14 ms at 4K per piece (review 2026-10-22).
+void Capture::CheckScreen(IDirect3DDevice9* dev) {
+  if (!active_ || !checkPending_) return;
+  checkPending_ = false;
   IDirect3DSurface9* bb = nullptr;
-  if (FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb))) return;
-  const RECT r{0, 0, edgeW_, edgeH_};
-  HRESULT hr = dev->StretchRect(bb, &r, edgeRt_, nullptr, D3DTEXF_NONE);
-  bb->Release();
-  if (FAILED(hr) || FAILED(dev->GetRenderTargetData(edgeRt_, edgeSys_))) {
-    Abort("edge readback failed");
-    return;
-  }
   D3DLOCKED_RECT lr;
-  if (FAILED(edgeSys_->LockRect(&lr, nullptr, D3DLOCK_READONLY))) {
-    Abort("edge lock failed");
-    return;
+  HRESULT hr = dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb);
+  if (SUCCEEDED(hr)) {
+    hr = dev->StretchRect(bb, nullptr, checkRt_, nullptr, D3DTEXF_NONE);
+    bb->Release();
   }
-  edges::Piece pieces[edges::kPieces];
-  edges::Layout(width_, height_, pieces);
-  const int tiles = p_.sample.tiles, tx = tile_ % tiles, ty = tile_ / tiles;
-  const int imgW = width_ * tiles, imgH = height_ * tiles;
-  const frame::Rect area = frame::Fit(imgW, imgH, p_.aspect);
-  int written = 0;
-  for (const edges::Piece& pc : pieces)
-    for (int y = 0; y < pc.h; ++y)
-      for (int x = 0; x < pc.w; ++x) {
-        const int ix = tx * width_ + pc.sx + x, iy = ty * height_ + pc.sy + y;  // in the whole image
-        if (ix < area.x || iy < area.y || ix >= area.x + area.w || iy >= area.y + area.h) continue;
-        const uint8_t* src = static_cast<const uint8_t*>(lr.pBits) + static_cast<size_t>(pc.dy + y) * lr.Pitch +
-                             static_cast<size_t>(pc.dx + x) * 4;
-        uint8_t* dst = image_.data() + (static_cast<size_t>(iy) * imgW + ix) * 3;
-        dst[0] = src[2];
-        dst[1] = src[1];
-        dst[2] = src[0];
-        ++written;
-      }
-  edgeSys_->UnlockRect();
-  if (tile_ == 0) U2LOG("capture: FSAA edge frame, %d edge pixels written back per screen piece", written);
-  resolveArmed_ = edgePending_ = false;
-  TileRead();
+  if (SUCCEEDED(hr)) hr = dev->GetRenderTargetData(checkRt_, sys_);
+  if (SUCCEEDED(hr)) hr = sys_->LockRect(&lr, nullptr, D3DLOCK_READONLY);
+  if (FAILED(hr)) {
+    U2LOG("screen check: readback failed (hr=0x%08lX)", hr);
+  } else {
+    // The outer pixel is left out: with FSAA WidescreenFix clears it on the screen (HideAABug).
+    int worst = 0, wx = 0, wy = 0;
+    double sum = 0;
+    long long off = 0, n = 0;
+    for (int y = 1; y < height_ - 1; ++y) {
+      auto row = static_cast<const uint8_t*>(lr.pBits) + static_cast<size_t>(y) * lr.Pitch;
+      const uint8_t* img = image_.data() + static_cast<size_t>(y) * width_ * 3;
+      for (int x = 1; x < width_ - 1; ++x)
+        for (int c = 0; c < 3; ++c) {
+          const int d = std::abs(int(row[x * 4 + 2 - c]) - int(img[x * 3 + c]));
+          sum += d;
+          ++n;
+          if (d > 1) ++off;
+          if (d > worst) worst = d, wx = x, wy = y;
+        }
+    }
+    sys_->UnlockRect();
+    U2LOG("screen check (gamma %d): photo vs the screen after WidescreenFix, outer pixel left out: max %d at (%d,%d), "
+          "mean %.4f, %lld of %lld values off by more than 1",
+          static_cast<int>(gammaUse_), worst, wx, wy, n ? sum / n : 0.0, off, n);
+  }
+  Finish();
 }
 
 void Capture::Finish() {
@@ -207,12 +196,13 @@ void Capture::Finish() {
   const int aspect = p_.aspect;
   const bool crop = p_.crop;
   std::string path = p_.outPath;
+  const std::string note = gammaUse_ == wsfgamma::Use::Failed ? " (without WidescreenFix gamma)" : "";
   auto img = std::make_shared<std::vector<uint8_t>>(std::move(image_));
   Release();
   ++saving_;
   Notify("Saving...");
   // The crop runs on the writer thread too (9.8 ms at 7680x4320, review 2026-10-22).
-  std::thread([this, img, fullW, fullH, aspect, crop, path] {
+  std::thread([this, img, fullW, fullH, aspect, crop, path, note] {
     int w = fullW, h = fullH;
     if (crop) {  // Crop to Ratio: keep the photo area (the same frame::Fit the bars were drawn around)
       const frame::Rect a = frame::CropInPlace(img->data(), w, h, aspect);
@@ -226,7 +216,7 @@ void Capture::Finish() {
     bool ok = u2::dev::SavePng(path, w, h, img->data());
     U2LOG("png %s (%dx%d): %s", path.c_str(), w, h, ok ? "saved" : "FAILED");
     std::string name = path.substr(path.find_last_of("\\/") + 1);
-    Notify(ok ? "Saved " + name : "Save failed (see the log)");
+    Notify(ok ? "Saved " + name + note : "Save failed (see the log)");
     --saving_;
   }).detach();
 }
@@ -248,10 +238,12 @@ float Capture::Progress() const {
 bool Capture::Saving() const { return saving_ > 0; }
 
 void Capture::Release() {
-  if (rt_) { rt_->Release(); rt_ = nullptr; }
+  if (surf_) { surf_->Release(); surf_ = nullptr; }
+  if (tex_) { tex_->Release(); tex_ = nullptr; }
+  if (out_) { out_->Release(); out_ = nullptr; }
   if (sys_) { sys_->Release(); sys_ = nullptr; }
-  if (edgeRt_) { edgeRt_->Release(); edgeRt_ = nullptr; }
-  if (edgeSys_) { edgeSys_->Release(); edgeSys_ = nullptr; }
+  if (checkRt_) { checkRt_->Release(); checkRt_ = nullptr; }
+  gamma_.Release();
   std::vector<uint8_t>().swap(image_);
 }
 

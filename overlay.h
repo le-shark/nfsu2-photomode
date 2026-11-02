@@ -1,5 +1,6 @@
 #pragma once
-// Drawing onto the backbuffer from the Render3D hook (watermark.cpp, grid.cpp): the states both overlays set, recorded
+// Drawing onto the current render target from the Render3D hook (watermark.cpp, grid.cpp): the screen, or a photo's
+// off-screen resolve target: the states both overlays set, recorded
 // once into a state block, and a scope that saves what the block does not hold. The device is a PUREDEVICE (0x50 at
 // 0x5B9B89), so nothing can be read back one by one: Capture() before the draw and Apply() after put the game's values
 // back, as accum.cpp does; stream 0 and the render target are saved by hand (WidescreenFix postfxcore.ixx
@@ -20,7 +21,7 @@ void SetStates(IDirect3DDevice9* dev, Kind kind);
 // Records SetStates into *block once. False (logged by the caller) when the device refuses.
 bool MakeBlock(IDirect3DDevice9* dev, Kind kind, IDirect3DStateBlock9** block);
 
-// Our states and the backbuffer as the render target, viewport = the whole backbuffer; everything back on destruction.
+// Our states on the current render target, viewport = all of it, no depth-stencil; everything back on destruction.
 class Scope {
  public:
   Scope(IDirect3DDevice9* dev, IDirect3DStateBlock9* block, Kind kind);
@@ -34,8 +35,8 @@ class Scope {
  private:
   IDirect3DDevice9* dev_;
   IDirect3DStateBlock9* block_;
-  IDirect3DSurface9* bb_ = nullptr;
   IDirect3DSurface9* rt_ = nullptr;
+  IDirect3DSurface9* ds_ = nullptr;
   IDirect3DVertexBuffer9* vb_ = nullptr;
   unsigned offset_ = 0, stride_ = 0;
   int w_ = 0, h_ = 0;

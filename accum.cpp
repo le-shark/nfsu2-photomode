@@ -149,43 +149,6 @@ void Accum::Draw(IDirect3DDevice9* dev, IDirect3DSurface9* target, IDirect3DPixe
   DrawQuads(dev, target, ps, t0, t1, c0, &q, 1);
 }
 
-void Accum::ShowKeptPieces(IDirect3DDevice9* dev, const edges::Piece* pieces, int count) {
-  if (failed_ || !kept_) return;
-  IDirect3DSurface9* rt = nullptr;
-  if (FAILED(dev->GetRenderTarget(0, &rt))) return;
-  // The kept frame is screen-sized: each piece pixel samples its own texel centre, 1:1, moved.
-  const float du = 1.0f / width_, dv = 1.0f / height_;
-  Quad q[edges::kPieces];
-  const int n = count < edges::kPieces ? count : edges::kPieces;
-  for (int i = 0; i < n; ++i) {
-    const edges::Piece& p = pieces[i];
-    q[i] = {p.dx - 0.5f, p.dy - 0.5f, p.dx + p.w - 0.5f, p.dy + p.h - 0.5f,
-            p.sx * du, p.sy * dv, (p.sx + p.w) * du, (p.sy + p.h) * dv};
-    // Thicker across the strip, the same source line repeated (edges.h kStripPad).
-    if (p.h == 1) {
-      q[i].y0 -= edges::kStripPad, q[i].y1 += edges::kStripPad;
-      q[i].v0 = q[i].v1 = (p.sy + 0.5f) * dv;
-    } else {
-      q[i].x0 -= edges::kStripPad, q[i].x1 += edges::kStripPad;
-      q[i].u0 = q[i].u1 = (p.sx + 0.5f) * du;
-    }
-  }
-  const float zero[4] = {};
-  DrawQuads(dev, rt, psCopy_, kept_, nullptr, zero, q, n);
-  rt->Release();
-}
-
-void Accum::Keep(IDirect3DDevice9* dev) {
-  if (failed_ || !scene_) return;
-  HRESULT hr = S_OK;
-  if (!kept_ && FAILED(hr = dev->CreateTexture(width_, height_, 1, D3DUSAGE_RENDERTARGET, D3DFMT_X8R8G8B8,
-                                               D3DPOOL_DEFAULT, &kept_, nullptr))) {
-    Fail("Keep texture", hr);
-    return;
-  }
-  CopyTarget(dev, kept_, "Keep");
-}
-
 void Accum::CopyTarget(IDirect3DDevice9* dev, IDirect3DTexture9* dst, const char* what) {
   IDirect3DSurface9 *rt = nullptr, *s = nullptr;
   HRESULT hr = dev->GetRenderTarget(0, &rt);
@@ -296,7 +259,6 @@ void Accum::Hold(IDirect3DDevice9* dev) {
 
 void Accum::FreeHold() {
   SafeRelease(hold_);
-  SafeRelease(kept_);
 }
 
 // Drawn with a shader, not StretchRect: the target may be the multisampled backbuffer (FSAA), which
@@ -325,7 +287,6 @@ void Accum::Fail(const char* what, long hr) {
 void Accum::Release() {
   SafeRelease(scene_);
   SafeRelease(hold_);
-  SafeRelease(kept_);
   SafeRelease(acc_[0]);
   SafeRelease(acc_[1]);
   SafeRelease(psAccum_);

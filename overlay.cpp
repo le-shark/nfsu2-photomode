@@ -54,17 +54,18 @@ bool MakeBlock(IDirect3DDevice9* dev, Kind kind, IDirect3DStateBlock9** block) {
 }
 
 Scope::Scope(IDirect3DDevice9* dev, IDirect3DStateBlock9* block, Kind kind) : dev_(dev), block_(block) {
-  if (!dev || !block || FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb_))) return;
+  if (!dev || !block || FAILED(dev->GetRenderTarget(0, &rt_)) || !rt_) return;
   D3DSURFACE_DESC d;
-  if (FAILED(bb_->GetDesc(&d))) return;
+  if (FAILED(rt_->GetDesc(&d))) return;
   UINT offset = 0, stride = 0;
   dev->GetStreamSource(0, &vb_, &offset, &stride);
   offset_ = offset;
   stride_ = stride;
-  dev->GetRenderTarget(0, &rt_);
+  dev->GetDepthStencilSurface(&ds_);
   if (FAILED(block->Capture())) return;
   SetStates(dev, kind);
-  dev->SetRenderTarget(0, bb_);
+  // An off-screen target has no multisampling; the auto depth-stencil may (FSAA). Z is off anyway.
+  dev->SetDepthStencilSurface(nullptr);
   D3DVIEWPORT9 vp{0, 0, d.Width, d.Height, 0, 1};
   dev->SetViewport(&vp);
   w_ = static_cast<int>(d.Width);
@@ -74,13 +75,14 @@ Scope::Scope(IDirect3DDevice9* dev, IDirect3DStateBlock9* block, Kind kind) : de
 
 Scope::~Scope() {
   if (ok_) {  // our draw ran: put back what it changed
-    if (rt_) dev_->SetRenderTarget(0, rt_);  // resets the viewport; Apply() restores the game's
+    dev_->SetRenderTarget(0, rt_);  // resets the viewport; Apply() restores the game's
+    dev_->SetDepthStencilSurface(ds_);
     block_->Apply();
     dev_->SetStreamSource(0, vb_, offset_, stride_);
   }
   if (vb_) vb_->Release();
   if (rt_) rt_->Release();
-  if (bb_) bb_->Release();
+  if (ds_) ds_->Release();
 }
 
 }  // namespace photomode::overlay

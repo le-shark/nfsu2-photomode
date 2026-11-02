@@ -1,8 +1,9 @@
 #pragma once
 // Capture on top of the GPU accumulator (accum.h): per tile, N jittered samples (lens position,
 // sub-pixel offset, optional shutter time slice) are folded into the running mean, then one
-// resolve frame shows the mean with the FE hidden and its backbuffer is read back at EndScene
-// (after WidescreenFix gamma). Tiles are stitched and a worker thread writes the PNG.
+// resolve frame draws the mean and the photo's overlays into an off-screen target (never the screen, so in-game FSAA
+// and WidescreenFix's edge clearing never reach the photo), runs WidescreenFix's gamma on it (wsfgamma.h) and reads it
+// back. Tiles are stitched and a worker thread writes the PNG.
 #include <atomic>
 #include <cstdint>
 #include <mutex>
@@ -11,9 +12,11 @@
 
 #include "sampling.h"
 #include "u2sdk/u2math.h"
+#include "wsfgamma.h"
 
 struct IDirect3DDevice9;
 struct IDirect3DSurface9;
+struct IDirect3DTexture9;
 
 namespace photomode {
 
@@ -24,16 +27,19 @@ struct CaptureParams {
   std::string outPath;      // full path of the .png
   int aspect = 0;           // Aspect Ratio (frame.h): the bars are drawn into the image
   bool crop = false;        // Crop to Ratio: the PNG is the photo area only
+  // [Debug] Verbose, 1x only: one more frame shows the photo's view on screen with the FE hidden, read back after
+  // WidescreenFix at EndScene as photos were until 2026-11-02, and compared with the photo (CheckScreen, logged).
+  bool screenCheck = false;
 };
 
 // What the controller does this frame.
 struct CaptureFrame {
   bool sample = false;      // render sample `adj` and fold it in
-  bool resolve = false;     // hide the FE, show the mean, read it back at EndScene
+  bool resolve = false;     // draw the mean off screen and read it back (ResolveTarget, ReadResolved)
   bool newTile = false;     // reset the accumulator first (a new tile starts)
   bool warm = false;        // supersample: render at 2x without sampling (glow buffer warm-up)
-  int region = -1;          // supersample resolve: quarter of the 2x mean to show (QuarterUv)
-  bool edges = false;       // with resolve: the FSAA edge frame (edges.h): show only the edge pieces
+  int region = -1;          // supersample resolve: quarter of the 2x mean to resolve (QuarterUv)
+  bool check = false;       // the screen check frame (CaptureParams::screenCheck)
   u2::ProjAdjust adj;
   float nextGameSpeed = 0;  // shutter: game speed for the next simulation step (0 = frozen)
 };
@@ -49,8 +55,12 @@ class Capture {
 
   // Called at the start of each rendered frame with the accumulator's sample count.
   CaptureFrame BeginFrame(int accumCount, float lastFrameDt);
-  // Called from the EndScene hook when this frame's resolve image was drawn.
-  void OnEndScene(IDirect3DDevice9* dev);
+  // A resolve frame: the caller draws this screen piece (the mean and the photo's overlays) into ResolveTarget, a
+  // screen-sized render target, then ReadResolved gammas it and copies it into the image.
+  IDirect3DSurface9* ResolveTarget() const { return active_ && resolveArmed_ ? surf_ : nullptr; }
+  void ReadResolved(IDirect3DDevice9* dev);
+  // From EndScene on the check frame: the screen against the photo, logged; then the PNG.
+  void CheckScreen(IDirect3DDevice9* dev);
 
   void Abort(const char* reason);
   float Progress() const;
@@ -58,13 +68,9 @@ class Capture {
   std::string TakeMessage();
   bool Saving() const;
   int Tile() const { return tile_; }  // the tile or 2x quarter being sampled / resolved
-  // The backbuffer is multisampled (in-game FSAA): each resolve frame is followed by an edge frame (edges.h).
-  bool EdgeFrames() const { return edgeFrames_; }
 
  private:
   void Release();  // surfaces and buffers
-  void TileRead();  // the tile (with its edges) is complete: the next one, or the PNG
-  void ReadEdges(IDirect3DDevice9* dev);  // the FSAA edge frame
   void Finish();
   void Notify(const std::string& m);
 
@@ -74,16 +80,16 @@ class Capture {
   int tile_ = 0, done_ = 0;       // current tile; samples done in it (for Progress)
   int lastPlanned_ = -1;          // sample index planned last frame (-1 none)
   int warm_ = 0;                   // supersample warm-up frames planned
-  bool resolveArmed_ = false;     // a resolve frame is pending its EndScene readback
+  bool resolveArmed_ = false;     // a resolve is pending its readback
   bool tileDone_ = false;         // the tile was read back; the next frame starts the next one
-  bool edgeFrames_ = false;       // see EdgeFrames
-  bool edgePending_ = false;      // the tile was read back; its edge frame comes next
-  IDirect3DSurface9* rt_ = nullptr;
+  bool checkPending_ = false;     // the photo is read; the screen check frame comes next
+  wsfgamma::Gamma gamma_;
+  wsfgamma::Use gammaUse_ = wsfgamma::Use::None;
+  IDirect3DTexture9* tex_ = nullptr;   // the resolve target (a texture: the gamma reads it)
+  IDirect3DSurface9* surf_ = nullptr;  // its level 0
+  IDirect3DSurface9* out_ = nullptr;   // the gamma's output (only with the gamma on)
   IDirect3DSurface9* sys_ = nullptr;
-  // The edge frame's readback: only the rectangle its pieces cover (edgeW_ x edgeH_ from the top-left).
-  IDirect3DSurface9* edgeRt_ = nullptr;
-  IDirect3DSurface9* edgeSys_ = nullptr;
-  int edgeW_ = 0, edgeH_ = 0;
+  IDirect3DSurface9* checkRt_ = nullptr;  // the screen check's copy of the backbuffer
   std::vector<uint8_t> image_;
   std::atomic<int> saving_{0};  // PNG writer threads still running
 
