@@ -26,6 +26,16 @@ struct Rig {
   float orbitHeight = 0.6f;             // pivot height above the car origin
   float moveSpeed = 6;                  // m/s
   float maxDist = 30;                   // clamp from anchor (car)
+  // Optional box the eye stays inside (the garage set: photomode garage.h). In Orbit mode a clamped eye still looks at
+  // the pivot.
+  bool bounded = false;
+  Vec3 boundMin, boundMax;
+
+  Vec3 Bound(const Vec3& e) const {
+    if (!bounded) return e;
+    return {u2::Clamp(e.x, boundMin.x, boundMax.x), u2::Clamp(e.y, boundMin.y, boundMax.y),
+            u2::Clamp(e.z, boundMin.z, boundMax.z)};
+  }
 
   static Vec3 Forward(float yawDeg, float pitchDeg) {
     float y = yawDeg * u2::kDegToRad, p = pitchDeg * u2::kDegToRad;
@@ -92,6 +102,7 @@ struct Rig {
       Vec3 off = eye - anchor;
       float l = u2::Length(off);
       if (l > maxDist) eye = anchor + off * (maxDist / l);
+      eye = Bound(eye);
     } else {
       SetOrbitDist(orbitDist - in.moveForward * step);
       // strafing circles the car: arc length `step` at radius orbitDist
@@ -103,9 +114,12 @@ struct Rig {
   void Compute(const Vec3& anchor, Vec3* outEye, Vec3* outTarget, Vec3* outUp) const {
     Vec3 f = Forward();
     if (mode == RigMode::Free) {
-      *outEye = eye;
+      *outEye = Bound(eye);
     } else {
-      *outEye = Pivot(anchor) - f * orbitDist;
+      const Vec3 e = Pivot(anchor) - f * orbitDist;
+      *outEye = Bound(e);
+      const Vec3 d = Pivot(anchor) - *outEye;
+      if (u2::Length(*outEye - e) > 1e-4f && u2::Length(d) > 1e-3f) f = u2::Normalize(d);
     }
     *outTarget = *outEye + f;
     Vec3 r = u2::Normalize(u2::Cross(f, Vec3{0, 0, 1}));

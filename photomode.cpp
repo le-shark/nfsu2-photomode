@@ -17,6 +17,7 @@
 #include "focusprobe.h"
 #include "follow.h"
 #include "frame.h"
+#include "garage.h"
 #include "grid.h"
 #include "lens.h"
 #include "mute.h"
@@ -50,6 +51,12 @@ using namespace u2;
 // game permanently frozen after exiting.)
 
 enum class State { Off, Active, Capturing };
+// Where photo mode is open (2026-11-02, user: also in the garage and on the post-race scene; research
+// docs/research/2026-11-02-photomode-garage-postrace.md):
+// - Race: a race or free roam, racing.
+// - PostRace: after the player's finish, the results over the world (race coordinator state 7).
+// - Garage: the front end's platform set (garage.h). No world: the subjects are the FE cars, nothing to drive or expose.
+enum class Scene { None, Race, PostRace, Garage };
 // User 2026-10-19: Focus Mode got its own row (Enter on Focus cycling the modes was not discoverable); Focus is the
 // distance, editable only in Manual. Quality left the menu to free the row: [Capture] DefaultQuality still sets it
 // and its code stays (lens.h kQualitySamples).
@@ -173,15 +180,18 @@ struct PhotoMode {
   uint8_t savedShowcaseKeys = 0, savedShowcaseDpad = 0;
   int finishAtDrive = 0;        // the player's finish tick when driving started (PlayerFinishTick)
   bool openedBefore = false;    // Camera Mode, Focal Length and Roll are kept from the previous opening (Enter)
-  // The camera when photo mode closed, relative to its car (SaveView / RestoreView).
+  Scene scene = Scene::None;    // where it is open (Enter)
+  std::vector<int> rows;        // the menu's rows there, in order (RowsFor)
+  // The camera when photo mode closed, relative to its car (SaveView / RestoreView); the garage keeps its own.
   struct View {
     bool valid = false;
     Rig rig;
-    uint8_t* ref = nullptr;     // the car it was relative to; null = the player
-    uint8_t* target = nullptr;  // the Focus Target; null = the player
+    uint8_t* ref = nullptr;     // the car it was relative to; null = the default subject (the player, the garage car)
+    uint8_t* target = nullptr;  // the Focus Target; null = the default subject
     Vec3 carPos{};
     float carHeading = 0;       // degrees
-  } view;
+  };
+  View view, garageView;
   std::string toast;
   float toastTime = 0;
   float backGuard = 0;          // seconds left in which Back/close keys are ignored
@@ -256,25 +266,45 @@ void Toast(const std::string& s, float seconds = 3) {
 // The whole path (OutputDir may name nested folders); an existing folder is fine.
 void EnsureOutputDir() { SHCreateDirectoryExA(nullptr, g->cfg.outputDir.c_str(), nullptr); }
 
-// Target cars: the player and active AI racers (u2::RacerCars). Index into that list, or -1.
+// The cars photo mode can aim at. In a race and after it: the player and the active AI racers (u2::RacerCars, Car*). In
+// the garage: the FE cars on the set (u2::FrontEndCars, FrontEndRenderingCar*), numbered from 1. The two kinds keep
+// their pose in different places, so every read goes through these.
+bool InGarage() { return g->scene == Scene::Garage; }
+int Subjects(RacerCar* out, int max) {
+  if (!InGarage()) return RacerCars(out, max);
+  uint8_t* cars[kMaxCars];
+  const int n = FrontEndCars(cars, max < kMaxCars ? max : kMaxCars);
+  for (int i = 0; i < n; ++i) out[i] = {cars[i], i + 1};
+  return n;
+}
+uint8_t* DefaultSubject() {
+  if (!InGarage()) return PlayerCar();
+  uint8_t* car = nullptr;
+  return FrontEndCars(&car, 1) ? car : nullptr;
+}
+Vec3 SubjectPos(uint8_t* car) { return InGarage() ? FeCarPosition(car) : CarPosition(car); }
+void SubjectAxes(uint8_t* car, Vec3 axes[3]) { InGarage() ? FeCarAxes(car, axes) : CarAxes(car, axes); }
+bool SubjectBox(uint8_t* car, Vec3* mn, Vec3* mx) { return InGarage() ? FeCarLocalBox(car, mn, mx) : CarLocalBox(car, mn, mx); }
+
+// Index of the Focus Target in that list, or -1.
 int TargetIndex(const RacerCar* cars, int n) {
   for (int i = 0; i < n; ++i)
     if (cars[i].car == g->target) return i;
   return -1;
 }
 
-uint8_t* TargetCar() { return g->target ? g->target : PlayerCar(); }
+uint8_t* TargetCar() { return g->target ? g->target : DefaultSubject(); }
 
 bool UpdateAnchor() {
   // A racer that drops out (finished, parked) hands the orbit back to the player, except while the
   // shutter is open: the exposure stays on the car it started with (Car* live for the session).
   if (g->target && g->state != State::Capturing) {
     RacerCar cars[kMaxCars];
-    if (TargetIndex(cars, RacerCars(cars, kMaxCars)) < 0) g->target = nullptr;
+    if (TargetIndex(cars, Subjects(cars, kMaxCars)) < 0) g->target = nullptr;
   }
   uint8_t* car = TargetCar();
   if (!car) return false;
-  g->anchor = CarPosition(car);
+  g->anchor = SubjectPos(car);
   return true;
 }
 
@@ -294,7 +324,14 @@ std::string RacerName(const RacerCar& c) {
 
 std::string TargetName() {
   RacerCar cars[kMaxCars];
-  int i = TargetIndex(cars, RacerCars(cars, kMaxCars));
+  const int n = Subjects(cars, kMaxCars);
+  if (InGarage()) {  // "Car", or "Car N" when the set shows more than one
+    int i = 0;
+    while (i < n && cars[i].car != TargetCar()) ++i;
+    if (n <= 1 || i == n) return "Car";
+    return "Car " + std::to_string(i + 1);
+  }
+  int i = TargetIndex(cars, n);
   if (i < 0 || cars[i].racer == 0) return "You";
   return RacerName(cars[i]);
 }
@@ -304,9 +341,9 @@ std::string TargetName() {
 void CycleTarget(int dir) {
   if (g->rig.mode == RigMode::Free && !g->rangeCar) g->rangeCar = TargetCar();
   RacerCar cars[kMaxCars];
-  int n = RacerCars(cars, kMaxCars);
+  int n = Subjects(cars, kMaxCars);
   if (n < 2) {
-    Toast("No other racers");
+    Toast(InGarage() ? "No other cars" : "No other racers");
     return;
   }
   int i = TargetIndex(cars, n);
@@ -321,11 +358,11 @@ CarPose PoseOf(uint8_t* car, const Vec3& fallback) {
   CarPose c{fallback, {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}}};
   if (car) {
     Vec3 axes[3];
-    CarAxes(car, axes);
-    c.pos = CarPosition(car);
+    SubjectAxes(car, axes);
+    c.pos = SubjectPos(car);
     if (std::fabs(Length(axes[0]) - 1) < 0.1f && std::fabs(Length(axes[2]) - 1) < 0.1f)
       for (int r = 0; r < 3; ++r) c.axis[r] = axes[r];
-    CarLocalBox(car, &c.boxMin, &c.boxMax);  // the car's own body box; the fallback box stays without one
+    SubjectBox(car, &c.boxMin, &c.boxMax);  // the car's own body box; the fallback box stays without one
   }
   return c;
 }
@@ -359,19 +396,17 @@ float AutoFocusDistance(FocusMode mode) {
   return d < kMinFocusM ? kMinFocusM : d;
 }
 // Aim autofocus: nearest hit of the view's centre ray on the static world (u2::WorldRayHit) or a
-// car box (every car in play, not only the target). With no hit the last distance is kept.
+// car box (every car in play, not only the target). With no hit the last distance is kept. The garage has no collision
+// world (the track is unloaded before the FE, 0x5817D0): its cars' boxes, then the focus probe's depth.
 void UpdateAim() {
   CamPose cam = RigPose();
   Vec3 dir = Normalize(cam.fwd);
   float best = kMaxFocusM;
   int source = -1;
-  if (float d; WorldRayHit(cam.eye, dir, kMaxFocusM, &d) && d < best) best = d, source = 0;
+  if (float d; !InGarage() && WorldRayHit(cam.eye, dir, kMaxFocusM, &d) && d < best) best = d, source = 0;
   uint8_t* cars[kMaxCars];
-  for (int i = 0, n = ActiveCars(cars, kMaxCars); i < n; ++i) {
-    Vec3 axes[3];
-    CarAxes(cars[i], axes);
-    CarPose pose{CarPosition(cars[i]), {axes[0], axes[1], axes[2]}};
-    CarLocalBox(cars[i], &pose.boxMin, &pose.boxMax);
+  for (int i = 0, n = InGarage() ? FrontEndCars(cars, kMaxCars) : ActiveCars(cars, kMaxCars); i < n; ++i) {
+    const CarPose pose = PoseOf(cars[i], SubjectPos(cars[i]));
     float d = RayCarBoxHit(cam.eye, dir, pose, best);
     if (d >= 0 && d < best) best = d, source = 1;
   }
@@ -530,45 +565,73 @@ void ApplyCamera(float dt) {
 }
 
 // ---- state transitions ----------------------------------------------------------------------
+// After the player's finish the race stays in state 4 for the finish delay, then EndRace 0x60AAA0 creates the post-race
+// screen manager [0x8363DC] (0x60AE39) and the race coordinator goes to state 7 (handler 0x603EB0; state names at
+// 0x802170). That screen shows the PC help bar (0x4E9640, from 0x4F3C58), which a race treats as paused.
+constexpr uintptr_t kPostRaceScreens = 0x8363DC;
+constexpr int kRcPostRace = 7;
+
+Scene DetectScene() {
+  if (IsInGame()) {
+    auto rc = Var<int*>(addr::pRaceCoordinator);
+    return rc && *rc == kRcPostRace && Var<void*>(kPostRaceScreens) ? Scene::PostRace : Scene::Race;
+  }
+  return garage::Present() ? Scene::Garage : Scene::None;
+}
+
 // The game never pauses in a network session (GameLoop 0x581306), so neither do we.
 // Not while another ASI holds the freeze (the daylight tuner is open): its menu owns the options screen.
-bool CanEnter() { return IsInGame() && !IsGamePaused() && !IsNetworkSession() && Device() && !freeze::AnyHeld(); }
+// In a race not over the game's pause, options or dialogs (the help bar is up with them). On the results and in the
+// garage the help bar is part of the screen; our menu takes the input from the game's screens there (optmenu modal).
+bool CanEnter(Scene s) {
+  if (s == Scene::None || !Device() || freeze::AnyHeld() || IsNetworkSession()) return false;
+  return s != Scene::Race || !IsGamePaused();
+}
+
+// Drive needs a race to drive in (user 2026-10-20); after the finish the player's car takes no driving input (input
+// mode 9, 0x5EA76A..0x5EA771, 0x60600C..0x60603F).
+bool DriveAllowed(Scene s) { return g->cfg.drive && s == Scene::Race; }
 
 // User 2026-10-20 (after the beta report on reset settings): the camera comes back where it was left, relative to its
 // car (the Focus Target, or in Free mode the car its range stayed around), turned with the car's heading. Height,
 // pitch and roll stay level with the world, so a car on a slope or on its roof does not tilt the view.
 float CarHeading(uint8_t* car) {
   Vec3 axes[3];
-  CarAxes(car, axes);  // row 0 = forward (TargetCarPose)
+  SubjectAxes(car, axes);  // row 0 = forward (TargetCarPose)
   return std::atan2(axes[0].y, axes[0].x) * kRadToDeg;
 }
 
-// The player or an active racer (u2::RacerCars includes the player). Pointers are only compared, never read.
+// One of Subjects (the player or an active racer; in the garage an FE car). Pointers are only compared, never read.
 bool IsActiveCar(uint8_t* car) {
   RacerCar cars[kMaxCars];
-  for (int i = 0, n = RacerCars(cars, kMaxCars); i < n; ++i)
+  for (int i = 0, n = Subjects(cars, kMaxCars); i < n; ++i)
     if (cars[i].car == car) return true;
   return false;
 }
 
+PhotoMode::View& SceneView() { return InGarage() ? g->garageView : g->view; }
+
+// In the garage "the default subject" is the platform car, whichever of GarageMain's two FE cars shows it (they take
+// turns when the car changes, GarageMain+0x4C / +0x50), so the view stays on the platform car.
 void SaveView() {
+  PhotoMode::View& v = SceneView();
   uint8_t* ref = g->rig.mode == RigMode::Free && g->rangeCar ? g->rangeCar : TargetCar();
   if (!ref) {
-    g->view.valid = false;
+    v.valid = false;
     return;
   }
-  g->view = {true, g->rig, ref == PlayerCar() ? nullptr : ref, g->target, CarPosition(ref), CarHeading(ref)};
+  v = {true, g->rig, ref == DefaultSubject() ? nullptr : ref, g->target, SubjectPos(ref), CarHeading(ref)};
 }
 
 // False when there is nothing to restore or its car has left the race: the camera then starts at the game camera.
 bool RestoreView() {
-  const auto& v = g->view;
-  uint8_t* ref = v.ref ? v.ref : PlayerCar();
+  const auto& v = SceneView();
+  uint8_t* ref = v.ref ? v.ref : DefaultSubject();
   if (!v.valid || !ref || !IsActiveCar(ref)) return false;
   g->target = v.target && IsActiveCar(v.target) ? v.target : nullptr;
   UpdateAnchor();
   const float turn = CarHeading(ref) - v.carHeading;
-  const Vec3 pos = CarPosition(ref);
+  const Vec3 pos = SubjectPos(ref);
   g->rig = v.rig;
   g->rig.maxDist = g->cfg.maxDistance;
   g->rig.moveSpeed = g->cfg.moveSpeed;
@@ -815,7 +878,58 @@ void SyncFeSelectCancel() {
   }
 }
 
-void Enter() {
+// The menu's rows for a scene: Drive only where there is a race to drive in; the garage has no world time to expose
+// (GameLoop runs no simulation outside a race, 0x581349), no Car to steer, no rain and no world sound.
+std::vector<int> RowsFor(Scene s) {
+  std::vector<int> rows;
+  for (int r = 0; r < RowCount; ++r) {
+    if (r == RowDrive && !DriveAllowed(s)) continue;
+    if (s == Scene::Garage && (r == RowShutter || r == RowFollow || r == RowWheel || r == RowRain || r == RowSound)) continue;
+    rows.push_back(r);
+  }
+  return rows;
+}
+
+float ShutterSec() { return InGarage() ? 0 : lens::kShutters[g->shutterIdx]; }
+
+const char* SceneName(Scene s) {
+  switch (s) {
+    case Scene::Race: return "race";
+    case Scene::PostRace: return "post-race";
+    case Scene::Garage: return "garage";
+    default: return "none";
+  }
+}
+
+// The garage set's walls (garage.h). The game camera's own spot is always allowed, so the view never jumps on opening.
+void ApplyBounds(const Vec3& camPos) {
+  g->rig.bounded = InGarage() && garage::CameraBox(&g->rig.boundMin, &g->rig.boundMax);
+  if (!g->rig.bounded) return;
+  Vec3& mn = g->rig.boundMin;
+  Vec3& mx = g->rig.boundMax;
+  mn = {(std::min)(mn.x, camPos.x), (std::min)(mn.y, camPos.y), (std::min)(mn.z, camPos.z)};
+  mx = {(std::max)(mx.x, camPos.x), (std::max)(mx.y, camPos.y), (std::max)(mx.z, camPos.z)};
+  U2LOG("enter: camera inside the set (%.1f %.1f %.1f)-(%.1f %.1f %.1f)", mn.x, mn.y, mn.z, mx.x, mx.y, mx.z);
+}
+
+void LogFrontEndCars() {
+  uint8_t* cars[kMaxCars];
+  const int n = FrontEndCars(cars, kMaxCars);
+  U2LOG("FE cars: %d", n);
+  for (int i = 0; i < n; ++i) {
+    Vec3 p = FeCarPosition(cars[i]), a[3], mn, mx;
+    FeCarAxes(cars[i], a);
+    const bool box = FeCarLocalBox(cars[i], &mn, &mx);
+    U2LOG("  FE car %d %p pos (%.2f %.2f %.2f) fwd (%.2f %.2f %.2f) up (%.2f %.2f %.2f) box %s (%.2f %.2f %.2f)-(%.2f %.2f %.2f)",
+          i + 1, cars[i], p.x, p.y, p.z, a[0].x, a[0].y, a[0].z, a[2].x, a[2].y, a[2].z, box ? "yes" : "no", mn.x, mn.y,
+          mn.z, mx.x, mx.y, mx.z);
+  }
+}
+
+void Enter(Scene scene) {
+  g->scene = scene;
+  g->rows = RowsFor(scene);
+  menu::SetRowCount(static_cast<int>(g->rows.size()));
   LoadWatermarks();
   g->rangeCar = nullptr;
   CameraParams* cam = PlayerCamera();
@@ -823,7 +937,7 @@ void Enter() {
                    Var<int>(addr::DrawHud), cam->FieldOfView, Var<uint8_t>(addr::FECursorVisible),
                    Var<int>(addr::RainEnable)};
   g->target = nullptr;
-  if (g->cfg.verbose) LogCars();
+  if (g->cfg.verbose) InGarage() ? LogFrontEndCars() : LogCars();
   if (!UpdateAnchor()) g->anchor = ToVec3(cam->Position);
   g->rig.maxDist = g->cfg.maxDistance;
   g->rig.moveSpeed = g->cfg.moveSpeed;
@@ -837,6 +951,7 @@ void Enter() {
     g->rig.InitFromCamera(ToVec3(cam->Position), ToVec3(cam->Direction), g->anchor);
     g->rig.roll = roll;
   }
+  ApplyBounds(ToVec3(cam->Position));
   if (!g->openedBefore) {
     g->focalMm = lens::kFocals[lens::Closest(lens::kFocals, focal)];
     g->openedBefore = true;
@@ -846,7 +961,7 @@ void Enter() {
   freeze::Hold(true);
   ZeroNativeFx(true);
   ApplyRain();
-  mute::Set(!g->sound);
+  mute::Set(!g->sound && !InGarage());  // the garage has no world sound (the row is left out there)
   SetFePadInput(false);
   g->hintSettle = kHintSettleSec;
   GetCursorPos(&g->cursorAtEnter);
@@ -861,7 +976,10 @@ void Enter() {
   g->state = State::Active;
   ApplyCamera(0);
   // Camera::StopUpdating (set only by mods such as ExOpts) makes SetCameraMatrix ignore us.
-  U2LOG("enter: cam pos (%.1f %.1f %.1f) dir (%.2f %.2f %.2f) fov %u (%.0fmm) car (%.1f %.1f %.1f) stopUpdating=%d view %s",
+  auto rc = Var<int*>(addr::pRaceCoordinator);
+  U2LOG("enter: %s (flow %d, race state %d, help bar %d, %zu rows) cam pos (%.1f %.1f %.1f) dir (%.2f %.2f %.2f) fov %u "
+        "(%.0fmm) car (%.1f %.1f %.1f) stopUpdating=%d view %s",
+        SceneName(scene), GameFlowState(), rc && IsInGame() ? *rc : -1, Var<uint8_t>(addr::PCHelpBarUp), g->rows.size(),
         cam->Position.x, cam->Position.y, cam->Position.z, cam->Direction.x, cam->Direction.y, cam->Direction.z,
         cam->FieldOfView, focal, g->anchor.x, g->anchor.y, g->anchor.z, Var<int>(addr::CameraStopUpdating),
         restored ? "restored" : "from the game camera");
@@ -944,7 +1062,7 @@ void RestoreDriveKeys() {
 }
 
 void StartDrive() {
-  if (g->driving || g->state != State::Active || !g->cfg.drive) return;
+  if (g->driving || g->state != State::Active || !DriveAllowed(g->scene)) return;
   g->driving = true;
   g->finishAtDrive = PlayerFinishTick();
   g->savedShowcaseKeys = Var<uint8_t>(addr::ShowcaseKeys);
@@ -1002,9 +1120,9 @@ void Exit(const char* why, bool byPlayer = false) {
     g->driving = false;
     RestoreDriveKeys();
   }
-  // Only in gameplay: after leaving it the cars may be gone (RestoreView then starts from the game camera).
-  if (IsInGame()) SaveView();
-  else g->view.valid = false;
+  // Only while still there: after leaving it the cars may be gone (RestoreView then starts from the game camera).
+  if (InGarage() ? garage::Present() : IsInGame()) SaveView();
+  else SceneView().valid = false;
   g->capture.Abort("photo mode closed");
   g->frame = {};
   g->accum.Free();  // the targets are recreated on the next enter
@@ -1038,7 +1156,8 @@ void Exit(const char* why, bool byPlayer = false) {
   SetCursorPos(g->cursorAtEnter.x, g->cursorAtEnter.y);
   g->state = State::Off;
   if (g->cfg.verbose) g->postExitLog = 3;
-  U2LOG("exit (%s): speed=%.2f hud=%d", why, Var<float>(addr::GameSpeed), Var<int>(addr::DrawHud));
+  U2LOG("exit (%s, %s): speed=%.2f hud=%d", why, SceneName(g->scene), Var<float>(addr::GameSpeed), Var<int>(addr::DrawHud));
+  g->scene = Scene::None;
 }
 
 void StartCapture() {
@@ -1058,7 +1177,7 @@ void StartCapture() {
   CaptureParams p;
   p.sample = {lens::kQualitySamples[g->qualityIdx], g->tiles, lens::ApertureRadiusM(Focal(), FStop()), FocusDistance(),
               g->cfg.antialias};
-  p.shutterSec = lens::kShutters[g->shutterIdx];
+  p.shutterSec = ShutterSec();
   p.outPath = NewPicturePath();
   p.aspect = g->aspect;
   p.crop = g->aspect && g->crop;
@@ -1277,8 +1396,8 @@ std::string RowValue(int row) {
   return b;
 }
 
-// The menu's row index to ours: without Drive the menu has one row less and Take Picture moves up into Drive's place.
-int MenuRow(int row) { return !g->cfg.drive && row >= RowDrive ? row + 1 : row; }
+// The menu's row index to ours: the scene's rows (RowsFor) in order, so a row left out moves the ones below it up.
+int MenuRow(int row) { return row >= 0 && row < static_cast<int>(g->rows.size()) ? g->rows[row] : RowCount; }
 std::string MenuLabel(int row) { return RowLabel(MenuRow(row)); }
 std::string MenuValue(int row) { return RowValue(MenuRow(row)); }
 void MenuAdjust(int row, int dir) { Adjust(MenuRow(row), dir); }
@@ -1313,7 +1432,7 @@ void Look(RigInput* ri, float stickX, float stickY) {
 
 // Free mode keeps its range around rangeCar once the target changed (CycleTarget); else around the target.
 void UpdateRig(const RigInput& ri, float dt) {
-  const Vec3 range = g->rig.mode == RigMode::Free && g->rangeCar ? CarPosition(g->rangeCar) : g->anchor;
+  const Vec3 range = g->rig.mode == RigMode::Free && g->rangeCar ? SubjectPos(g->rangeCar) : g->anchor;
   g->rig.Update(ri, dt, range);
 }
 
@@ -1347,8 +1466,8 @@ void HandleControls(float dt) {
     return;
   }
   if (in.KeyPressed('H') || in.PadPressed(PadB)) g->uiHidden = !g->uiHidden;
-  if (in.KeyPressed('T')) g->racerTags = !g->racerTags;
-  if (g->cfg.drive && (in.KeyPressed(g->cfg.driveKey) || in.PadPressed(PadBack))) {
+  if (in.KeyPressed('T') && !InGarage()) g->racerTags = !g->racerTags;  // racers only
+  if (DriveAllowed(g->scene) && (in.KeyPressed(g->cfg.driveKey) || in.PadPressed(PadBack))) {
     StartDrive();
     return;
   }
@@ -1466,9 +1585,9 @@ void Tick() {
     if (pause::TakeRequest()) g->pauseRequest = kPauseOpenWindowSec;
     if (g->pauseRequest > 0) {
       g->pauseRequest -= dt;
-      if (CanEnter()) {
+      if (const Scene s = DetectScene(); s == Scene::Race && CanEnter(s)) {
         g->pauseRequest = 0;
-        Enter();
+        Enter(s);
         g->fromPause = true;
         return;
       }
@@ -1479,15 +1598,25 @@ void Tick() {
     bool combo = g->cfg.padCombo && g->input.PadDown(PadLS) && g->input.PadDown(PadRS) &&
                  (g->input.PadPressed(PadLS) || g->input.PadPressed(PadRS));
     if (g->input.KeyPressed(g->cfg.hotkey) || combo) {
-      if (CanEnter()) Enter();
-      else U2LOG("hotkey ignored: flow=%d paused=%d network=%d device=%p", GameFlowState(), IsGamePaused(), IsNetworkSession(), Device());
+      const Scene s = DetectScene();
+      auto rc = Var<int*>(addr::pRaceCoordinator);
+      if (CanEnter(s)) Enter(s);
+      else U2LOG("hotkey ignored: scene %s flow=%d race state=%d paused=%d network=%d device=%p", SceneName(s), GameFlowState(),
+                 rc && IsInGame() ? *rc : -1, IsGamePaused(), IsNetworkSession(), Device());
     }
     return;
   }
   // Only the game's real pause state counts here (our own menu screen is up while photo mode is).
-  if (!IsInGame() || IsPauseMenuState()) {
+  if (InGarage()) {
+    if (!garage::Present()) {
+      Exit("left the garage");
+      return;
+    }
+  } else if (!IsInGame() || IsPauseMenuState()) {
     Exit(IsInGame() ? "game paused" : "left gameplay");
     return;
+  } else {
+    g->scene = DetectScene();  // a shutter exposure in the finish delay can reach the results (EndRace)
   }
   UpdateAnchor();
 
@@ -1561,7 +1690,7 @@ void Tick() {
   // (user 2026-10-22: only the grey Focus row was left), so the menu takes no input meanwhile.
   menu::SetInputBlocked(g->state == State::Capturing || g->backGuard > 0);
   menu::Update("Photo Mode", StatusText());
-  if (g->racerTags) UpdateTags();
+  if (g->racerTags && !InGarage()) UpdateTags();
   g->lastDt = dt > 0 ? dt : g->lastDt;
 }
 
@@ -1794,6 +1923,8 @@ constexpr int kParticleTicks = 4;  // about 4 ms, still several steps per normal
 using ParticleStepFn = void(__fastcall*)(void*, void*, float);
 ParticleStepFn oParticleStep;
 void __fastcall ParticleStepDetour(void* mgr, void* edx, float dt) {
+  // The garage steps its set's emitters with real time (garage.h): held with the rest of the set while open.
+  if (g && g->state != State::Off && InGarage() && garage::IsSetEmitters(mgr)) return;
   if (!g || g->state != State::Capturing || g->capture.Params().shutterSec <= 0) return oParticleStep(mgr, edx, dt);
   g->particleCarry += dt;
   const int ticks = static_cast<int>(g->particleCarry * 1024);
@@ -1889,11 +2020,13 @@ bool Install() {
     return false;  // created hooks are never enabled
   }
   // Footer: user 2026-10-19, "H - Hide/Show UI" at the bottom of the bar; 2026-10-20 "Space - Take Picture" next to it.
-  if (!menu::Install(menu::Callbacks{g->cfg.drive ? RowCount : RowCount - 1, &MenuLabel, &MenuValue, &MenuAdjust, &MenuActivate, &MenuBack,
-                                     &MenuIsAction, &MenuIsEnabled,
-                                     g->padHint ? kFooterPad : kFooterKeys},
-                     g->cfg.menuLayout, g->cfg.verbose))
-    return false;
+  // Modal: on the results and in the garage the game's own screens stay up under ours and would also take its keys
+  // (Enter would press Continue on the results, Esc leave the garage screen).
+  g->rows = RowsFor(Scene::Race);
+  menu::Callbacks cb{static_cast<int>(g->rows.size()), &MenuLabel, &MenuValue, &MenuAdjust, &MenuActivate, &MenuBack,
+                     &MenuIsAction, &MenuIsEnabled, g->padHint ? kFooterPad : kFooterKeys};
+  cb.modal = true;
+  if (!menu::Install(cb, g->cfg.menuLayout, g->cfg.verbose)) return false;
   if (!hook::EnableAll()) {
     hook::DisableAll();
     menu::Uninstall();

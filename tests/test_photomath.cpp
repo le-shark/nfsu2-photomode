@@ -84,6 +84,39 @@ TEST(RigOrbitZoomClamps) {
   CHECK_NEAR(r.orbitDist, 30.0, 1e-4);
 }
 
+// Garage (2026-11-02): the eye stays inside the set's box; in Orbit mode a clamped eye still looks at the car.
+TEST(RigBoundsKeepEyeInside) {
+  Rig r;
+  r.bounded = true;
+  r.boundMin = {-5, -5, 0.25f};
+  r.boundMax = {5, 20, 4};
+  r.mode = RigMode::Free;
+  r.moveSpeed = 100;
+  r.eye = {0, 0, 1};
+  r.yaw = 180;  // towards -x
+  RigInput in;
+  in.moveForward = 1;
+  for (int i = 0; i < 10; ++i) r.Update(in, 0.1f, {0, 0, 0});
+  CHECK_NEAR(r.eye.x, -5, 1e-4);
+  in.moveForward = 0;
+  in.moveUp = -1;
+  for (int i = 0; i < 10; ++i) r.Update(in, 0.1f, {0, 0, 0});
+  CHECK_NEAR(r.eye.z, 0.25, 1e-4);
+
+  r.mode = RigMode::Orbit;
+  r.yaw = 0;
+  r.pitch = 0;
+  r.orbitDist = 12;  // from a car at the origin the eye would be at x = -12, outside the box
+  Vec3 eye, target, up;
+  r.Compute({}, &eye, &target, &up);
+  CHECK_NEAR(eye.x, -5, 1e-4);
+  const Vec3 pivot = r.Pivot({});
+  CHECK_NEAR(u2::Dot(u2::Normalize(target - eye), u2::Normalize(pivot - eye)), 1, 1e-4);
+  r.orbitDist = 3;  // inside: as without a box
+  r.Compute({}, &eye, &target, &up);
+  CHECK_NEAR(eye.x, -3, 1e-4);
+}
+
 TEST(RigModeSwitchKeepsView) {
   Rig r;
   r.mode = RigMode::Orbit;
