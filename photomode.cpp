@@ -19,10 +19,12 @@
 #include "frame.h"
 #include "grid.h"
 #include "lens.h"
+#include "mute.h"
 #include "pauseentry.h"
 #include "rig.h"
 #include "sampling.h"
 #include "supersample.h"
+#include "tags.h"
 #include "watermark.h"
 #include "watermark_res.h"
 #include "settings.h"
@@ -55,10 +57,16 @@ enum class State { Off, Active, Capturing };
 // User 2026-10-20: Drive (beta request), the last row: the menu scrolls to it (12 rows, 11 slots; u2sdk optmenu).
 // User 2026-10-20: Watermark (default None) and Watermark Pos. (disabled while None), before Take Picture.
 // User 2026-10-22: Take Picture is the last row, Drive above it (MenuRow skips Drive when [PhotoMode] Drive = 0).
+// User 2026-10-31 (release): Wheel Angle, Rain Drops and Sound Effects, after Grid. Racer tags are key T only.
 enum Row { RowCamera, RowFocal, RowRoll, RowTarget, RowFocusMode, RowFocus, RowAperture, RowShutter, RowFollow, RowResolution,
-           RowAspect, RowCrop, RowGrid, RowWatermark, RowWatermarkPos, RowDrive, RowTake, RowCount };
+           RowAspect, RowCrop, RowGrid, RowWheel, RowRain, RowSound, RowWatermark, RowWatermarkPos, RowDrive, RowTake,
+           RowCount };
 
 constexpr float kMinFocusM = 0.3f, kMaxFocusM = 500;
+constexpr float kZoomRepeatFirst = 0.35f, kZoomRepeat = 0.12f;  // pad X / Y held
+constexpr const char* kFooterKeys = "H - Hide/Show UI    Space - Take Picture";
+constexpr const char* kFooterPad = "B - Hide/Show UI    A - Take Picture";
+constexpr float kHintSettleSec = 0.25f;
 constexpr float kBackGuardSec = 0.3f;  // after a key cancels a capture, the same press must not also exit
 constexpr float kMinFrameLimit = 1 / 1800.f;  // see addr::FrameLimit
 // The pause-menu icon resumes the race first (pauseentry.cpp); photo mode opens once the game has unpaused, given up
@@ -73,6 +81,7 @@ struct Saved {
   int dofEnable, mbEnable, drawHud;
   uint16_t fov;
   uint8_t cursorVisible;
+  int rainEnable;
 };
 
 // What the Render3D post-hook does this frame (decided in Tick, before the frame renders).
@@ -137,6 +146,16 @@ struct PhotoMode {
   CarPose captureCar{};
   bool uiHidden = false;
   bool grid = false;            // Grid row (grid.h): thirds lines on screen, never in the photo
+  bool racerTags = false;       // key T: stays as left for the session (DrawTags)
+  bool rainDrops = true;        // Rain Drops row: the drops on the lens (g_RainEnable, ApplyRain)
+  bool sound = false;           // World Sound row: off while photo mode is open (mute.h), back while driving
+  // Wheel Angle row: only what is drawn (WheelScope), per car, forgotten on closing and on Drive.
+  struct WheelSet { uint8_t* car; float deg; };
+  std::vector<WheelSet> wheels;
+  Mat4 viewProj{};              // view 1's, without the sample jitter (ProjDetour), for the tags
+  bool viewProjValid = false;
+  float particleCarry = 0;      // shutter exposures: particle time not stepped yet (ParticleStepDetour)
+  float zoomRepeat = 0;         // pad X / Y held: seconds to the next focal length step
   probe::FocusProbe probe;      // precise Aim / Closest (focusprobe.h)
   int probeStage = 0;           // 1: frame held, the probe renders next frame
   PoseKey lastPose, probedPose;
@@ -168,6 +187,9 @@ struct PhotoMode {
   std::string toast;
   float toastTime = 0;
   float backGuard = 0;          // seconds left in which Back/close keys are ignored
+  float hintSettle = 0;         // seconds after opening in which keys and the mouse do not count for the footer
+  bool padHint = false;         // the last input came from the pad: the menu's footer shows its buttons
+  bool stickHint = false;       // a stick or trigger was off centre last frame
 
   Vec3 anchor{};
   // Free mode: the car the camera's MaxDistance range stays around (the target when Free mode began), so a new
@@ -265,13 +287,25 @@ bool UpdateAnchor() {
   return true;
 }
 
+// User 2026-11-01: a racer's own name in a race, as the standings show it (DriverInfo Car+0x14, +0x90C char[16];
+// 0x4C93B8..0x4C93F0); in free roam (race type [0x89E7B0] == 0, verified-in-binary.md) a number.
+constexpr uintptr_t kRaceType = 0x89E7B0;
+std::string RacerName(const RacerCar& c) {
+  if (Var<int>(kRaceType) != 0)
+    if (auto driver = *reinterpret_cast<uint8_t**>(c.car + 0x14)) {
+      const char* name = reinterpret_cast<const char*>(driver + 0x90C);
+      if (name[0]) return std::string(name, strnlen(name, 16));
+    }
+  char b[32];
+  std::snprintf(b, sizeof b, "Racer %d", c.racer);
+  return b;
+}
+
 std::string TargetName() {
   RacerCar cars[kMaxCars];
   int i = TargetIndex(cars, RacerCars(cars, kMaxCars));
   if (i < 0 || cars[i].racer == 0) return "You";
-  char b[32];
-  std::snprintf(b, sizeof b, "Racer %d", cars[i].racer);
-  return b;
+  return RacerName(cars[i]);
 }
 
 // In Orbit mode the camera circles the new target; in Free mode it stays where it is (its range keeps the car it was
@@ -664,12 +698,139 @@ void ZeroNativeFx(bool log) {
                       "ImproveMotionBlur?); zeroing it would crash");
 }
 
+// The drops on the lens (rain splatter 0x5C7AB0): g_RainEnable is read per frame only by its gate 0x5CB7E7, the other
+// readers are the options and the render-target setup at a device reset (u2re xref), so falling rain stays. Only ever
+// turned off, as for the tile capture (verified-in-binary.md "What changes on paused frames").
+void ApplyRain() { Var<int>(addr::RainEnable) = g->rainDrops ? g->saved.rainEnable : 0; }
+
+// Wheel Angle (user 2026-10-31: purely visual). The car pass draws the wheels from copies of the matrices Car+0x130[4]
+// (spin + steer) and +0x230[4] (steer) that 0x5F6820 makes every frame (0x5F6B9B..0x5F6BD1, args of CarRenderInfo::Render
+// read at 0x62710D); the sim builds those with 0x5921B0 (thiscall on Car+0x40, wheel 0 / 1; 0x59CBE6) from the u16
+// Car+0x40E, 65536 = 360 degrees. (0x5EC7F0's render-time set is only a second draw: writing +0x40E alone did nothing,
+// [game] 2026-11-01.) For the length of Render3D they are rebuilt at our angle and then put back, so the simulation
+// never sees it, and each frame keeps the current spin and ride height for shutter blur.
+constexpr uintptr_t kCarSteer = 0x40E, kCarWheelSpin = 0x130, kCarWheelSteer = 0x230, kCarSub = 0x40;
+constexpr uintptr_t kBuildWheelMatrix = 0x5921B0;
+constexpr size_t kFrontMatrices = 2 * 0x40;  // wheels 0 and 1, front only in 0x5921B0 (0x592303)
+constexpr float kMaxWheelDeg = 45;
+uint16_t& CarSteer(uint8_t* car) { return *reinterpret_cast<uint16_t*>(car + kCarSteer); }
+
+class WheelScope {
+ public:
+  WheelScope() {
+    if (g->state == State::Off) return;
+    using BuildFn = void(__fastcall*)(void*, void*, int);
+    const auto build = reinterpret_cast<BuildFn>(kBuildWheelMatrix);
+    for (const auto& w : g->wheels) {
+      if (n_ == kMaxCars) break;
+      Saved& sv = saved_[n_++];
+      sv.car = w.car;
+      sv.steer = CarSteer(w.car);
+      std::memcpy(sv.spin, w.car + kCarWheelSpin, kFrontMatrices);
+      std::memcpy(sv.turn, w.car + kCarWheelSteer, kFrontMatrices);
+      CarSteer(w.car) = static_cast<uint16_t>(static_cast<int>(std::lround(w.deg * 65536 / 360)) & 0xFFFF);
+      for (int i = 0; i < 2; ++i) build(w.car + kCarSub, nullptr, i);
+    }
+  }
+  ~WheelScope() {
+    for (int i = 0; i < n_; ++i) {
+      Saved& sv = saved_[i];
+      CarSteer(sv.car) = sv.steer;
+      std::memcpy(sv.car + kCarWheelSpin, sv.spin, kFrontMatrices);
+      std::memcpy(sv.car + kCarWheelSteer, sv.turn, kFrontMatrices);
+    }
+  }
+
+ private:
+  struct Saved {
+    uint8_t* car;
+    uint16_t steer;
+    uint8_t spin[kFrontMatrices], turn[kFrontMatrices];
+  };
+  Saved saved_[kMaxCars];
+  int n_ = 0;
+};
+
+PhotoMode::WheelSet* FindWheel(uint8_t* car) {
+  for (auto& w : g->wheels)
+    if (w.car == car) return &w;
+  return nullptr;
+}
+
+// A change the mean must not keep showing (the sample key does not cover it).
+void RestartPreview() {
+  g->accum.Reset();
+  g->stillTime = 0;
+}
+
+// The first step starts from where the car's wheels are; Ctrl: tenths of a degree.
+void StepWheel(int dir) {
+  uint8_t* car = TargetCar();
+  if (!car) return;
+  auto* w = FindWheel(car);
+  if (!w) {
+    const float natural = static_cast<int16_t>(CarSteer(car)) * 360.0f / 65536;
+    g->wheels.push_back({car, std::round(natural)});
+    w = &g->wheels.back();
+  }
+  const float step = g->input.KeyDown(VK_CONTROL) ? 0.1f : 1.f;
+  w->deg = Clamp(w->deg + dir * step, -kMaxWheelDeg, kMaxWheelDeg);
+  RestartPreview();
+}
+
+// The sticks are the camera here, so they must not be the menu's directions too (user 2026-11-01). The FE id table 0x7F91C8
+// (stride 0x1C: +0 joy event, +4 mask bit; fe-input.md 1.4) maps the events FENG_PAD_*_ALTERNATE 0x2E..0x31 to the same
+// direction bits as FENG_PAD_* 0x2A..0x2D; the second set is the left stick (XtendedInput Config-UG2 ini binds them so:
+// JOY_EVENT_FENG_PAD_UP_ALTERNATE = XINPUT_GAMEPAD_LS_UP, FENG_PAD_UP = DPAD_UP, VK_UP). With their mask bits 0 the
+// GetJoyPadMask 0x50C6D0 never sets a direction from them. In memory, put back on closing.
+//
+// Pad A and B are the picture and the menu's hiding here, so they are not its select and cancel either. Entries 8..11
+// are FENG_SELECT 0x25/0x26 (bit 0x10) and FENG_CANCEL 0x27/0x28 (bit 0x20); pad and keyboard share these events
+// (XtendedInput: SELECT = GAMEPAD_A and VK_RETURN), so their bits are given back only while Enter or Esc is down
+// (SyncFeSelectCancel): the FE's own path then does the rest, sound and scripts included.
+constexpr uintptr_t kFeIdTable = 0x7F91C8, kFeIdStride = 0x1C;
+constexpr int kFeFirstEntry = 4, kFeEntries = 8;
+constexpr uint32_t kFeEntryIds[kFeEntries] = {0x2E, 0x2F, 0x30, 0x31, 0x25, 0x26, 0x27, 0x28};
+uint32_t g_feMasks[kFeEntries];
+bool g_feOff = false;
+bool g_feKeyArmed[2];  // Enter, Esc seen up since opening: a key still held from before must not press a row
+uintptr_t FeEntry(int i) { return kFeIdTable + (kFeFirstEntry + i) * kFeIdStride; }
+void SetFePadInput(bool on) {
+  if (on == !g_feOff) return;
+  for (int i = 0; i < kFeEntries; ++i)
+    if (Var<uint32_t>(FeEntry(i)) != kFeEntryIds[i]) {  // not the game's table: leave it
+      U2LOG("FE id table entry %d is not the game's; the pad stays on the menu", i);
+      return;
+    }
+  for (int i = 0; i < kFeEntries; ++i) {
+    if (on) Var<uint32_t>(FeEntry(i) + 4) = g_feMasks[i];
+    else {
+      g_feMasks[i] = Var<uint32_t>(FeEntry(i) + 4);
+      Var<uint32_t>(FeEntry(i) + 4) = 0;
+    }
+  }
+  g_feKeyArmed[0] = g_feKeyArmed[1] = false;
+  g_feOff = !on;
+}
+
+void SyncFeSelectCancel() {
+  if (!g_feOff) return;
+  const int keys[2] = {VK_RETURN, VK_ESCAPE};
+  for (int k = 0; k < 2; ++k) {
+    const bool down = g->input.KeyDown(keys[k]);
+    if (!down) g_feKeyArmed[k] = true;
+    for (int i = 4 + k * 2; i < 6 + k * 2; ++i)
+      Var<uint32_t>(FeEntry(i) + 4) = down && g_feKeyArmed[k] ? g_feMasks[i] : 0;
+  }
+}
+
 void Enter() {
   LoadWatermarks();
   g->rangeCar = nullptr;
   CameraParams* cam = PlayerCamera();
   g->saved = Saved{Var<float>(addr::GameSpeed), Var<int>(addr::g_DepthOfFieldEnable), Var<int>(addr::g_MotionBlurEnable),
-                   Var<int>(addr::DrawHud), cam->FieldOfView, Var<uint8_t>(addr::FECursorVisible)};
+                   Var<int>(addr::DrawHud), cam->FieldOfView, Var<uint8_t>(addr::FECursorVisible),
+                   Var<int>(addr::RainEnable)};
   g->target = nullptr;
   if (g->cfg.verbose) LogCars();
   if (!UpdateAnchor()) g->anchor = ToVec3(cam->Position);
@@ -693,6 +854,10 @@ void Enter() {
   g->backGuard = 0;
   freeze::Hold(true);
   ZeroNativeFx(true);
+  ApplyRain();
+  mute::Set(!g->sound);
+  SetFePadInput(false);
+  g->hintSettle = kHintSettleSec;
   GetCursorPos(&g->cursorAtEnter);
   Var<uint8_t>(addr::FECursorVisible) = 0;  // hide the FE cursor, like the game's showcase photo shoot (0x4CEE11)
   g->input.SetMouseCapture(true);
@@ -752,7 +917,7 @@ void __cdecl SaveRegistryDetour() {
   Var<int>(addr::g_MotionBlurEnable) = g->saved.mbEnable;
   if (g->savedStreaks >= 0) Var<int>(addr::LightStreaksEnable) = g->savedStreaks;
   if (g->savedFog >= 0) Var<int>(addr::HorizonFogEnable) = g->savedFog;
-  if (g->savedRain >= 0) Var<int>(addr::RainEnable) = g->savedRain;
+  Var<int>(addr::RainEnable) = g->saved.rainEnable;  // the Rain Drops row zeroes it too
   oSaveRegistry();
   Var<int>(addr::g_DepthOfFieldEnable) = dof, Var<int>(addr::g_MotionBlurEnable) = mb;
   Var<int>(addr::LightStreaksEnable) = streaks, Var<int>(addr::HorizonFogEnable) = fog, Var<int>(addr::RainEnable) = rain;
@@ -797,6 +962,8 @@ void StartDrive() {
   Var<uint8_t>(addr::ShowcaseDpad) = 0;
   menu::SetHidden(true);
   menu::SetGameInput(true);
+  g->wheels.clear();  // user 2026-10-31: Drive puts the wheels back
+  mute::Set(false);
   freeze::Hold(false);
   g->accum.Reset();
   g->frame = {};
@@ -810,6 +977,7 @@ void StopDrive() {
   RestoreDriveKeys();
   freeze::Hold(true);
   menu::SetGameInput(false);
+  mute::Set(!g->sound);
   g->accum.Reset();
   g->stillTime = 0;
   // The pad button that stopped it must not also reach the menu once it shows again.
@@ -854,6 +1022,11 @@ void Exit(const char* why, bool byPlayer = false) {
   RestoreCaptureEffects();
   FreeSupersample();
   SetUncapped(false);
+  g->wheels.clear();
+  mute::Set(false);
+  SetFePadInput(true);
+  Var<int>(addr::RainEnable) = g->saved.rainEnable;
+  g->viewProjValid = false;
   Var<int>(addr::MirrorOverride) = g->savedMirror;
   // Going back to the pause menu: the world stays frozen until the game's own pause has taken over (Tick).
   freeze::Hold(backToPause);
@@ -866,6 +1039,7 @@ void Exit(const char* why, bool byPlayer = false) {
   Var<int>(addr::g_MotionBlurEnable) = g->saved.mbEnable;
   Var<int>(addr::DrawHud) = g->saved.drawHud;
   PlayerCamera()->FieldOfView = g->saved.fov;
+  tags::Close();
   menu::Close();
   g->input.SetMouseCapture(false);
   Var<uint8_t>(addr::FECursorVisible) = g->saved.cursorVisible;
@@ -952,6 +1126,7 @@ void StartCapture() {
   g->frame.hold = p.sample.tiles > 1 && !p.supersample;
   g->captureCam = RigPose();
   g->captureCar = TargetCarPose();
+  g->particleCarry = 0;
   g->state = State::Capturing;
 }
 
@@ -1015,6 +1190,18 @@ void Adjust(int row, int dir) {
     case RowAspect: g->aspect = Wrap(g->aspect + dir, frame::kCount); break;
     case RowCrop: if (g->aspect) g->crop = !g->crop; break;  // only with a ratio (IsRowEnabled)
     case RowGrid: g->grid = !g->grid; break;
+    case RowWheel: StepWheel(dir); break;
+    case RowRain:
+      if (g->saved.rainEnable) {  // with the game's own option off there are no drops to turn off (IsRowEnabled)
+        g->rainDrops = !g->rainDrops;
+        ApplyRain();
+        RestartPreview();
+      }
+      break;
+    case RowSound:
+      g->sound = !g->sound;
+      mute::Set(!g->sound);
+      break;
     case RowWatermark:
       // The next one that can be shown (None always can); an unreadable image is skipped from then on.
       for (int n = static_cast<int>(g->wm.size()), i = Wrap(g->watermark + dir, n); ; i = Wrap(i + dir, n))
@@ -1039,6 +1226,7 @@ bool IsRowEnabled(int row) {
   if (row == RowFocus) return g->focusMode == FocusMode::Manual;
   if (row == RowWatermarkPos) return g->watermark != 0;
   if (row == RowCrop) return g->aspect != 0;
+  if (row == RowRain) return g->saved.rainEnable != 0;
   return true;
 }
 
@@ -1046,14 +1234,20 @@ void Activate(int row) {
   if (g->state != State::Active) return;
   if (row == RowTake) StartCapture();
   else if (row == RowDrive) StartDrive();
-  else Adjust(row, 1);
+  else if (row == RowWheel) {  // Enter: back to the car's own angle
+    if (auto* w = FindWheel(TargetCar())) {
+      g->wheels.erase(g->wheels.begin() + (w - g->wheels.data()));
+      RestartPreview();
+    }
+  } else Adjust(row, 1);
 }
 
 // Row texts for the native menu (u2sdk optmenu draws them into UI_PauseOptions.fng).
 std::string RowLabel(int row) {
   static const char* names[RowCount] = {"Camera Mode", "Focal Length", "Roll",     "Focus Target",
                                         "Focus Mode", "Focus",        "Aperture", "Shutter Speed",
-                                        "Shutter Follow", "Resolution", "Aspect Ratio", "Crop to Ratio", "Grid", "Watermark", "Watermark Pos.",
+                                        "Shutter Follow", "Resolution", "Aspect Ratio", "Crop to Ratio", "Grid", "Wheel Angle", "Rain Drops", "World Sound",
+                                        "Watermark", "Watermark Pos.",
                                         "Drive", "Take Picture"};
   return row >= 0 && row < RowCount ? names[row] : "";
 }
@@ -1083,6 +1277,12 @@ std::string RowValue(int row) {
     case RowAspect: return frame::Name(g->aspect);
     case RowCrop: return g->crop ? "Yes" : "No";
     case RowGrid: return g->grid ? "On" : "Off";
+    case RowWheel:
+      if (const auto* w = FindWheel(TargetCar())) std::snprintf(b, sizeof b, "%+.1f", w->deg);
+      else return "Natural";
+      break;
+    case RowRain: return g->rainDrops && g->saved.rainEnable ? "On" : "Off";
+    case RowSound: return g->sound ? "On" : "Off";
     case RowWatermark: return g->watermark < static_cast<int>(g->wm.size()) ? g->wm[g->watermark].name : "None";
     case RowWatermarkPos: return watermark::CornerName(g->wmCorner);
     default: break;
@@ -1130,11 +1330,11 @@ void UpdateRig(const RigInput& ri, float dt) {
   g->rig.Update(ri, dt, range);
 }
 
-// While driving the keys and the pad drive the car: only the photo-mode key (close), the Drive key or Esc / pad Back
-// (stop driving) and mouse look are ours.
+// While driving the keys and the pad drive the car: only the photo-mode key or pad Start (close), the Drive key or Esc /
+// pad Back (stop driving) and mouse look are ours.
 void HandleDriveControls() {
   Input& in = g->input;
-  if (in.KeyPressed(g->cfg.hotkey)) {
+  if (in.KeyPressed(g->cfg.hotkey) || in.PadPressed(PadStart)) {
     Exit("user", true);
     return;
   }
@@ -1152,21 +1352,34 @@ void HandleControls(float dt) {
   const PadState& pad = in.Pad();
   if (g->driving) return HandleDriveControls();
 
-  if (g->backGuard <= 0 && (in.KeyPressed(g->cfg.hotkey) || in.PadPressed(PadB))) {
+  // Pad layout from a pad player (beta feedback 2026-10-31): A picture, B hide, Y / X lens in / out, the D-pad the menu;
+  // The menu takes select and cancel from the keyboard only (SyncFeSelectCancel). Start closes, Back drives (user
+  // 2026-11-02, swapped); Start does not also pause: the block byte stays set for 3 frames after closing (optmenu Close).
+  if (g->backGuard <= 0 && (in.KeyPressed(g->cfg.hotkey) || in.PadPressed(PadStart))) {
     Exit("user", true);
     return;
   }
-  if (in.KeyPressed('H') || in.PadPressed(PadY)) g->uiHidden = !g->uiHidden;
-  if (g->cfg.drive && in.KeyPressed(g->cfg.driveKey)) {
+  if (in.KeyPressed('H') || in.PadPressed(PadB)) g->uiHidden = !g->uiHidden;
+  if (in.KeyPressed('T')) g->racerTags = !g->racerTags;
+  if (g->cfg.drive && (in.KeyPressed(g->cfg.driveKey) || in.PadPressed(PadBack))) {
     StartDrive();
     return;
   }
-  if (in.KeyPressed(VK_SPACE) || in.PadPressed(PadX)) {
+  if (in.KeyPressed(VK_SPACE) || in.PadPressed(PadA)) {
     StartCapture();
     return;
   }
-  // Menu navigation (arrows / Enter / Esc, D-pad / A / B) is handled by the game's own FE.
+  // Menu navigation (arrows / Enter / Esc, D-pad) is handled by the game's own FE.
   if (int w = in.Wheel()) Adjust(RowFocal, w);
+  // One lens per press, then repeating while held.
+  const int zoom = (in.PadDown(PadY) ? 1 : 0) - (in.PadDown(PadX) ? 1 : 0);
+  if (in.PadPressed(PadY) || in.PadPressed(PadX)) {
+    Adjust(RowFocal, zoom);
+    g->zoomRepeat = kZoomRepeatFirst;
+  } else if (zoom && (g->zoomRepeat -= dt) <= 0) {
+    Adjust(RowFocal, zoom);
+    g->zoomRepeat = kZoomRepeat;
+  }
   if (in.KeyPressed(VK_OEM_4)) CycleTarget(-1);  // [ ] (pad: the Target row)
   if (in.KeyPressed(VK_OEM_6)) CycleTarget(1);
 
@@ -1213,6 +1426,31 @@ void LogPostExit(float dt) {
         Var<int>(addr::DrawHud), Var<uint8_t>(addr::PCHelpBarUp), rc ? *rc : -1, Var<int>(addr::CameraStopUpdating));
 }
 
+void UpdateTags();
+
+// The footer follows the last input (user 2026-11-02). Key, mouse button, wheel, a real mouse move, or a pad button or a
+// stick / trigger leaving centre; a stick held over a key press does not take the hint back. While closed only the
+// open key and the pad are read: the pad's A on the pause menu's icon counts. Just after opening keys and the mouse do
+// not count: the first full read shows every held key as pressed, and the cursor has just been parked.
+void UpdateFooterHint() {
+  constexpr float kStickHint = 0.3f;
+  constexpr float kMouseHint = 8;  // pixels in a frame: a nudged desk does not count
+  const Input& in = g->input;
+  const PadState& p = in.Pad();
+  const bool stick = std::fabs(p.lx) > kStickHint || std::fabs(p.ly) > kStickHint || std::fabs(p.rx) > kStickHint ||
+                     std::fabs(p.ry) > kStickHint || p.lt > kStickHint || p.rt > kStickHint;
+  const bool pad = in.PadAnyPressed() || (stick && !g->stickHint);
+  g->stickHint = stick;
+  const int key = in.FirstKeyPressed();
+  const float mouse = std::fabs(in.MouseDX()) + std::fabs(in.MouseDY());
+  const bool keys = g->hintSettle <= 0 && (key != 0 || in.Wheel() != 0 || mouse > kMouseHint);
+  const bool hint = keys ? false : pad ? true : g->padHint;
+  if (hint == g->padHint) return;
+  g->padHint = hint;
+  U2LOG("footer hint: %s (key %d wheel %d mouse %.0f)", hint ? "pad" : "keyboard", key, in.Wheel(), mouse);
+  menu::SetFooter(hint ? kFooterPad : kFooterKeys);
+}
+
 void Tick() {
   LARGE_INTEGER now;
   QueryPerformanceCounter(&now);
@@ -1235,7 +1473,10 @@ void Tick() {
   g->frameArmed = true;
   if (g->rezeroNativeFx) {  // after a device reset (OnDeviceReset); the reset frame itself draws nothing
     g->rezeroNativeFx = false;
-    if (g->state != State::Off) ZeroNativeFx(false);
+    if (g->state != State::Off) {
+      ZeroNativeFx(false);
+      ApplyRain();
+    }
   }
   menu::Tick();
   if (g->state == State::Off) {
@@ -1246,6 +1487,9 @@ void Tick() {
   } else {
     g->input.Update();
   }
+  UpdateFooterHint();
+  SyncFeSelectCancel();
+  if (g->hintSettle > 0) g->hintSettle -= dt;
   if (g->toastTime > 0) g->toastTime -= dt;
   if (g->backGuard > 0) g->backGuard -= dt;
   if (std::string m = g->capture.TakeMessage(); !m.empty()) Toast(m, 4);
@@ -1369,7 +1613,32 @@ void Tick() {
   // (user 2026-10-22: only the grey Focus row was left), so the menu takes no input meanwhile.
   menu::SetInputBlocked(g->state == State::Capturing || g->backGuard > 0);
   menu::Update("Photo Mode", StatusText());
+  if (g->racerTags) UpdateTags();
   g->lastDt = dt > 0 ? dt : g->lastDt;
+}
+
+// ---- racer tags -----------------------------------------------------------------------------
+// A tag over each rival (tags.h), placed in the FE canvas: vertices go to clip space as x * [0x79AC10] - 1,
+// -(y * [0x79AC14] - 1) around the canvas centre (fe-rendering.md), so canvas = ndc / those. The Focus Target's is green.
+constexpr uintptr_t kFeScaleX = 0x79AC10, kFeScaleY = 0x79AC14;
+void UpdateTags() {
+  if (!g->viewProjValid) return;
+  tags::Begin();
+  RacerCar cars[kMaxCars];
+  const int n = RacerCars(cars, kMaxCars);
+  for (int i = 0; i < n; ++i) {
+    if (cars[i].racer <= 0) continue;  // rivals only
+    const CarPose car = PoseOf(cars[i].car, CarPosition(cars[i].car));
+    constexpr float kAboveRoof = 0.4f;
+    const Vec3 p = car.pos + car.axis[2] * (car.boxMax.z + kAboveRoof);
+    const Mat4& m = g->viewProj;  // row vectors, as AdjustView / AdjustProj
+    const float cw = p.x * m.m[0][3] + p.y * m.m[1][3] + p.z * m.m[2][3] + m.m[3][3];
+    if (cw <= 0.01f) continue;  // behind the camera
+    const float cx = (p.x * m.m[0][0] + p.y * m.m[1][0] + p.z * m.m[2][0] + m.m[3][0]) / cw;
+    const float cy = (p.x * m.m[0][1] + p.y * m.m[1][1] + p.z * m.m[2][1] + m.m[3][1]) / cw;
+    tags::Show(RacerName(cars[i]).c_str(), cx / Var<float>(kFeScaleX), -cy / Var<float>(kFeScaleY), cars[i].car == g->target);
+  }
+  tags::End();
 }
 
 // ---- hooks ----------------------------------------------------------------------------------
@@ -1424,6 +1693,7 @@ void DrawOverlays(IDirect3DDevice9* dev) {
 // Pre-FE point: the backbuffer holds the 3D scene + game post FX; the 2D pass 0x5CBF40(0) with the
 // mirror, letterbox and FE comes next (0x5D2B5A..0x5D2B60). Skipped by the game on frames without 3D.
 void __cdecl Render3DDetour() {
+  WheelScope wheels;
   // 2x sample frame: the whole 3D pass renders into the 2W x 2H target (Begin/End always pair up
   // inside this call), and the sample is folded in while that target is still bound.
   const bool super = g->state == State::Capturing && g->capture.Params().supersample && g->super.Ready();
@@ -1523,6 +1793,10 @@ void __fastcall CubicMoverUpdateDetour(void* mover, void* edx) {
 
 void __fastcall ProjDetour(void* plat, void* edx, eView* view, float a, float b, int c) {
   oProj(plat, edx, view, a, b, c);
+  if (g->state != State::Off && view && view->Id == 1 && plat) {
+    g->viewProj = static_cast<Mat4*>(plat)[2];  // before the sample's jitter below
+    g->viewProjValid = true;
+  }
   const ProjAdjust* adj = g->state != State::Off && g->frame.sample ? &g->frame.adj : nullptr;
   if (!adj || !view || !IsSampledView(view->Id) || !plat) return;
   // The frustum planes (plat+0xC0, computed at 0x5C80C9 from the unadjusted ViewProj) stay the
@@ -1547,6 +1821,8 @@ void __fastcall FeRenderDetour(void* feng, void* edx) {
   int n = 0;
   for (auto p = feng::FirstActivePackage(); p && n < 64; p = feng::NextPackage(p)) {
     if (menu::IsMenuPackage(feng::PackageName(p)) && !hideMenu) continue;
+    // Tags stay with the menu hidden (H), like the grid; never in a photo.
+    if (tags::IsPackage(feng::PackageName(p)) && g->racerTags && !(g->state == State::Capturing && g->frame.resolve)) continue;
     pkgs[n] = p;
     saved[n] = feng::PackageObjects(p);
     feng::PackageObjects(p) = nullptr;
@@ -1554,6 +1830,39 @@ void __fastcall FeRenderDetour(void* feng, void* edx) {
   }
   oFeRender(feng, edx);
   for (int i = 0; i < n; ++i) feng::PackageObjects(pkgs[i]) = saved[i];
+}
+
+// Long exposures (beta feedback 2026-10-31: smoke "accumulates in excess in slow motion", gone once the camera closes).
+// The particle step 0x492E10 (thiscall, float dt; 0x60A181) ages particles by a whole number of 1/1024 s, truncated
+// (0x492E23..0x492E33, subtracted at 0x49307C), while the float dt moves them. A shutter step is shutter / samples: at
+// 128 samples anything up to 1/8 s is under one tick, so during the exposure no smoke aged, and repeated photos kept
+// adding to it. While the shutter is open the step runs only every kParticleTicks and gets whole ticks; the total time
+// is the same.
+constexpr uintptr_t kParticleStep = 0x492E10;
+constexpr int kParticleTicks = 4;  // about 4 ms, still several steps per normal 60 Hz frame
+using ParticleStepFn = void(__fastcall*)(void*, void*, float);
+ParticleStepFn oParticleStep;
+void __fastcall ParticleStepDetour(void* mgr, void* edx, float dt) {
+  if (!g || g->state != State::Capturing || g->capture.Params().shutterSec <= 0) return oParticleStep(mgr, edx, dt);
+  g->particleCarry += dt;
+  const int ticks = static_cast<int>(g->particleCarry * 1024);
+  if (ticks < kParticleTicks) return;
+  const float step = ticks / 1024.0f;
+  g->particleCarry -= step;
+  oParticleStep(mgr, edx, step);
+}
+
+// The player's commands are off while photo mode is open, Drive apart (user 2026-11-01: pad Y bound to reset car reset it).
+// SetInputMode binds the driving events to thunk 0x605C50 (cdecl port, id, value, player; 0x606130), which runs them at
+// once in the event dispatch: 0xA1 calls ResetCar 0x6009A0 (0x60345E), freeze or not; the game's real pause does not
+// guard this either. Presses stop here; releases pass, so held states (look back) still end. The FE has its own callback
+// 0x50C630, and pauseentry's call to 0x602BD0 is direct.
+constexpr uintptr_t kPlayerEventThunk = 0x605C50;
+using PlayerEventFn = void(__cdecl*)(int, int, int, void*);
+PlayerEventFn oPlayerEvent;
+void __cdecl PlayerEventDetour(int port, int id, int value, void* player) {
+  if (g && g->state != State::Off && !g->driving && value != 0) return;
+  oPlayerEvent(port, id, value, player);
 }
 
 void OnDeviceReset() {
@@ -1573,6 +1882,7 @@ void OnDeviceReset() {
   if (g->state != State::Off) {
     Var<int>(addr::g_DepthOfFieldEnable) = g->saved.dofEnable;
     Var<int>(addr::g_MotionBlurEnable) = g->saved.mbEnable;
+    Var<int>(addr::RainEnable) = g->saved.rainEnable;
     g->rezeroNativeFx = true;
   }
 }
@@ -1609,6 +1919,18 @@ bool Install() {
     U2LOG("BleachQuadPass 0x5C6520: entry bytes differ (another mod?); not hooked");
   else if (!Supersample::InstallBleachFix())
     U2LOG("bleach hook failed: 2x photos with Enhanced Contrast stay soft");
+  // Optional: without it long exposures keep the smoke of every step (ParticleStepDetour).
+  // Entry bytes from u2re: push ebp; mov ebp, esp; and esp, -16; sub esp, 0x64.
+  if (!hook::EntryIs(kParticleStep, "\x55\x8B\xEC\x83\xE4\xF0\x83\xEC\x64", 9))
+    U2LOG("particle step 0x492E10: entry bytes differ (another mod?); not hooked");
+  else if (!hook::Create(kParticleStep, &ParticleStepDetour, &oParticleStep, "ParticleStep"))
+    U2LOG("particle-step hook failed: long exposures may pile up smoke");
+  // Optional: without it pad buttons bound to driving commands also act (PlayerEventDetour).
+  // Entry bytes from u2re: mov eax, [esp + 0xC]; mov ecx, [esp + 8].
+  if (!hook::EntryIs(kPlayerEventThunk, "\x8B\x44\x24\x0C\x8B\x4C\x24\x08", 8))
+    U2LOG("player event thunk 0x605C50: entry bytes differ (another mod?); not hooked");
+  else if (!hook::Create(kPlayerEventThunk, &PlayerEventDetour, &oPlayerEvent, "PlayerEvent"))
+    U2LOG("player-event hook failed: pad buttons may also act on the car");
   // Optional: without it photo mode still opens with its key.
   if (g->cfg.pauseMenuEntry && !pause::Install()) U2LOG("pause menu: no Photo Mode icon (see above)");
   if (!ok) {
@@ -1618,7 +1940,7 @@ bool Install() {
   // Footer: user 2026-10-19, "H - Hide/Show UI" at the bottom of the bar; 2026-10-20 "Space - Take Picture" next to it.
   if (!menu::Install(menu::Callbacks{g->cfg.drive ? RowCount : RowCount - 1, &MenuLabel, &MenuValue, &MenuAdjust, &MenuActivate, &MenuBack,
                                      &MenuIsAction, &MenuIsEnabled,
-                                     "H - Hide/Show UI    Space - Take Picture"},
+                                     g->padHint ? kFooterPad : kFooterKeys},
                      g->cfg.menuLayout, g->cfg.verbose))
     return false;
   if (!hook::EnableAll()) {

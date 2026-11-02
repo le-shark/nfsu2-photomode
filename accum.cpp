@@ -161,6 +161,14 @@ void Accum::ShowKeptPieces(IDirect3DDevice9* dev, const edges::Piece* pieces, in
     const edges::Piece& p = pieces[i];
     q[i] = {p.dx - 0.5f, p.dy - 0.5f, p.dx + p.w - 0.5f, p.dy + p.h - 0.5f,
             p.sx * du, p.sy * dv, (p.sx + p.w) * du, (p.sy + p.h) * dv};
+    // Thicker across the strip, the same source line repeated (edges.h kStripPad).
+    if (p.h == 1) {
+      q[i].y0 -= edges::kStripPad, q[i].y1 += edges::kStripPad;
+      q[i].v0 = q[i].v1 = (p.sy + 0.5f) * dv;
+    } else {
+      q[i].x0 -= edges::kStripPad, q[i].x1 += edges::kStripPad;
+      q[i].u0 = q[i].u1 = (p.sx + 0.5f) * du;
+    }
   }
   const float zero[4] = {};
   DrawQuads(dev, rt, psCopy_, kept_, nullptr, zero, q, n);

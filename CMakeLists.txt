@@ -22,6 +22,7 @@ u2_add_script(photomode NFSU2PhotoMode
   grid.cpp
   overlay.cpp
   focusprobe.cpp
+  tags.cpp
   photomode.rc
   ${SHADER_HEADERS})
 target_include_directories(photomode PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
