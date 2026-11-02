@@ -51,12 +51,11 @@ using namespace u2;
 // game permanently frozen after exiting.)
 
 enum class State { Off, Active, Capturing };
-// Where photo mode is open (2026-11-02, user: also in the garage and on the post-race scene; research
-// docs/research/2026-11-02-photomode-garage-postrace.md):
-// - Race: a race or free roam, racing.
-// - PostRace: after the player's finish, the results over the world (race coordinator state 7).
+// Where photo mode is open (2026-11-02, user: also in the garage; research docs/research/2026-11-02-photomode-garage-postrace.md):
+// - Race: a race or free roam.
 // - Garage: the front end's platform set (garage.h). No world: the subjects are the FE cars, nothing to drive or expose.
-enum class Scene { None, Race, PostRace, Garage };
+// The post-race results scene was built and dropped (user 2026-11-03); there the help bar keeps photo mode closed as before.
+enum class Scene { None, Race, Garage };
 // User 2026-10-19: Focus Mode got its own row (Enter on Focus cycling the modes was not discoverable); Focus is the
 // distance, editable only in Manual. Quality left the menu to free the row: [Capture] DefaultQuality still sets it
 // and its code stays (lens.h kQualitySamples).
@@ -234,7 +233,6 @@ struct PhotoMode {
   int savedMirror = 0;
   LARGE_INTEGER previewStart{};
   bool captureContinued = false;  // the capture started from the preview's samples
-  bool worldHeld = false;       // this exposure keeps the world still: cars on the cutscene mover (NisCarsInPlay)
   int captureFromSample = 0;
   LARGE_INTEGER captureStart{};
 };
@@ -566,31 +564,21 @@ void ApplyCamera(float dt) {
 }
 
 // ---- state transitions ----------------------------------------------------------------------
-// After the player's finish the race stays in state 4 for the finish delay, then EndRace 0x60AAA0 creates the post-race
-// screen manager [0x8363DC] (0x60AE39) and the race coordinator goes to state 7 (handler 0x603EB0; state names at
-// 0x802170). That screen shows the PC help bar (0x4E9640, from 0x4F3C58), which a race treats as paused.
-constexpr uintptr_t kPostRaceScreens = 0x8363DC;
-constexpr int kRcPostRace = 7;
-
 Scene DetectScene() {
-  if (IsInGame()) {
-    auto rc = Var<int*>(addr::pRaceCoordinator);
-    return rc && *rc == kRcPostRace && Var<void*>(kPostRaceScreens) ? Scene::PostRace : Scene::Race;
-  }
+  if (IsInGame()) return Scene::Race;
   return garage::Present() ? Scene::Garage : Scene::None;
 }
 
 // The game never pauses in a network session (GameLoop 0x581306), so neither do we.
 // Not while another ASI holds the freeze (the daylight tuner is open): its menu owns the options screen.
-// In a race not over the game's pause, options or dialogs (the help bar is up with them). On the results and in the
+// In a race not over the game's pause, options, dialogs or the post-race results (the help bar is up with them). In the
 // garage the help bar is part of the screen; our menu takes the input from the game's screens there (optmenu modal).
 bool CanEnter(Scene s) {
   if (s == Scene::None || !Device() || freeze::AnyHeld() || IsNetworkSession()) return false;
   return s != Scene::Race || !IsGamePaused();
 }
 
-// Drive needs a race to drive in (user 2026-10-20); after the finish the player's car takes no driving input (input
-// mode 9, 0x5EA76A..0x5EA771, 0x60600C..0x60603F).
+// Drive needs a race to drive in (user 2026-10-20).
 bool DriveAllowed(Scene s) { return g->cfg.drive && s == Scene::Race; }
 
 // User 2026-10-20 (after the beta report on reset settings): the camera comes back where it was left, relative to its
@@ -896,7 +884,6 @@ float ShutterSec() { return InGarage() ? 0 : lens::kShutters[g->shutterIdx]; }
 const char* SceneName(Scene s) {
   switch (s) {
     case Scene::Race: return "race";
-    case Scene::PostRace: return "post-race";
     case Scene::Garage: return "garage";
     default: return "none";
   }
@@ -1152,7 +1139,8 @@ void Exit(const char* why, bool byPlayer = false) {
   tags::Close();
   menu::Close();
   // The packages we kept from drawing (FeRenderDetour) lost every change made to them meanwhile (their intro fade-in,
-  // say): drawn anew from their state now. [game] 2026-11-02: the post-race menu came back with only "Continue".
+  // say): drawn anew from their state now. [game] 2026-11-02: the post-race menu (since dropped) came back with only
+  // "Continue".
   feng::RedrawAll();
   g->input.SetMouseCapture(false);
   Var<uint8_t>(addr::FECursorVisible) = g->saved.cursorVisible;
@@ -1162,22 +1150,6 @@ void Exit(const char* why, bool byPlayer = false) {
   if (g->cfg.verbose) g->postExitLog = 3;
   U2LOG("exit (%s, %s): speed=%.2f hud=%d", why, SceneName(g->scene), Var<float>(addr::GameSpeed), Var<int>(addr::DrawHud));
   g->scene = Scene::None;
-}
-
-// Cars on the game's cutscene mover (movement mode 5, "NISMvr": SetMovementMode 0x5F46A0 case 5, ctor 0x5B6FC0, name
-// 0x7A277C), as on the post-race scene (0x430AA6). Its controller 0x5A44A0 asks for speed = position error / dt and turn
-// rate = heading error / dt (1.0 / dt at 0x5A44CB) and kicks the body with impulses capped per call, not per second
-// (0x59BC60): a shutter sample's world step (shutter / samples, 62.5 us at 1/125 and 128) is 266 times shorter than a
-// frame, so it asks 266 times the speed and gives 128 full kicks in 8 ms. [game] 2026-11-02: a 1/125 photo after the finish
-// spun the car into the road. The game itself never steps them that finely, so with them in play an exposure keeps the
-// world on the game's pause path and only the camera moves (the cars move under a millimetre in such an exposure).
-// Investigation 2026-11-03, verified-in-binary.md "Cutscene mover".
-bool NisCarsInPlay() {
-  constexpr int kMovementNis = 5;
-  uint8_t* cars[kMaxCars];
-  for (int i = 0, n = ActiveCars(cars, kMaxCars); i < n; ++i)
-    if (*reinterpret_cast<int*>(cars[i] + 0x28) == kMovementNis) return true;
-  return false;
 }
 
 void StartCapture() {
@@ -1253,8 +1225,6 @@ void StartCapture() {
   g->captureCam = RigPose();
   g->captureCar = TargetCarPose();
   g->particleCarry = 0;
-  g->worldHeld = p.shutterSec > 0 && !InGarage() && NisCarsInPlay();
-  if (g->worldHeld) U2LOG("capture: cutscene cars in play (post-race): the world stays still during the exposure");
   g->state = State::Capturing;
 }
 
@@ -1637,8 +1607,6 @@ void Tick() {
   } else if (!IsInGame() || IsPauseMenuState()) {
     Exit(IsInGame() ? "game paused" : "left gameplay");
     return;
-  } else {
-    g->scene = DetectScene();  // a shutter exposure in the finish delay can reach the results (EndRace)
   }
   UpdateAnchor();
 
@@ -1671,13 +1639,11 @@ void Tick() {
       g->frame.show = !tiles;
       g->frame.showHold = tiles;
       // The world stays still on resolve frames: no need to wait for the 1/60 limiter (review 2026-10-22).
-      const bool still = g->capture.Params().shutterSec == 0 || g->worldHeld;
-      SetUncapped(((cf.sample || cf.warm) && still) || cf.resolve);
+      SetUncapped(((cf.sample || cf.warm) && g->capture.Params().shutterSec == 0) || cf.resolve);
       // Shutter samples advance the world by a small, non-zero time step through the normal
       // (unpaused) loop path; otherwise the world stays on the game's own pause path.
-      const bool step = cf.nextGameSpeed > 0 && !g->worldHeld;
-      freeze::Hold(!step);
-      Var<float>(addr::GameSpeed) = step ? cf.nextGameSpeed : g->saved.gameSpeed;
+      freeze::Hold(cf.nextGameSpeed <= 0);
+      Var<float>(addr::GameSpeed) = cf.nextGameSpeed > 0 ? cf.nextGameSpeed : g->saved.gameSpeed;
     } else {
       EndCapture();
     }
