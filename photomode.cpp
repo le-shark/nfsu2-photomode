@@ -940,6 +940,7 @@ void Enter(Scene scene) {
     g->rig.roll = roll;
   }
   ApplyBounds(ToVec3(cam->Position));
+  if (InGarage()) garage::HoldTurntable(true);
   if (!g->openedBefore) {
     g->focalMm = lens::kFocals[lens::Closest(lens::kFocals, focal)];
     g->openedBefore = true;
@@ -1111,6 +1112,7 @@ void Exit(const char* why, bool byPlayer = false) {
   // Only while still there: after leaving it the cars may be gone (RestoreView then starts from the game camera).
   if (InGarage() ? garage::Present() : IsInGame()) SaveView();
   else SceneView().valid = false;
+  garage::HoldTurntable(false);
   g->capture.Abort("photo mode closed");
   g->frame = {};
   g->accum.Free();  // the targets are recreated on the next enter

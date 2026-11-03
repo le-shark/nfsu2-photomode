@@ -12,5 +12,9 @@ bool Present();
 bool CameraBox(u2::Vec3* mn, u2::Vec3* mx);
 // The particle step call that GarageMain makes for its set's emitters (the Showroom's smoke) with real time.
 bool IsSetEmitters(const void* particleManager);
+// The turntable's own input switch off while photo mode is open (true) and back as it was (false). Its orbit events
+// come from the joystick layer, not the FE, so the menu's input masks do not reach them ([game] 2026-11-03, `.net`:
+// XtendedInput sends them for A / D and the right stick).
+void HoldTurntable(bool hold);
 
 }  // namespace photomode::garage

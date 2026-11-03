@@ -3,6 +3,7 @@
 #include <cstdint>
 
 #include "u2sdk/game.h"
+#include "u2sdk/log.h"
 
 namespace photomode::garage {
 namespace {
@@ -24,8 +25,21 @@ constexpr uintptr_t kFloorHeight = 0x7F45A8;  // float 0.15, the platform floor 
 // does not hold the Showroom's smoke.
 constexpr uintptr_t kEmitterSystem = 0x8357E0;
 constexpr float kWallMargin = 0.3f, kFloorMargin = 0.1f;
+// GarageMain's car orbit controller (2026-11-03, investigation agent, key bytes re-read): +0x240 its enable flag,
+// written 1 only by GarageMain's ctor (0x4EAF40); the CARSEL_ORBIT_* joy handler 0x4A5740 returns while it is 0
+// (0x4A5743..0x4A5748) and otherwise writes the rates +0x248 (turntable spin), +0x24C (pitch), +0x250 (zoom). The
+// tick spins the disc by +0x248 with real time (0x4D8A60..0x4D8A7A, angle +0x274), so the freeze does not hold it. A
+// rate latched by a key held at opening has its release dropped while the flag is 0, so the rates are cleared too.
+constexpr uintptr_t kOrbitEnabled = 0x240, kOrbitRates[3] = {0x248, 0x24C, 0x250};
 
 uint8_t* Garage() { return IsFngLoaded(kGaragePkg) ? FindFngObject(kGaragePkg) : nullptr; }
+
+uint8_t* g_heldGarage = nullptr;  // the GarageMain whose orbit input is off (HoldTurntable)
+int g_savedOrbitEnabled = 0;
+
+void ClearOrbitRates(uint8_t* gm) {
+  for (uintptr_t r : kOrbitRates) *reinterpret_cast<float*>(gm + r) = 0;
+}
 }  // namespace
 
 bool Present() {
@@ -50,6 +64,26 @@ bool CameraBox(Vec3* mn, Vec3* mx) {
 
 bool IsSetEmitters(const void* particleManager) {
   return reinterpret_cast<uintptr_t>(particleManager) == kEmitterSystem;
+}
+
+void HoldTurntable(bool hold) {
+  uint8_t* gm = Garage();
+  if (hold) {
+    if (!gm || g_heldGarage) return;
+    g_heldGarage = gm;
+    g_savedOrbitEnabled = *reinterpret_cast<int*>(gm + kOrbitEnabled);
+    *reinterpret_cast<int*>(gm + kOrbitEnabled) = 0;
+    ClearOrbitRates(gm);
+    U2LOG("garage: turntable input off (was %d)", g_savedOrbitEnabled);
+    return;
+  }
+  // Only the same GarageMain gets its switch back: a garage left meanwhile is gone (a new one starts enabled).
+  if (gm && gm == g_heldGarage) {
+    ClearOrbitRates(gm);
+    *reinterpret_cast<int*>(gm + kOrbitEnabled) = g_savedOrbitEnabled;
+    U2LOG("garage: turntable input back");
+  }
+  g_heldGarage = nullptr;
 }
 
 }  // namespace photomode::garage
