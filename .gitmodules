@@ -1,0 +1,3 @@
+[submodule "external/u2sdk"]
+	path = external/u2sdk
+	url = ../nfsu2-u2sdk.git

@@ -26,7 +26,7 @@ class Gamma {
  public:
   ~Gamma() { Release(); }
   Use Load(IDirect3DDevice9* dev);
-  // The same from a given module (tools/photomode/gamma_check loads WidescreenFix's .asi as a data file); ini empty =
+  // The same from a given module (tools/gamma_check loads WidescreenFix's .asi as a data file); ini empty =
   // ConsoleGamma taken as on.
   Use LoadFrom(IDirect3DDevice9* dev, void* module, const std::string& name, const std::string& ini);
   bool Loaded() const { return effect_ != nullptr; }
