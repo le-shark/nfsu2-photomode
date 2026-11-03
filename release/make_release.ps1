@@ -39,7 +39,7 @@ $asi = "$bin\NFSU2PhotoMode.asi"
 $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($asi))
 if ($text -match 'scripts_workspace|\.pdb') { throw "$asi contains a local path or a PDB reference" }
 
-$ver = (Select-String -Path "$repo\version.h" -Pattern '#define PHOTOMODE_VERSION "(.+)"').Matches[0].Groups[1].Value
+$ver = (Select-String -Path "$repo\src\version.h" -Pattern '#define PHOTOMODE_VERSION "(.+)"').Matches[0].Groups[1].Value
 $name = "NFSU2PhotoMode-$ver"
 $d = Join-Path $out $name
 if (Test-Path $d) { Remove-Item -Recurse -Force $d }

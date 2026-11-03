@@ -5,4 +5,4 @@ rem u2sdk: the submodule, or the scripts workspace's common\u2sdk (this repo at 
 set U2=..\..\external\u2sdk
 if not exist %U2%\src\log.cpp set U2=..\..\..\..\common\u2sdk
 call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars32.bat" >nul
-cl /nologo /EHsc /O2 /std:c++17 gamma_check.cpp ..\..\wsfgamma.cpp %U2%\src\log.cpp /I..\.. /I%U2%\include d3d9.lib user32.lib /Fe:gamma_check.exe
+cl /nologo /EHsc /O2 /std:c++17 gamma_check.cpp ..\..\src\wsfgamma.cpp %U2%\src\log.cpp /I..\..\src /I%U2%\include d3d9.lib user32.lib /Fe:gamma_check.exe

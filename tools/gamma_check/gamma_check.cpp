@@ -1,4 +1,4 @@
-// Runs photo mode's WidescreenFix gamma (scripts/photomode/wsfgamma.cpp) on the real GPU, outside the game: loads the
+// Runs photo mode's WidescreenFix gamma (scripts/photomode/src/wsfgamma.cpp) on the real GPU, outside the game: loads the
 // installed WidescreenFix .asi as a data file (none of its code runs), a grey ramp and two colour patches through its
 // ConsoleGamma effect, and prints input -> output. Checks that the effect loads by content, the D3DX calls work, and
 // the draw leaves the render target, the depth-stencil and the stream as they were.

@@ -16,7 +16,7 @@ endif()
 find_program(FXC fxc HINTS "$ENV{WindowsSdkVerBinPath}x86" "$ENV{WindowsSdkVerBinPath}/x86" REQUIRED)
 set(SHADER_HEADERS)
 foreach(name accum show show2x copy depthcopy)
-  set(src ${CMAKE_CURRENT_SOURCE_DIR}/shaders/${name}.hlsl)
+  set(src ${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/${name}.hlsl)
   set(out ${CMAKE_CURRENT_BINARY_DIR}/${name}_ps.h)
   add_custom_command(OUTPUT ${out}
     COMMAND ${FXC} /nologo /T ps_2_0 /E main /O3 /Vn g_ps_${name} /Fh ${out} ${src}
@@ -25,30 +25,30 @@ foreach(name accum show show2x copy depthcopy)
 endforeach()
 
 u2_add_script(photomode NFSU2PhotoMode
-  dllmain.cpp
-  photomode.cpp
-  pauseentry.cpp
-  garage.cpp
-  settings.cpp
-  capture.cpp
-  accum.cpp
-  supersample.cpp
-  watermark.cpp
-  grid.cpp
-  overlay.cpp
-  focusprobe.cpp
-  tags.cpp
-  wsfgamma.cpp
-  photomode.rc
+  src/dllmain.cpp
+  src/photomode.cpp
+  src/pauseentry.cpp
+  src/garage.cpp
+  src/settings.cpp
+  src/capture.cpp
+  src/accum.cpp
+  src/supersample.cpp
+  src/watermark.cpp
+  src/grid.cpp
+  src/overlay.cpp
+  src/focusprobe.cpp
+  src/tags.cpp
+  src/wsfgamma.cpp
+  src/photomode.rc
   ${SHADER_HEADERS})
 target_include_directories(photomode PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 # The resource script embeds the built-in watermark PNGs: rebuild it when they change.
-set_source_files_properties(photomode.rc PROPERTIES OBJECT_DEPENDS
-  "${CMAKE_CURRENT_SOURCE_DIR}/nfsplanet_watermark.png;${CMAKE_CURRENT_SOURCE_DIR}/nfs.png")
+set_source_files_properties(src/photomode.rc PROPERTIES OBJECT_DEPENDS
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/nfsplanet_watermark.png;${CMAKE_CURRENT_SOURCE_DIR}/src/nfs.png")
 
 # ---- host unit tests (pure code, no game needed) ---------------------------
 # Inside the scripts workspace its u2tests runs tests/test_photomath.cpp instead.
 if(PHOTOMODE_TOP)
   add_executable(photomode_tests ${U2SDK_DIR}/tests/test_main.cpp tests/test_photomath.cpp)
-  target_include_directories(photomode_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${U2SDK_DIR}/include ${U2SDK_DIR}/tests)
+  target_include_directories(photomode_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${U2SDK_DIR}/include ${U2SDK_DIR}/tests)
 endif()
