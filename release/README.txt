@@ -27,3 +27,7 @@ left stick - move camera
 right stick - look around
 lt / rt - move camera up/down
 lb / rb - roll camera
+
+Installation:
+1. make sure you have an ASI loader installed
+2. copy the scripts/ folder into your game folder
