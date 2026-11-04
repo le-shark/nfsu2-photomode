@@ -152,7 +152,6 @@ struct PhotoMode {
   bool grid = false;            // Grid row (grid.h): thirds lines on screen, never in the photo
   bool racerTags = false;       // key T: stays as left for the session (DrawTags)
   bool rainDrops = true;        // key R: the drops on the lens (g_RainEnable, ApplyRain)
-  bool sound = false;           // key M: world sound off while photo mode is open (mute.h), back while driving
   // Wheel Angle row: only what is drawn (WheelScope), per car, forgotten on closing and on Drive.
   struct WheelSet { uint8_t* car; float deg; };
   std::vector<WheelSet> wheels;
@@ -829,12 +828,6 @@ void ToggleRain() {
   RestartPreview();
 }
 
-// Key M.
-void ToggleSound() {
-  g->sound = !g->sound;
-  mute::Set(!g->sound);
-}
-
 // The sticks are the camera here, so they must not be the menu's directions too (user 2026-11-01). The FE id table 0x7F91C8
 // (stride 0x1C: +0 joy event, +4 mask bit; fe-input.md 1.4) maps the events FENG_PAD_*_ALTERNATE 0x2E..0x31 to the same
 // direction bits as FENG_PAD_* 0x2A..0x2D; the second set is the left stick (XtendedInput Config-UG2 ini binds them so:
@@ -964,7 +957,8 @@ void Enter(Scene scene) {
   freeze::Hold(true);
   ZeroNativeFx(true);
   ApplyRain();
-  mute::Set(!g->sound && !InGarage());  // the garage has no world sound (M does nothing there)
+  // World sound off while open (user 2026-11-04: always, no key; mute.h), back while driving; the garage has none.
+  mute::Set(!InGarage());
   SetFePadInput(false);
   g->hintSettle = kHintSettleSec;
   GetCursorPos(&g->cursorAtEnter);
@@ -1089,7 +1083,7 @@ void StopDrive() {
   RestoreDriveKeys();
   freeze::Hold(true);
   menu::SetGameInput(false);
-  mute::Set(!g->sound);
+  mute::Set(true);
   g->accum.Reset();
   g->stillTime = 0;
   // The pad button that stopped it must not also reach the menu once it shows again.
@@ -1461,9 +1455,8 @@ void HandleControls(float dt) {
   }
   if (in.KeyPressed('H') || in.PadPressed(PadB)) g->uiHidden = !g->uiHidden;
   if (in.KeyPressed('T') && !InGarage()) g->racerTags = !g->racerTags;  // racers only
-  // The garage has no rain or world sound; a DriveKey set to R or M stays the Drive key.
+  // The garage has no rain; a DriveKey set to R stays the Drive key.
   if (in.KeyPressed('R') && !InGarage() && g->cfg.driveKey != 'R') ToggleRain();
-  if (in.KeyPressed('M') && !InGarage() && g->cfg.driveKey != 'M') ToggleSound();
   if (DriveAllowed(g->scene) && (in.KeyPressed(g->cfg.driveKey) || in.PadPressed(PadBack))) {
     StartDrive();
     return;
