@@ -13,5 +13,19 @@ mouse wheel - focal length (zoom), ctrl + wheel - smaller steps
 h - show/hide hud
 ctrl + left/right on focal length/focus distance in Manual focus mode - smaller steps
 v - drive the car in photo mode
+t - toggle rival tags (for focus target assistance)
+r - toggle rain drops
 
 to upload custom watermarks: create a "watermarks" folder in the game's scripts/ folder and drop the watermarks there.
+
+gamepad controls:
+L3 + R3 - open
+start - close
+back - drive mode
+a - take picture
+b - toggle hud
+y / x - zoom in / out
+left stick - move camera
+right stick - look around
+lt / rt - move camera up/down
+lb / rb - roll camera
