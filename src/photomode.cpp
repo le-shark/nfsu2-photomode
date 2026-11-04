@@ -64,9 +64,9 @@ enum class Scene { None, Race, Garage };
 // User 2026-10-20: Watermark (default None) and Watermark Pos. (disabled while None), before Take Picture.
 // User 2026-10-22: Take Picture is the last row, Drive above it (MenuRow skips Drive when [PhotoMode] Drive = 0).
 // User 2026-10-31 (release): Wheel Angle, Rain Drops and Sound Effects, after Grid. Racer tags are key T only.
+// User 2026-11-04: Rain Drops and World Sound left the menu: keys R and M only, as T.
 enum Row { RowCamera, RowFocal, RowRoll, RowTarget, RowFocusMode, RowFocus, RowAperture, RowShutter, RowFollow, RowResolution,
-           RowAspect, RowCrop, RowGrid, RowWheel, RowRain, RowSound, RowWatermark, RowWatermarkPos, RowDrive, RowTake,
-           RowCount };
+           RowAspect, RowCrop, RowGrid, RowWheel, RowWatermark, RowWatermarkPos, RowDrive, RowTake, RowCount };
 
 constexpr float kMinFocusM = 0.3f, kMaxFocusM = 500;
 constexpr float kZoomRepeatFirst = 0.35f, kZoomRepeat = 0.12f;  // pad X / Y held
@@ -151,8 +151,8 @@ struct PhotoMode {
   bool uiHidden = false;
   bool grid = false;            // Grid row (grid.h): thirds lines on screen, never in the photo
   bool racerTags = false;       // key T: stays as left for the session (DrawTags)
-  bool rainDrops = true;        // Rain Drops row: the drops on the lens (g_RainEnable, ApplyRain)
-  bool sound = false;           // World Sound row: off while photo mode is open (mute.h), back while driving
+  bool rainDrops = true;        // key R: the drops on the lens (g_RainEnable, ApplyRain)
+  bool sound = false;           // key M: world sound off while photo mode is open (mute.h), back while driving
   // Wheel Angle row: only what is drawn (WheelScope), per car, forgotten on closing and on Drive.
   struct WheelSet { uint8_t* car; float deg; };
   std::vector<WheelSet> wheels;
@@ -821,6 +821,20 @@ void StepWheel(int dir) {
   RestartPreview();
 }
 
+// Key R. With the game's own option off there are no drops to turn off.
+void ToggleRain() {
+  if (!g->saved.rainEnable) return;
+  g->rainDrops = !g->rainDrops;
+  ApplyRain();
+  RestartPreview();
+}
+
+// Key M.
+void ToggleSound() {
+  g->sound = !g->sound;
+  mute::Set(!g->sound);
+}
+
 // The sticks are the camera here, so they must not be the menu's directions too (user 2026-11-01). The FE id table 0x7F91C8
 // (stride 0x1C: +0 joy event, +4 mask bit; fe-input.md 1.4) maps the events FENG_PAD_*_ALTERNATE 0x2E..0x31 to the same
 // direction bits as FENG_PAD_* 0x2A..0x2D; the second set is the left stick (XtendedInput Config-UG2 ini binds them so:
@@ -868,12 +882,12 @@ void SyncFeSelectCancel() {
 }
 
 // The menu's rows for a scene: Drive only where there is a race to drive in; the garage has no world time to expose
-// (GameLoop runs no simulation outside a race, 0x581349), no Car to steer, no rain and no world sound.
+// (GameLoop runs no simulation outside a race, 0x581349) and no Car to steer.
 std::vector<int> RowsFor(Scene s) {
   std::vector<int> rows;
   for (int r = 0; r < RowCount; ++r) {
     if (r == RowDrive && !DriveAllowed(s)) continue;
-    if (s == Scene::Garage && (r == RowShutter || r == RowFollow || r == RowWheel || r == RowRain || r == RowSound)) continue;
+    if (s == Scene::Garage && (r == RowShutter || r == RowFollow || r == RowWheel)) continue;
     rows.push_back(r);
   }
   return rows;
@@ -950,7 +964,7 @@ void Enter(Scene scene) {
   freeze::Hold(true);
   ZeroNativeFx(true);
   ApplyRain();
-  mute::Set(!g->sound && !InGarage());  // the garage has no world sound (the row is left out there)
+  mute::Set(!g->sound && !InGarage());  // the garage has no world sound (M does nothing there)
   SetFePadInput(false);
   g->hintSettle = kHintSettleSec;
   GetCursorPos(&g->cursorAtEnter);
@@ -1015,7 +1029,7 @@ void __cdecl SaveRegistryDetour() {
   Var<int>(addr::g_MotionBlurEnable) = g->saved.mbEnable;
   if (g->savedStreaks >= 0) Var<int>(addr::LightStreaksEnable) = g->savedStreaks;
   if (g->savedFog >= 0) Var<int>(addr::HorizonFogEnable) = g->savedFog;
-  Var<int>(addr::RainEnable) = g->saved.rainEnable;  // the Rain Drops row zeroes it too
+  Var<int>(addr::RainEnable) = g->saved.rainEnable;  // the R key zeroes it too
   oSaveRegistry();
   Var<int>(addr::g_DepthOfFieldEnable) = dof, Var<int>(addr::g_MotionBlurEnable) = mb;
   Var<int>(addr::LightStreaksEnable) = streaks, Var<int>(addr::HorizonFogEnable) = fog, Var<int>(addr::RainEnable) = rain;
@@ -1291,17 +1305,6 @@ void Adjust(int row, int dir) {
     case RowCrop: if (g->aspect) g->crop = !g->crop; break;  // only with a ratio (IsRowEnabled)
     case RowGrid: g->grid = !g->grid; break;
     case RowWheel: StepWheel(dir); break;
-    case RowRain:
-      if (g->saved.rainEnable) {  // with the game's own option off there are no drops to turn off (IsRowEnabled)
-        g->rainDrops = !g->rainDrops;
-        ApplyRain();
-        RestartPreview();
-      }
-      break;
-    case RowSound:
-      g->sound = !g->sound;
-      mute::Set(!g->sound);
-      break;
     case RowWatermark:
       // The next one that can be shown (None always can); an unreadable image is skipped from then on.
       for (int n = static_cast<int>(g->wm.size()), i = Wrap(g->watermark + dir, n); ; i = Wrap(i + dir, n))
@@ -1326,7 +1329,6 @@ bool IsRowEnabled(int row) {
   if (row == RowFocus) return g->focusMode == FocusMode::Manual;
   if (row == RowWatermarkPos) return g->watermark != 0;
   if (row == RowCrop) return g->aspect != 0;
-  if (row == RowRain) return g->saved.rainEnable != 0;
   return true;
 }
 
@@ -1346,7 +1348,7 @@ void Activate(int row) {
 std::string RowLabel(int row) {
   static const char* names[RowCount] = {"Camera Mode", "Focal Length", "Roll",     "Focus Target",
                                         "Focus Mode", "Focus",        "Aperture", "Shutter Speed",
-                                        "Shutter Follow", "Resolution", "Aspect Ratio", "Crop to Ratio", "Grid", "Wheel Angle", "Rain Drops", "World Sound",
+                                        "Shutter Follow", "Resolution", "Aspect Ratio", "Crop to Ratio", "Grid", "Wheel Angle",
                                         "Watermark", "Watermark Pos.",
                                         "Drive", "Take Picture"};
   return row >= 0 && row < RowCount ? names[row] : "";
@@ -1381,8 +1383,6 @@ std::string RowValue(int row) {
       if (const auto* w = FindWheel(TargetCar())) std::snprintf(b, sizeof b, "%+.1f", w->deg);
       else return "Natural";
       break;
-    case RowRain: return g->rainDrops && g->saved.rainEnable ? "On" : "Off";
-    case RowSound: return g->sound ? "On" : "Off";
     case RowWatermark: return g->watermark < static_cast<int>(g->wm.size()) ? g->wm[g->watermark].name : "None";
     case RowWatermarkPos: return watermark::CornerName(g->wmCorner);
     default: break;
@@ -1461,6 +1461,9 @@ void HandleControls(float dt) {
   }
   if (in.KeyPressed('H') || in.PadPressed(PadB)) g->uiHidden = !g->uiHidden;
   if (in.KeyPressed('T') && !InGarage()) g->racerTags = !g->racerTags;  // racers only
+  // The garage has no rain or world sound; a DriveKey set to R or M stays the Drive key.
+  if (in.KeyPressed('R') && !InGarage() && g->cfg.driveKey != 'R') ToggleRain();
+  if (in.KeyPressed('M') && !InGarage() && g->cfg.driveKey != 'M') ToggleSound();
   if (DriveAllowed(g->scene) && (in.KeyPressed(g->cfg.driveKey) || in.PadPressed(PadBack))) {
     StartDrive();
     return;
